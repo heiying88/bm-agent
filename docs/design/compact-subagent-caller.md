@@ -1,57 +1,13 @@
-# Compact SubAgent caller
+# 紧凑 SubAgent 调用方
 
-The advertised `SubAgent` schema has `intent`, `target`, `message`, reserved
-`reply_to`, and optional `role`. The default intent is `chat`. A message without a target
-creates a direct durable Child of the current Root and keeps the complete task
-body. A target chat delivers corrective input through the existing SessionInbox.
-Runtime continues to own activation and parent waiting.
+向模型公告的 `SubAgent` schema 含有 `intent`、`target`、`message`、保留字段 `reply_to` 与可选的 `role`。默认 intent 为 `chat`。不带 target 的 message 会在当前 Root 之下创建一个直接的持久 Child，并保留完整的任务正文。带 target 的 chat 通过既有 SessionInbox 投递纠偏输入。Runtime 继续掌管 activation 与父级等待。
 
-Only a new Child can select `role`: the shipped defaults are `explorer`,
-`implementer`, and `reviewer`, with the existing Project → Global → builtin
-catalog precedence. Omission keeps `worker`; unknown names retain the existing
-legacy-label fallback. Invalid or duplicate catalog definitions fail closed.
-Role names are explicit and are never inferred from the task body. A continuation,
-inspection, or control call with `role` is rejected; it cannot rebind a Child's
-frozen profile. Model/workspace/host parameters remain hidden. The four-field
-example in #791 does not impose a closed field count; this optional logical role
-selection keeps the accepted named-profile consumer reachable from the LLM.
+只有新建的 Child 才能选择 `role`：随版本内置的默认角色是 `explorer`、`implementer` 和 `reviewer`，沿用既有的 Project → Global → builtin 目录优先级。省略时保持 `worker`；未知名称仍走既有的 legacy 标签回退。无效或重复的目录定义一律 fail closed。角色名必须显式给出，绝不从任务正文推断。continuation、inspection 或 control 调用一旦携带 `role` 即被拒绝；`role` 不能重新绑定 Child 已冻结的 profile。model/workspace/host 参数仍然隐藏。#791 的四字段示例并不构成封闭的字段数；这个可选的逻辑角色选择让已验收的具名 profile 消费者仍可被 LLM 触达。
 
-`inspect` without a target returns the current Root's observed tree in pages
-of at most 32 nodes at depth 4. The tree reader can scope a Child's descendants
-only when its Host can verify the canonical ancestor chain, Project, current
-activation, and each descendant from durable storage. The isolated `current_exe`
-Worker requests a bounded page over the active run's read-only HostBridge; its
-local Child Session is never a source of tree authority. A nested Worker without
-a canonical Host ancestry store fails closed. Pass
-`message={"view":"tree","cursor":"<next_cursor>"}` to read the next page.
-The cursor binds the caller lifetime, Project, canonical lineage, and observed
-tree; a changed tree rejects a stale cursor and requires a fresh first page.
-Each page stays within the 8 KiB tool-result limit. A target
-inspection supports overview, paginated message previews,
-message content, the latest result, and an error indicator. For pagination, pass
-a JSON object containing `view`, `cursor`, and optionally `message_id` as the
-message. History cursors retain the existing persisted-prefix checks. The whole
-serialized ToolResult is limited to 8 KiB; structured physical runtime fields,
-tool arguments, and raw execution errors are excluded from the compact result.
-User and Child-authored transcript text is content, not an identity certificate.
+不带 target 的 `inspect` 返回当前 Root 的观察树：按深度 4 展开，每页至多 32 个节点。树读取者只有在 Host 能从持久存储验证规范祖先链、Project、当前 activation 以及每个后代时，才能圈定某个 Child 的后代范围。隔离的 `current_exe` Worker 通过活动 Run 的只读 HostBridge 请求一个有界分页；它本地的 Child Session 永远不是树 authority 的来源。没有规范 Host 谱系存储的嵌套 Worker 一律 fail closed。传入 `message={"view":"tree","cursor":"<next_cursor>"}` 可读取下一页。cursor 绑定调用者生命周期、Project、规范谱系与被观察的树；树一旦变化就会拒绝过期的 cursor，要求重新读取第一页。每页都保持在 8 KiB 的工具结果上限之内。带 target 的 inspection 支持 overview、分页 message 预览、message 内容、最新 result 和错误指示。分页时，把包含 `view`、`cursor` 以及可选 `message_id` 的 JSON 对象作为 message 传入。历史 cursor 保留既有的已持久化前缀检查。整个序列化后的 ToolResult 限制在 8 KiB 以内；结构化物理 runtime 字段、工具参数和原始执行错误都不会进入紧凑结果。用户与 Child 撰写的 transcript 文本是内容，不是身份凭证。
 
-`control` accepts `cancel` and `retry`; retry runs the same logical Child rather
-than creating another one. A corrective message uses target chat. Compact calls
-normalize before launch-owner classification, preserving the existing detached
-owner, admission gate, cancellation compensation, and runtime wait signal.
-Legacy action calls retain their original arguments and output shape.
+`control` 接受 `cancel` 和 `retry`；retry 复跑同一个逻辑 Child，而不是另建一个。纠偏消息走带 target 的 chat。紧凑调用在 launch-owner 分类之前先做归一化，保留既有的分离 owner、准入闸门、取消补偿和 runtime 等待信号。legacy action 调用保留原有参数与输出形态。
 
-This caller covers Root to direct local durable Child execution. It does not
-resolve ParentRequests, reassign remote actors, or authorize deep lifecycle
-mutation. The Root model catalog hides `ask_agent`, `deploy_agent`, and `cluster`;
-their underlying direct-call compatibility routes remain registered until the
-remote facade is complete. Tree/status results are observations, not claims or
-activation authority. Required-packet typed-result selectors remain available
-through the compatible legacy inspection route.
+该调用方覆盖从 Root 到直接本地持久 Child 的执行。它不解析 ParentRequests、不重新指派远端 actor，也不授权深层的生命周期变更。Root 的模型目录隐藏 `ask_agent`、`deploy_agent` 和 `cluster`；在远端 facade 完成之前，它们底层的直连兼容路由仍保持注册。tree/状态结果是观察数据，不是声明，也不是 activation 权威。Required-packet 的类型化结果选择器仍可通过兼容的 legacy inspection 路由使用。
 
-The source tests include real V2 storage, SessionInbox, adapter ownership checks,
-Child scope and forged-lineage rejection, and the pre-commit cancellation barrier.
-Their no-op runner proves Host-side caller and admission bookkeeping. It does
-not establish Child tree support in an isolated native Worker. Native acceptance
-is recorded separately when run against the compiled host and its `current_exe`
-worker.
+源码测试覆盖真实 V2 存储、SessionInbox、adapter 归属检查、Child 范围与伪造谱系拒绝，以及 pre-commit 取消屏障。其中的 no-op runner 证明了 Host 侧的调用方与准入记账。它并未确立隔离原生 Worker 内的 Child 树支持。原生验收在与编译出的 host 及其 `current_exe` worker 实际对跑时另行记录。

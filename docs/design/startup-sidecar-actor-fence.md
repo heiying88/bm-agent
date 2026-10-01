@@ -1,65 +1,23 @@
-# Startup Child sidecar reconstruction fence
+# 启动时 Child sidecar 重建围栏
 
-`SessionStoreV2::migrate_runtime_sidecars` is the existing startup migration;
-`bamboo_server::app_state::init::init_storage` is its sole production caller.
-Startup still reports migration failures nonfatally. It does not reconstruct a
-protected missing Child runtime from an older embedded main projection.
+`SessionStoreV2::migrate_runtime_sidecars` 是既有的启动迁移；`bamboo_server::app_state::init::init_storage` 是其唯一的生产调用方。启动阶段仍以非致命方式报告迁移失败。它不会从较旧的嵌入式 main 投影重建受保护的缺失 Child 运行时。
 
-## Final candidate boundary
+## 最终候选边界
 
-The existing index and migration marker are routing hints. There is no outer
-Task guard. Each candidate acquires lifecycle shared, Task shared, then the
-exact Session writer guard. Before opening a hinted target, its id and canonical
-relative layout must agree. Under the final guard set, the migration checks the
-real target directory, runtime presence and raw main file again. Only an actual
-`NotFound` means absent; other errors and nonregular targets reject. An existing
-regular runtime is skipped, preserving concurrent legitimate publication.
+既有的索引与迁移标记只是路由提示，没有外层 Task 守卫。每个候选者依次获取 lifecycle 共享锁、Task 共享锁，然后是精确的 Session 写守卫。打开提示的目标之前，其 id 与规范相对布局必须一致。在最终守卫集合之下，迁移会再次检查真实的目标目录、运行时是否存在以及原始 main 文件。只有真正的 `NotFound` 才表示缺失；其他错误与非常规目标都会被拒绝。已存在的常规运行时会被跳过，以保护并发的合法发布。
 
-The raw main must match the hint's target kind/root/parent/depth/birth and its
-canonical path. Local typed Actor identity validation rejects invalid lineage.
-The index never supplies the reconstructed context. Existing Root lifetime,
-Root context and Supervisor checks remain in place; missing Root or Supervisor
-authority cannot be reconstructed here.
+原始 main 文件必须与提示中的目标 kind/root/parent/depth/birth 及其规范路径匹配。本地带类型的 Actor 身份校验会拒绝无效世系。索引从不提供重建所需的上下文。既有的 Root 生命周期、Root 上下文与 Supervisor 检查保持不变；缺失的 Root 或 Supervisor 权限无法在此重建。
 
-The accepted default-writer observational classifier admits both Actor files
-absent (legacy) or complete valid matching inert Cold / attempt zero / no
-activation authority. Activated, completed, failed, cancelled, retired (also
-retired attempt zero), partial, corrupt, nonregular or mismatched authority
-rejects before runtime publication. Classification calls no Actor ensure,
-repair or refresh operation. Arbitrary external erasure of both Actor files
-while retaining a Session remains indistinguishable from legacy and is outside
-this contract.
+被接受的默认写入者观察式分类器只接纳两种情况：两个 Actor 文件均缺失（legacy），或者两文件完整、有效、匹配，且处于惰性 Cold / 尝试数为零 / 无激活权限的状态。已激活、已完成、已失败、已取消、已退役（包括尝试数为零的已退役）、部分写入、损坏、非常规或权限不匹配的情形都会在运行时发布之前被拒绝。分类过程不调用任何 Actor 的 ensure、repair 或 refresh 操作。保留 Session 的同时从外部任意抹除两个 Actor 文件，仍与 legacy 无法区分，这不在本契约范围内。
 
-## Physical publication and partial completion
+## 物理发布与部分完成
 
-The existing runtime projection still removes messages, native provider
-transcript and Inbox admission data. Main history remains byte-identical.
-Runtime replacement uses the accepted complete std filesystem job (unique temp,
-write, file fsync, replace, directory fsync and cleanup). That job owns the same
-Arc guard holder through physical completion, including caller abort or runtime
-shutdown. Guards release in Session, Task, lifecycle order. A successor activation
-claim cannot pass a parked job and then receive its late stale publication.
+既有的运行时投影仍会移除消息、原生 provider 会话记录与 Inbox 准入数据。main 历史保持字节一致。运行时替换使用已被接受的完整 std 文件系统作业（唯一临时文件、写入、文件 fsync、替换、目录 fsync 与清理）。该作业在物理完成之前（包括调用方中止或运行时关闭的情况）始终持有同一个 Arc 守卫持有器。守卫按 Session、Task、lifecycle 的顺序释放。后继激活 claim 不能越过被暂停的作业、随后又收到它迟到的过期发布。
 
-This guarantee applies to each started candidate job, not the entire async loop.
-A cancelled loop may not start later candidates or marker publication. The
-existing marker remains last, with its existing tmp/rename protocol. A failed
-run may leave earlier sidecars completed; rerun skips them and processes the
-remaining admissible candidates. An error after replace may have changed bytes
-without confirmation. There is no all-file rollback or new recovery journal.
-Missing or malformed main retains the existing skip policy; the migration marker
-is not a comprehensive authority audit.
+该保证适用于每个已启动的候选作业，而不是整个异步循环。被取消的循环可能不会启动后续候选者或标记发布。既有标记仍最后写入，沿用其 tmp/rename 协议。失败的运行可能留下已完成的早期 sidecar；重跑会跳过它们并处理其余可接纳的候选者。替换之后的错误可能在未确认的情况下已经改变了字节。没有全文件回滚，也没有新的恢复 journal。缺失或格式错误的 main 保持既有的跳过策略；迁移标记不是一次全面的权限审计。
 
-## Verification boundary
+## 验证边界
 
-Focused tests exercise the public migration, actual raw files, scan-to-lock races,
-physical FileExt probes across caller abort and runtime shutdown, precreated
-independent Stores and real successor claims, replacement errors/cleanup and
-partial rerun. A server integration test invokes the unchanged public initializer
-and verifies protected runtime stays absent with nonfatal startup behavior.
-Execution receipts must state the tested platform; source portability is not
-native Windows/Linux evidence. Existing Windows replacement behavior is retained.
+针对性测试演练公共迁移、真实的原始文件、从扫描到加锁的竞态、跨越调用方中止与运行时关闭的物理 FileExt 探针、预先创建的独立 Store 与真实的后继 claim、替换错误/清理以及部分重跑。一个服务端集成测试调用未变更的公共初始化器，并验证受保护的运行时保持缺失且启动行为非致命。执行回执必须注明实际测试的平台；源码可移植性不是原生 Windows/Linux 的证据。既有的 Windows 替换行为保持不变。
 
-This writer fence does not redesign Child history reads, which may still fall
-back to main when runtime is absent. Task CAS/undo (#1354), Supervisor management
-(#1355), default saves (#1350), fenced append (#1351), Inbox, runtime/provider
-admission, global caches and additional migration protocols remain independent.
+这一写入者围栏不重新设计 Child 历史读取——运行时缺失时它仍可能回退到 main。Task CAS/undo（#1354）、Supervisor 管理（#1355）、默认保存（#1350）、围栏式追加（#1351）、Inbox、运行时/provider 准入、全局缓存以及更多迁移协议都保持独立。

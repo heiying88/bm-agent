@@ -1,25 +1,16 @@
-# Real russh transport fixture
+# 真实 russh 传输夹具
 
-The repository-level runner starts this fixture and executes the ignored
-`russh_live` integration test:
+仓库级 runner 会启动这个夹具并执行带忽略标记的 `russh_live` 集成测试：
 
 ```sh
 scripts/run-russh-live.sh
 ```
 
-The runner requires a working Docker daemon, `ssh-keygen`, and Cargo. It creates
-an ephemeral Ed25519 client key, builds the digest-pinned Alpine fixture, binds
-the SSH port to a random loopback port, waits for the container health check,
-and always removes the container, image tag, and key directory on exit.
+该 runner 需要可用的 Docker 守护进程、`ssh-keygen` 和 Cargo。它会创建一个临时 Ed25519 客户端密钥，构建按摘要钉住的 Alpine 夹具，把 SSH 端口绑定到随机回环端口，等待容器健康检查通过，并在退出时总是清理容器、镜像标签和密钥目录。
 
-The container generates a fresh Ed25519 host key at startup. Only public-key
-authentication for the unprivileged `deploy` user is enabled; password, root,
-agent, X11, and local forwarding are disabled. Remote forwarding and
-`internal-sftp` remain enabled because they are the production contracts under
-test. No repository secret or external SSH service is used.
+容器在启动时生成全新的 Ed25519 主机密钥。只启用了非特权 `deploy` 用户的公钥认证；密码、root、agent、X11 以及本地转发均已禁用。远程转发和 `internal-sftp` 保持启用，因为它们正是被测试的生产契约。不使用任何仓库密钥或外部 SSH 服务。
 
-For an already-running SSH server, invoke the ignored test directly with either
-`RUSSH_KEY_PATH` (recommended) or `RUSSH_PASS`:
+对于已经在运行的 SSH 服务器，可直接用 `RUSSH_KEY_PATH`（推荐）或 `RUSSH_PASS` 调用这个被忽略的测试：
 
 ```sh
 RUSSH_HOST=127.0.0.1 \
@@ -30,7 +21,4 @@ cargo test --locked -p bamboo-broker --test russh_live \
   russh_deploys_through_reverse_tunnel -- --exact --ignored --nocapture
 ```
 
-The Rust test has a 60-second contract timeout. The protected Linux `Test` CI
-job additionally bounds the complete fixture build and execution to ten
-minutes, so startup or cleanup regressions fail closed instead of silently
-skipping.
+Rust 测试有 60 秒的契约超时。受保护的 Linux `Test` CI 作业还把夹具的完整构建与执行限制在十分钟内，这样启动或清理方面的回归会显式失败，而不是被静默跳过。

@@ -1,6 +1,6 @@
-# Bounded goal timeout recovery
+# 有界的目标超时恢复
 
-Goal recovery is disabled by default. A session's `gold_config` can enable it:
+目标恢复默认关闭。session 的 `gold_config` 可以启用它：
 
 ```json
 {
@@ -14,10 +14,10 @@ Goal recovery is disabled by default. A session's `gold_config` can enable it:
 }
 ```
 
-Lotus Next exposes these choices in the goal editor. Recovery requires an active goal, no pending completion declaration, no input/child/Bash suspension, available run budget, and coordinated persistence.
+Lotus Next 在目标编辑器中暴露这些选项。恢复要求：存在活动目标、没有待处理的完成声明、没有输入/子代/Bash 挂起、有可用的 run 预算，并且持久化已协调一致。
 
-After the ordinary three turn attempts, only structured replay-safe stream timeouts can reserve an extra attempt. A timeout after any semantic output or a partially emitted tool call is ineligible. Formatted provider error strings never qualify for these extra attempts.
+在普通的三次回合尝试之后，只有结构化且可安全重放的流超时才能预留额外尝试。在任何语义输出之后、或工具调用部分发出之后发生的超时不符合条件。格式化的 provider 错误字符串永远不会获得这些额外尝试。
 
-A reservation records its counter, goal identity, start time and next attempt time in session metadata before waiting. Extra attempts use exponential backoff from five seconds up to sixty seconds. The policy caps attempts at ten and the recovery window at one hour even if a larger value is supplied. The run's accumulated token/tool/subagent limits still apply; recovery does not replenish them. The current run retains ownership, so no second execution is launched. Stop interrupts both ordinary retry waits and recovery waits.
+预留在等待之前，会将其计数器、目标身份、开始时间与下次尝试时间记录到 session 元数据中。额外尝试使用指数退避，从 5 秒到最长 60 秒。即便提供更大的值，策略也会把尝试次数限制为 10 次、恢复窗口限制为 1 小时。当前 run 累积的 token/工具/子代理限额仍然适用；恢复不会补充它们。当前 run 保留所有权，因此不会启动第二次执行。Stop 会同时中断普通重试等待与恢复等待。
 
-Counters persist across reloads and are scoped to the goal. A resumed goal respects any remaining recorded backoff. Recovery does not start an idle session after a process restart; an explicit resume retains the existing retry budget. Terminal goals, corrupt recovery records and elapsed recovery windows do not receive extra retries. No account routing, provider-specific message matching, or unrestricted watchdog is introduced.
+计数器在重载之后保留，并限定在该目标范围内。恢复的目标会遵循任何剩余的已记录退避。进程重启后，恢复不会启动一个空闲的 session；显式恢复保留既有的重试预算。已终止的目标、损坏的恢复记录与已流逝的恢复窗口都不会获得额外重试。没有引入账户路由、provider 特定的消息匹配，也没有不受限制的看门狗。

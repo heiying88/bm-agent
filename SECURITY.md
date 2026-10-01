@@ -1,112 +1,111 @@
-# Security Policy
+# 安全策略
 
-## Supported Versions
+## 受支持的版本
 
-We release patches for security vulnerabilities. The project ships
-date-versioned nightly releases; the latest nightly is the supported line:
+我们会为安全漏洞发布补丁。本项目发布按日期编号的 nightly 版本；最新 nightly 是受支持的版本线：
 
-| Version                     | Supported          |
+| 版本                       | 支持情况            |
 | --------------------------- | ------------------ |
-| latest nightly (`2026.x`)   | :white_check_mark: |
-| `0.x` (legacy SemVer)       | :x:                |
+| 最新 nightly（`2026.x`）   | :white_check_mark: |
+| `0.x`（遗留 SemVer）       | :x:                |
 
-## Reporting a Vulnerability
+## 报告漏洞
 
-We take the security of Bamboo seriously. If you have discovered a security vulnerability, please report it to us.
+我们非常重视 Bamboo 的安全。如果你发现了安全漏洞，请向我们报告。
 
-### How to Report
+### 如何报告
 
-**Please do not report security vulnerabilities through public GitHub issues.**
+**请勿通过公开的 GitHub issue 报告安全漏洞。**
 
-Instead, please report them via email to: **mugeng.du@gmail.com**
+请改为通过邮件报告至：**mugeng.du@gmail.com**
 
-You should receive a response within 48 hours. If for some reason you do not, please follow up via email to ensure we received your original message.
+你应该会在 48 小时内收到回复。如果由于某种原因没有收到，请通过邮件跟进，以确保我们收到了你的原始消息。
 
-### What to Include
+### 报告内容
 
-Please include the following information in your report:
+请在报告中包含以下信息：
 
-- **Type of issue** (e.g., buffer overflow, SQL injection, cross-site scripting, etc.)
-- **Full paths of source file(s)** related to the manifestation of the issue
-- **The location of the affected source code** (tag/branch/commit or direct URL)
-- **Any special configuration** required to reproduce the issue
-- **Step-by-step instructions** to reproduce the issue
-- **Proof-of-concept or exploit code** (if possible)
-- **Impact of the issue**, including how an attacker might exploit it
+- **问题类型**（如缓冲区溢出、SQL 注入、跨站脚本等）
+- 与问题表现相关的**源文件完整路径**
+- **受影响源代码的位置**（tag/分支/commit 或直接 URL）
+- **重现问题所需的任何特殊配置**
+- **重现问题的分步说明**
+- **概念验证或利用代码**（如有可能）
+- **问题的影响**，包括攻击者可能如何利用
 
-### What to Expect
+### 后续预期
 
-- **Acknowledgment**: We'll acknowledge receipt of your report within 48 hours
-- **Assessment**: We'll assess the vulnerability and determine its severity
-- **Fix**: We'll work on a fix and prepare a security release
-- **Disclosure**: We'll coordinate disclosure with you
+- **确认**：我们会在 48 小时内确认收到你的报告
+- **评估**：我们会评估漏洞并确定其严重程度
+- **修复**：我们会着手修复并准备安全发布
+- **披露**：我们会与你协调披露事宜
 
-### Disclosure Policy
+### 披露策略
 
-- We will **not** disclose the vulnerability until a fix is ready
-- We will **credit you** in the security advisory (unless you prefer to remain anonymous)
-- We request that you **do not disclose** the vulnerability publicly until we have released a fix
+- 在修复就绪之前，我们**不会**披露该漏洞
+- 我们会在安全公告中**为你致谢**（除非你希望保持匿名）
+- 我们请求你在我们发布修复之前**不要公开披露**该漏洞
 
-## Security Best Practices
+## 安全最佳实践
 
-When using Bamboo in production:
+在生产环境中使用 Bamboo 时：
 
-1. **Keep updated**: Always use the latest stable version
-2. **Secure your API keys**: Never commit API keys to version control
-3. **Use environment variables**: Store sensitive configuration in environment variables
-4. **Enable rate limiting**: Use the built-in rate limiting features
-5. **Configure CORS**: Properly configure CORS for your use case
-6. **Regular audits**: Regularly audit your dependencies with `cargo audit`
+1. **保持更新**：始终使用最新的稳定版本
+2. **保护好你的 API 密钥**：绝不把 API 密钥提交到版本控制
+3. **使用环境变量**：把敏感配置存放在环境变量中
+4. **启用限流**：使用内置的限流功能
+5. **配置 CORS**：为你的使用场景正确配置 CORS
+6. **定期审计**：定期用 `cargo audit` 审计依赖
 
-## Security Features
+## 安全特性
 
-Bamboo includes several built-in security features:
+Bamboo 内置多项安全特性：
 
-- ✅ **Rate Limiting**: Built-in protection against DoS attacks
-- ✅ **CORS Configuration**: Configurable Cross-Origin Resource Sharing
-- ✅ **Input Validation**: Comprehensive input validation and sanitization
-- ✅ **Secure Headers**: Security headers for HTTP responses
-- ✅ **Encrypted Storage**: Encrypted storage for sensitive data
-- ✅ **API Key Protection**: Secure handling of LLM provider API keys
+- ✅ **限流**：内置的 DoS 攻击防护
+- ✅ **CORS 配置**：可配置的跨域资源共享
+- ✅ **输入校验**：全面的输入校验与净化
+- ✅ **安全响应头**：HTTP 响应的安全头
+- ✅ **加密存储**：敏感数据的加密存储
+- ✅ **API 密钥保护**：LLM provider API 密钥的安全处理
 
-## Known Security Considerations
+## 已知安全注意事项
 
-### API Keys
+### API 密钥
 
-- API keys for LLM providers are stored in configuration files
-- We recommend using environment variables for production deployments
-- Never commit API keys to version control
+- LLM provider 的 API 密钥存储在配置文件中
+- 我们建议生产部署使用环境变量
+- 绝不把 API 密钥提交到版本控制
 
-### Network Security
+### 网络安全
 
-- By default, Bamboo binds to `127.0.0.1` (localhost only)
-- For production, configure appropriate firewall rules
-- Use HTTPS in production environments
+- 默认情况下，Bamboo 绑定到 `127.0.0.1`（仅 localhost）
+- 生产环境请配置适当的防火墙规则
+- 生产环境请使用 HTTPS
 
-### Dependencies
+### 依赖
 
-We regularly audit our dependencies for known vulnerabilities:
+我们会定期审计依赖中的已知漏洞：
 
 ```bash
-# Run security audit
+# 运行安全审计
 cargo audit
 ```
 
-## Security Updates
+## 安全更新
 
-Security updates will be released as patch versions and announced via:
+安全更新将以补丁版本发布，并通过以下渠道公告：
 
-- GitHub Security Advisories
-- Release notes on GitHub
-- crates.io updates
+- GitHub 安全公告
+- GitHub 上的发布说明
+- crates.io 更新
 
-## Contact
+## 联系方式
 
-For any security-related questions or concerns, contact:
+如有任何安全相关问题或疑虑，请联系：
 
-- **Email**: mugeng.du@gmail.com
-- **GitHub**: https://github.com/bigduu/Bamboo-agent/security
+- **邮箱**：mugeng.du@gmail.com
+- **GitHub**：https://github.com/bigduu/Bamboo-agent/security
 
 ---
 
-**Last Updated**: 2026-02-23
+**最后更新**：2026-02-23

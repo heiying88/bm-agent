@@ -1,4 +1,4 @@
-# Architecture Overview — Broker-mediated remote sub-agents
+# 架构总览 —— 经 broker 中介的远端子代理
 
 > 本文是面向"怎么部署 / 项目结构 / 部署能力实现"的总览。
 > 配套设计文档: [SubAgent Actor runtime](subagent-actor-runtime-design.md)、

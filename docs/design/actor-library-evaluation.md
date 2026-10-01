@@ -1,36 +1,22 @@
-# Actor library decision for #791
+# 面向 #791 的 actor 库决策
 
-Decision date: 2026-09-29.
+决策日期：2026-09-29。
 
-## Current delivery boundary
+## 当前交付边界
 
-Finish the canonical local ActorSession, direct parent requests, durable
-SessionInbox admission, and parent/child wait and resume path first. Keep the
-already supported pinned WSS worker path bounded and fail closed. Automatic
-remote placement, migration, and failover remain outside the current delivery
-slice until a durable activation owner can fence transcript writes and Inbox
-acknowledgements across processes.
+先完成规范的本地 ActorSession、直接父请求、持久的 SessionInbox 准入，以及父/子等待与恢复路径。已支持的固定（pinned）WSS worker 路径保持有界且失败关闭。在持久激活 owner 能够跨进程为 transcript 写入与 Inbox 确认加上围栏之前，自动远程放置、迁移与故障转移仍留在当前交付切片之外。
 
-`ActorSession` and its Session history remain the durable agent identity.
-`SessionInbox` remains the durable message authority. A worker, mailbox address,
-or library actor reference is capacity or transport, not a second agent identity.
+`ActorSession` 及其 Session 历史仍是持久的 agent 身份。`SessionInbox` 仍是持久的消息 authority。worker、mailbox 地址或库的 actor 引用只是容量或传输手段，不是第二个 agent 身份。
 
-## Libraries evaluated
+## 评估过的库
 
-| Library | Useful capability | Fit with Bamboo |
+| 库 | 有用的能力 | 与 Bamboo 的契合度 |
 | --- | --- | --- |
-| [Ractor / ractor_cluster](https://docs.rs/ractor_cluster/latest/ractor_cluster/) | Typed actors, supervision, remote references and RPC | Best candidate for a small execution/supervision prototype. Its [runtime semantics](https://github.com/slawlor/ractor/blob/main/docs/runtime-semantics.md) say reconnects may lose messages; application-level acknowledgement, retry and idempotency are still required. |
-| [Coerce](https://docs.rs/coerce/latest/coerce/) | Remote actors, sharding, persistence and snapshots | Its own ActorSystem and persistence model would overlap Bamboo's current Session, directory and Inbox authority. A full migration would be a separate architecture change. |
-| [Kameo remote](https://docs.rs/kameo/latest/kameo/remote/index.html) | Remote actor references over libp2p | Its peer-to-peer network differs from Bamboo's broker-mediated topology. |
-| [Actix](https://actix.rs/docs/whatis/) | In-process actors and supervision | Does not replace Bamboo's cross-process durable delivery. `actix-web` in the server is not itself an Actix Actor runtime. |
+| [Ractor / ractor_cluster](https://docs.rs/ractor_cluster/latest/ractor_cluster/) | 类型化 actor、监督、远程引用与 RPC | 小型执行/监督原型的最佳候选。其[运行时语义](https://github.com/slawlor/ractor/blob/main/docs/runtime-semantics.md)指出重连可能丢消息；仍需要应用层的确认、重试与幂等。 |
+| [Coerce](https://docs.rs/coerce/latest/coerce/) | 远程 actor、分片、持久化与 snapshot | 它自带的 ActorSystem 与持久化模型会与 Bamboo 现有的 Session、目录和 Inbox authority 重叠。完整迁移将是一次独立的架构变更。 |
+| [Kameo remote](https://docs.rs/kameo/latest/kameo/remote/index.html) | 基于 libp2p 的远程 actor 引用 | 其点对点网络与 Bamboo 由 broker 中介的拓扑不同。 |
+| [Actix](https://actix.rs/docs/whatis/) | 进程内 actor 与监督 | 无法替代 Bamboo 的跨进程持久投递。服务端的 `actix-web` 本身并不是 Actix Actor 运行时。 |
 
-No library here supplies the full combination of Bamboo's stable Session
-identity, direct-parent authority, checkpoint-before-ack admission, Project
-boundary, and cross-process activation fencing. Replacing the broker or Inbox
-now would require proving these contracts again and would delay the local #791
-path.
+这里没有一个库能完整提供 Bamboo 所需的组合：稳定的 Session 身份、直接父 authority、先 checkpoint 后 ack 的准入、Project 边界，以及跨进程激活围栏。现在就替换 broker 或 Inbox，需要重新证明这些契约，并会拖延本地 #791 路径。
 
-If a later prototype adopts a library, place it behind the execution or
-supervision seam and keep Bamboo's Session and Inbox as the only durable
-authorities. Compare it against the existing implementation with the same
-restart, duplicate delivery, parent request, and worker replacement tests.
+如果之后的原型采纳某个库，应把它放在执行或监督的接缝之后，并让 Bamboo 的 Session 与 Inbox 仍是仅有的持久 authority。要用同样的重启、重复投递、父请求与 worker 替换测试，把它与既有实现进行对比。

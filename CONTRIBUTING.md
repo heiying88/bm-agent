@@ -1,265 +1,264 @@
-# Contributing to Bamboo
+# 为 Bamboo 贡献
 
-First off, thank you for considering contributing to Bamboo! It's people like you that make Bamboo such a great tool.
+首先，感谢你考虑为 Bamboo 贡献！正是像你这样的人让 Bamboo 成为一个出色的工具。
 
-## Code of Conduct
+## 行为准则
 
-This project and everyone participating in it is governed by the [Bamboo Code of Conduct](CODE_OF_CONDUCT.md). By participating, you are expected to uphold this code.
+本项目及所有参与者均受 [Bamboo 行为准则](CODE_OF_CONDUCT.md)约束。参与本项目即表示你应遵守该准则。
 
-## How Can I Contribute?
+## 我可以如何贡献？
 
-### Reporting Bugs
+### 报告 Bug
 
-Before creating bug reports, please check the issue list as you might find out that you don't need to create one. When you are creating a bug report, please include as many details as possible:
+在创建 bug 报告之前，请先查看 issue 列表，也许你会发现根本不必新建。创建 bug 报告时，请尽可能包含详细信息：
 
-- **Use a clear and descriptive title**
-- **Describe the exact steps to reproduce the problem**
-- **Provide specific examples to demonstrate the steps**
-- **Describe the behavior you observed and what behavior you expected**
-- **Include logs and screenshots if helpful**
-- **Specify your environment** (OS, Rust version, bamboo version)
+- **使用清晰、有描述性的标题**
+- **描述重现问题的确切步骤**
+- **提供具体示例来演示这些步骤**
+- **描述你观察到的行为以及你期望的行为**
+- **如有帮助，附上日志和截图**
+- **说明你的环境**（操作系统、Rust 版本、bamboo 版本）
 
-### Suggesting Enhancements
+### 提出增强建议
 
-Enhancement suggestions are tracked as GitHub issues. When creating an enhancement suggestion, include:
+增强建议以 GitHub issue 的形式跟踪。创建增强建议时，请包含：
 
-- **Use a clear and descriptive title**
-- **Provide a detailed description of the suggested enhancement**
-- **Explain why this enhancement would be useful**
-- **List some examples of how it would be used**
-- **Specify which module/component it affects**
+- **使用清晰、有描述性的标题**
+- **详细描述所建议的增强**
+- **解释这个增强为什么有用**
+- **列举一些使用方式的示例**
+- **说明它影响哪个模块/组件**
 
-### Pull Requests
+### Pull Request
 
-- Fill in the required template
-- Do not include issue numbers in the PR title
-- Include screenshots and animated GIFs in your pull request whenever possible
-- Follow the Rust code style guidelines
-- Include tests for new functionality
-- Update documentation for changed functionality
-- End all files with a newline
+- 填写必需的模板
+- PR 标题中不要包含 issue 编号
+- 尽可能在 pull request 中附上截图和动画 GIF
+- 遵循 Rust 代码风格指南
+- 为新功能编写测试
+- 为已变更的功能更新文档
+- 所有文件以换行符结尾
 
-## Development Setup
+## 开发环境搭建
 
-### Prerequisites
+### 前置要求
 
-- Rust 1.95 or later
+- Rust 1.95 或更高版本
 - Cargo
 - Git
 
-### Setting Up Your Development Environment
+### 配置你的开发环境
 
-1. Fork and clone the repository:
+1. Fork 并克隆仓库：
    ```bash
    git clone https://github.com/YOUR_USERNAME/bamboo.git
    cd bamboo
    ```
 
-2. Create a branch from the integration branch for your changes:
+2. 从集成分支创建你的变更分支：
    ```bash
    git checkout dev
    git pull --ff-only
    git checkout -b feature/my-new-feature
    ```
 
-3. Build the project:
+3. 构建项目：
    ```bash
    cargo build
    ```
 
-4. Run tests:
+4. 运行测试：
    ```bash
    cargo test
    ```
 
-5. Run the server:
+5. 运行服务器：
    ```bash
    cargo run -- serve
    ```
 
-### Running Tests
+### 运行测试
 
 ```bash
-# Verify the complete workspace on the minimum supported Rust version
+# 在最低支持的 Rust 版本上校验完整 workspace
 cargo +1.95.0 check --locked --workspace --all-targets --all-features
 
-# Run all tests
+# 运行全部测试
 cargo test
 
-# Run specific test suite
+# 运行特定测试套件
 cargo test --test server_integration
 
-# Run tests with verbose output
+# 以详细输出运行测试
 cargo test -- --nocapture
 
-# Run specific test
+# 运行特定测试
 cargo test test_bamboo_config_default
 ```
 
-### Code Style
+### 代码风格
 
-We follow standard Rust conventions:
+我们遵循标准 Rust 惯例：
 
-- Use `cargo fmt` to format your code
-- Use `cargo clippy` to catch common mistakes
-- Write documentation comments for public APIs
-- Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
+- 使用 `cargo fmt` 格式化代码
+- 使用 `cargo clippy` 捕获常见错误
+- 为公开 API 编写文档注释
+- 遵循 [Rust API 指南](https://rust-lang.github.io/api-guidelines/)
 
-### Commit Messages
+### 提交信息
 
-- Use the present tense ("Add feature" not "Added feature")
-- Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
-- Limit the first line to 72 characters or less
-- Reference issues and pull requests liberally after the first line
-- Consider starting the commit message with an applicable emoji:
-  - 🎨 `:art:` when improving the format/structure of the code
-  - 🐎 `:racehorse:` when improving performance
-  - 🚱 `:non-potable_water:` when plugging memory leaks
-  - 📝 `:memo:` when writing docs
-  - 🐛 `:bug:` when fixing a bug
-  - 🔥 `:fire:` when removing code or files
-  - 💚 `:green_heart:` when fixing the CI build
-  - ✅ `:white_check_mark:` when adding tests
-  - 🔒 `:lock:` when dealing with security
-  - ⬆️ `:arrow_up:` when upgrading dependencies
-  - ⬇️ `:arrow_down:` when downgrading dependencies
+- 使用一般现在时（"Add feature" 而非 "Added feature"）
+- 使用祈使语气（"Move cursor to..." 而非 "Moves cursor to..."）
+- 首行不超过 72 个字符
+- 首行之后可随意引用 issue 和 pull request
+- 考虑以适用的 emoji 开头：
+  - 🎨 `:art:` 改进代码格式/结构时
+  - 🐎 `:racehorse:` 提升性能时
+  - 🚱 `:non-potable_water:` 堵住内存泄漏时
+  - 📝 `:memo:` 撰写文档时
+  - 🐛 `:bug:` 修复 bug 时
+  - 🔥 `:fire:` 删除代码或文件时
+  - 💚 `:green_heart:` 修复 CI 构建时
+  - ✅ `:white_check_mark:` 添加测试时
+  - 🔒 `:lock:` 处理安全问题时
+  - ⬆️ `:arrow_up:` 升级依赖时
+  - ⬇️ `:arrow_down:` 降级依赖时
 
-### Project Structure
+### 项目结构
 
-Bamboo uses a Cargo workspace with the following crates under `crates/`:
+Bamboo 使用 Cargo workspace，`crates/` 下包含以下 crate：
 
 ```
 bamboo/
-├── src/                    # Main crate (bamboo-agent root)
-│   └── bin/bamboo.rs       # CLI binary entry point
+├── src/                    # 主 crate（bamboo-agent 根）
+│   └── bin/bamboo.rs       # CLI 二进制入口
 ├── crates/
-│   ├── bamboo-agent-core/  # Agent runtime core, composition, storage, tools
-│   ├── bamboo-compression/ # Context compression and summarization
-│   ├── bamboo-domain/      # Domain types: sessions, tools, workflows, schedules, MCP
-│   ├── bamboo-engine/      # Agent engine: MCP, metrics, runtime, skills
-│   ├── bamboo-infrastructure/ # Config, LLM providers, process management, storage
-│   ├── bamboo-memory/      # Memory system: durable memory, budget, Dream notebook
-│   ├── bamboo-server/      # HTTP server, handlers, routes, app state
-│   └── bamboo-tools/       # Tool registry, executor, orchestrator, built-in tools
-├── tests/                  # Integration tests
-├── Cargo.toml              # Workspace manifest
+│   ├── bamboo-agent-core/  # Agent 运行时核心、组合、存储、工具
+│   ├── bamboo-compression/ # 上下文压缩与摘要
+│   ├── bamboo-domain/      # 领域类型：会话、工具、工作流、调度、MCP
+│   ├── bamboo-engine/      # Agent 引擎：MCP、指标、运行时、skill
+│   ├── bamboo-infrastructure/ # 配置、LLM provider、进程管理、存储
+│   ├── bamboo-memory/      # 记忆系统：持久记忆、预算、Dream 笔记本
+│   ├── bamboo-server/      # HTTP 服务器、handler、路由、应用状态
+│   └── bamboo-tools/       # 工具注册表、执行器、编排器、内置工具
+├── tests/                  # 集成测试
+├── Cargo.toml              # workspace 清单
 └── README.md
 ```
 
-### Workspace Crate Responsibilities
+### Workspace crate 职责
 
-| Crate | Responsibility |
+| Crate | 职责 |
 |---|---|
-| `bamboo-agent-core` | Agent system composition, workspace state, core agent types |
-| `bamboo-compression` | Context compression, summarization, token limits |
-| `bamboo-domain` | Domain types for sessions, tools, workflows, schedules, MCP config |
-| `bamboo-engine` | Agent engine: MCP integration, metrics, runtime, skill execution |
-| `bamboo-infrastructure` | Configuration management, LLM providers, process management, SQLite storage |
-| `bamboo-memory` | Memory system, token budget management, Dream notebook |
-| `bamboo-server` | HTTP server, request handlers, routes, session app state |
-| `bamboo-tools` | Tool registry, executor, orchestrator, built-in tools, permission system |
+| `bamboo-agent-core` | Agent 系统组合、workspace 状态、核心 Agent 类型 |
+| `bamboo-compression` | 上下文压缩、摘要、token 限制 |
+| `bamboo-domain` | 会话、工具、工作流、调度、MCP 配置的领域类型 |
+| `bamboo-engine` | Agent 引擎：MCP 集成、指标、运行时、skill 执行 |
+| `bamboo-infrastructure` | 配置管理、LLM provider、进程管理、SQLite 存储 |
+| `bamboo-memory` | 记忆系统、token 预算管理、Dream 笔记本 |
+| `bamboo-server` | HTTP 服务器、请求 handler、路由、会话应用状态 |
+| `bamboo-tools` | 工具注册表、执行器、编排器、内置工具、权限系统 |
 
-### Module Guidelines
+### 模块准则
 
-- Each module should have a clear responsibility
-- Use `mod.rs` to re-export public APIs
-- Document all public items
-- Include unit tests within modules
-- Keep module dependencies minimal
+- 每个模块应有清晰的职责
+- 使用 `mod.rs` 再导出公开 API
+- 为所有公开条目编写文档
+- 在模块内包含单元测试
+- 保持模块依赖最少
 
-### Testing Guidelines
+### 测试准则
 
-- Write tests for all new functionality
-- Ensure all tests pass before submitting PRs
-- Use descriptive test names
-- Include edge cases in tests
-- Use `#[tokio::test]` for async tests
-- Use `tempfile` for tests that need file system access
-- On macOS, use `scripts/run-macos-server-lib-tests.sh` for the monolithic
-  `bamboo-server` lib-test. The library package's directly linked test/example
-  artifacts disable Apple's compact-unwind table because the crate's DWARF
-  unwind records exceed that format's 16 MiB offset limit. DWARF unwinding and
-  line tables remain enabled for panic backtraces and debugging. The flag has
-  no final-link effect while creating the rlib and is not propagated to
-  downstream dev/release binaries.
+- 为所有新功能编写测试
+- 提交 PR 前确保所有测试通过
+- 使用描述性的测试名
+- 测试中包含边界情况
+- 异步测试使用 `#[tokio::test]`
+- 需要文件系统访问的测试使用 `tempfile`
+- 在 macOS 上，使用 `scripts/run-macos-server-lib-tests.sh` 运行单体
+  `bamboo-server` lib 测试。该库包直接链接的测试/示例产物会禁用
+  Apple 的紧凑展开表，因为该 crate 的 DWARF 展开记录超出了该格式
+  16 MiB 的偏移限制。DWARF 展开与行号表仍为 panic 回溯和调试启用。
+  该标志在生成 rlib 时没有最终链接效应，也不会传播到下游
+  dev/release 二进制。
 
-### Documentation Guidelines
+### 文档准则
 
-- Update README.md if you change functionality
-- Update API documentation with `///` comments
-- Include examples in documentation
-- Keep CHANGELOG.md updated
-- Add inline comments for complex logic
+- 变更功能时更新 README.md
+- 用 `///` 注释更新 API 文档
+- 文档中包含示例
+- 保持 CHANGELOG.md 更新
+- 为复杂逻辑添加行内注释
 
-## Release Process
+## 发布流程
 
-1. Update CHANGELOG.md with new version
-2. Update version in Cargo.toml
-3. Create a git tag: `git tag v0.x.0`
-4. Push tag: `git push origin v0.x.0`
-5. CI will automatically publish to crates.io
+1. 用新版本更新 CHANGELOG.md
+2. 更新 Cargo.toml 中的版本号
+3. 创建 git tag：`git tag v0.x.0`
+4. 推送 tag：`git push origin v0.x.0`
+5. CI 会自动发布到 crates.io
 
-## Additional Notes
+## 补充说明
 
-### Issue and Pull Request Labels
+### Issue 与 Pull Request 标签
 
-- `bug` - Something isn't working
-- `enhancement` - New feature or request
-- `documentation` - Improvements or additions to documentation
-- `good first issue` - Good for newcomers
-- `help wanted` - Extra attention is needed
-- `wontfix` - This will not be worked on
+- `bug` - 某些功能不工作
+- `enhancement` - 新功能或请求
+- `documentation` - 文档改进或补充
+- `good first issue` - 适合新手
+- `help wanted` - 需要额外关注
+- `wontfix` - 不会处理
 
-## CI/CD Setup
+## CI/CD 设置
 
-### Existing Workflows
+### 现有工作流
 
-Bamboo uses GitHub Actions for continuous integration and publishing:
+Bamboo 使用 GitHub Actions 进行持续集成与发布：
 
-- **CI** (`.github/workflows/ci.yml`) -- Pull requests into `dev` run locked Rust build/test, formatting, and CI workflow policy checks in the required `Test` gate. Pull requests into `main`, pushes to `main`, and manual dispatches retain comprehensive validation, with the all-feature library and integration suite in the required `E2E Tests` job. Only promotion pull requests from this repository's `dev` branch into `main` add release builds on Linux, macOS, and Windows; manual dispatches also run that platform matrix. Linux TLS and frontend contract tests run in `Test`, while macOS and Windows run their platform-specific checks. Successful dev PR builds can reuse their own Rust cache until closure; `.github/workflows/pr-cache-cleanup.yml` then removes only that same-repository PR's merge-ref caches.
-- **CodeQL** (`.github/workflows/codeql.yml`) -- Runs the Actions, JavaScript/TypeScript, Python, and Rust analyses for pull requests into `main`, pushes to `main`, and explicit manual dispatches. Routine `dev` activity does not run CodeQL.
-- **Publish Crate** (`.github/workflows/publish-crate.yml`) -- Publishes the workspace crates to crates.io in dependency order. Normally dispatched by the Zenith release train with the unified date version and the `@bigduu/lotus` frontend version to embed; supports `dry_run`.
-- **Publish Docker image** (`.github/workflows/docker-publish.yml`) -- Builds the multi-arch container image and pushes it to GHCR.
-- **Documentation** (`.github/workflows/docs.yml`) -- Builds documentation on every push to main. Deploys to GitHub Pages.
+- **CI**（`.github/workflows/ci.yml`）—— 进入 `dev` 的 pull request 会在必需的 `Test` 门中运行锁定版本的 Rust 构建/测试、格式化以及 CI 工作流策略检查。进入 `main` 的 pull request、推送到 `main` 以及手动派发保留全面验证，全特性库与集成套件位于必需的 `E2E Tests` 作业中。只有本仓库 `dev` 分支进入 `main` 的晋升 pull request 才会附加 Linux、macOS 和 Windows 上的发布构建；手动派发也会运行该平台矩阵。Linux TLS 与前端契约测试在 `Test` 中运行，而 macOS 和 Windows 运行各自平台特定的检查。成功的 dev PR 构建可以复用自己的 Rust 缓存直至关闭；随后 `.github/workflows/pr-cache-cleanup.yml` 只移除同一仓库该 PR merge-ref 的缓存。
+- **CodeQL**（`.github/workflows/codeql.yml`）—— 对进入 `main` 的 pull request、推送到 `main` 以及显式手动派发运行 Actions、JavaScript/TypeScript、Python 和 Rust 分析。日常 `dev` 活动不运行 CodeQL。
+- **Publish Crate**（`.github/workflows/publish-crate.yml`）—— 按依赖顺序把 workspace crate 发布到 crates.io。通常由 Zenith 发布列车派发，携带统一的日期版本和要嵌入的 `@bigduu/lotus` 前端版本；支持 `dry_run`。
+- **Publish Docker image**（`.github/workflows/docker-publish.yml`）—— 构建多架构容器镜像并推送到 GHCR。
+- **Documentation**（`.github/workflows/docs.yml`）—— 每次推送到 main 时构建文档，部署到 GitHub Pages。
 
-### Badge URLs
+### 徽章 URL
 
-After workflows run, badges resolve to:
+工作流运行后，徽章解析到：
 
-- CI: `https://github.com/bigduu/Bamboo-agent/actions/workflows/ci.yml`
-- Documentation: `https://github.com/bigduu/Bamboo-agent/actions/workflows/docs.yml`
-- GitHub Pages: `https://bigduu.github.io/Bamboo-agent/`
-- docs.rs: `https://docs.rs/bamboo-agent` (built automatically after publishing to crates.io)
+- CI：`https://github.com/bigduu/Bamboo-agent/actions/workflows/ci.yml`
+- 文档：`https://github.com/bigduu/Bamboo-agent/actions/workflows/docs.yml`
+- GitHub Pages：`https://bigduu.github.io/Bamboo-agent/`
+- docs.rs：`https://docs.rs/bamboo-agent`（发布到 crates.io 后自动构建）
 
-### Setup Checklist
+### 设置清单
 
-1. Push changes to GitHub to trigger CI.
-2. Enable GitHub Pages: **Settings > Pages > Source** set to **GitHub Actions**.
-3. Add `CARGO_REGISTRY_TOKEN` secret under **Settings > Secrets and variables > Actions** for crates.io publishing.
-4. Verify badge status in README after pushing.
+1. 推送变更到 GitHub 以触发 CI。
+2. 启用 GitHub Pages：**Settings > Pages > Source** 设为 **GitHub Actions**。
+3. 在 **Settings > Secrets and variables > Actions** 下添加 `CARGO_REGISTRY_TOKEN` secret，用于 crates.io 发布。
+4. 推送后在 README 中确认徽章状态。
 
-## E2E Testing
+## E2E 测试
 
 ```bash
-# Run all e2e tests
+# 运行全部 e2e 测试
 cargo test --test e2e
 
-# Run specific test
+# 运行特定测试
 cargo test --test e2e test_health_endpoint
 ```
 
-Tests cover all API endpoints (chat, execute, events, sessions, tasks, respond, metrics, MCP, health). Each test is isolated using actix-web's in-memory test framework.
+测试覆盖所有 API 端点（chat、execute、events、sessions、tasks、respond、metrics、MCP、health）。每个测试都使用 actix-web 的内存测试框架实现隔离。
 
-### Adding E2E tests
+### 添加 E2E 测试
 
-1. Create `tests/e2e/new_endpoint.rs`
-2. Use `create_test_app()` helper from `common`
-3. Add the module to `tests/e2e/mod.rs`
+1. 创建 `tests/e2e/new_endpoint.rs`
+2. 使用 `common` 中的 `create_test_app()` 辅助函数
+3. 把模块加入 `tests/e2e/mod.rs`
 
-## Questions?
+## 有疑问？
 
-Feel free to open an issue with the question label or start a discussion on GitHub.
+欢迎打开带 question 标签的 issue，或在 GitHub 上发起讨论。
 
 ---
 
-Thank you for contributing!
+感谢你的贡献！

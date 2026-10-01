@@ -1,24 +1,19 @@
-# Root deletion and explicit recreation
+# Root 删除与显式重建
 
-V2 storage retains canonical revocation evidence when a Root is deleted. An old
-full or runtime snapshot cannot recreate that Root through ordinary save, even
-when its directory and index entry are gone or another process has restarted.
-The existing Root context fence still checks birth, Project and metadata revision
-when a live directory exists.
+当 Root 被删除时，V2 存储会保留规范的吊销证据。旧的完整或运行时快照无法通过普通保存重建该 Root，即使其目录与索引条目已经消失，或另一个进程已经重启。当活跃目录存在时，既有的 Root 上下文 fence 仍会检查 birth、Project 与元数据修订。
 
-The lifetime cases have distinct boundaries:
+各生命周期情形有各自明确的边界：
 
-| Operation | Result |
+| 操作 | 结果 |
 | --- | --- |
-| First full save of a never-deleted ID | Creates the Root as before. |
-| First runtime save with no persisted target | Falls back to full creation as before. |
-| Retry of an interrupted initial full save | May finish an empty creation layout or the exact existing runtime birth/context; it cannot advance a partial pair's context. |
-| Ordinary full/runtime save after deletion | Returns typed `SessionAuthorityConflict` before writing files, index, or search work. |
-| Trusted explicit same-ID recreation | Constructs a blank Ordinary Root with a host-generated birth newer than every revoked lifetime. |
-| Retry after complete recreation publication | Strictly validates the complete pair and returns the surviving Root, preserving its model and history. |
+| 首次完整保存从未删除过的 ID | 与之前一样创建 Root。 |
+| 首次运行时保存且没有持久化目标 | 与之前一样回退到完整创建。 |
+| 重试被中断的首次完整保存 | 可能完成一个空的创建布局，或精确落定既有的 runtime birth/context；不能推进残缺配对的 context。 |
+| 删除之后的普通完整/运行时保存 | 在写入文件、索引或搜索工作之前返回类型化的 `SessionAuthorityConflict`。 |
+| 受信任的同 ID 显式重建 | 构造一个空白 Ordinary Root，其宿主生成的 birth 晚于所有已吊销的生命周期。 |
+| 完整重建发布之后的重试 | 严格校验完整配对并返回幸存的 Root，保留其模型与历史。 |
 
-Trusted hosts can recreate a deleted Ordinary ID through the Storage port exposed
-by the SDK:
+受信任的宿主可以通过 SDK 暴露的 Storage 端口重建已删除的 Ordinary ID：
 
 ```rust,no_run
 use bamboo_sdk::Agent;
@@ -32,60 +27,18 @@ async fn recreate(agent: &Agent, deleted_id: &str) -> std::io::Result<()> {
 }
 ```
 
-The operation takes an ID and initial model, constructs the Session itself, and
-does not accept a snapshot or caller-selected birth marker. It is an in-process
-host port, with no model tool or new HTTP route. Normal HTTP creation uses fresh
-IDs and retains its existing idempotency contract. The reserved default Supervisor
-uses its separate trusted bootstrap port, which also assigns a fresh birth after
-deletion. Unsupported Storage implementations fail before mutation.
+该操作接受一个 ID 与初始模型，自行构造 Session，不接受快照，也不接受调用者选择的 birth 标记。它是一个进程内宿主端口，没有模型工具，也没有新的 HTTP 路由。正常的 HTTP 创建使用全新的 ID，并保持既有的幂等契约。保留的默认 Supervisor 使用其独立的受信任引导端口，该端口在删除之后同样会分配新的 birth。不支持的 Storage 实现会在任何变更之前失败。
 
-Deletion acquires the existing exclusive lifecycle and Task locks, reads birth
-markers from canonical main/runtime files, then atomically writes and synchronizes
-`.root-revocations/<id>.json`. The record contains the ID, format version, and
-greatest revoked birth. It records only deletion evidence: active sessions and
-Supervisor management grants have no parallel registry. The cutoff never
-decreases. Recreation chooses the later of the current clock and one nanosecond
-after that cutoff; timestamp exhaustion is an error before publication.
+删除会获取既有的独占生命周期锁与 Task 锁，从规范的 main/runtime 文件读取 birth 标记，然后原子写入并同步 `.root-revocations/<id>.json`。该记录包含 ID、格式版本与最大的已吊销 birth。它只记录删除证据：活动 session 与 Supervisor 管理授权没有平行的注册表。截断值从不会减小。重建会选择当前时钟与比该截断值晚 1 纳秒的时刻中较晚的一个；时间戳耗尽会在发布之前报错。
 
-Revocation publication is the logical deletion point. Physical directory removal
-and derived index removal follow it, with removal errors propagated. A failure or
-crash after revocation can leave files or index rows behind, but strict authority,
-history, runtime, copy, migration and index-rebuild paths cannot restore the
-revoked Root's authority. Remaining children are hidden while that Root is
-revoked. Startup reconciles stale derived index rows from the same revocation
-evidence. Damage confined to one Root hides only that Root and its children from
-the derived index; reconciliation repeats after a required rebuild so compatibility
-recovery cannot restore those rows while healthy Roots remain available. A retry
-or trusted recreation can remove a remaining revoked directory.
+吊销的发布是逻辑上的删除点。物理目录移除与派生索引移除随后进行，移除错误会向外传播。吊销之后的失败或崩溃可能留下文件或索引行，但严格的权威、历史、运行时、复制、迁移与索引重建路径都无法恢复被吊销 Root 的权威。该 Root 处于吊销状态期间，剩余的子代会被隐藏。启动时依据同一份吊销证据对账过期的派生索引行。局限于一个 Root 的损坏只会让该 Root 及其子代从派生索引中隐藏；必要的重建之后会重复对账，因此在健康的 Root 仍然可用时，兼容性恢复无法恢复这些行。重试或受信任的重建可以移除残留的被吊销目录。
 
-Recreation and Supervisor bootstrap publish a complete main/runtime pair through
-staged-directory rename under those same locks. A crash before publication leaves
-no new authority; unpublished staging directories are inert. A crash after pair
-publication but before index publication preserves the new lifetime, and retry
-repairs the index. Ordinary save callers still use the existing per-session and
-Task locks, so deletion cannot race the final writer check or a filesystem commit.
+重建与 Supervisor 引导在同一批锁之下，通过暂存目录重命名发布完整的 main/runtime 配对。发布之前的崩溃不会留下新的权威；未发布的暂存目录是惰性的。配对发布之后、索引发布之前的崩溃会保留新的生命周期，重试会修复索引。普通保存调用者仍然使用既有的每 session 锁与 Task 锁，因此删除不会与最终写入者检查或文件系统提交发生竞争。
 
-Revocations live outside `sessions/` and survive the development `dev_reset`
-operation. Reset first records the canonical Roots it removes, including Roots
-missing from a stale local index. This prevents surviving processes from saving
-old snapshots after a history reset. Cleanup uses the same Root deletion boundary.
-Revocation evidence is not automatically pruned while old snapshots may exist.
+吊销记录位于 `sessions/` 之外，在开发用的 `dev_reset` 操作之后仍会保留。重置会先记录它移除的规范 Root，包括陈旧本地索引中缺失的 Root。这防止幸存的进程在历史重置之后保存旧快照。清理使用同一个 Root 删除边界。只要旧快照可能存在，吊销证据就不会被自动清理。
 
-Existing corrupt, mismatched, unreadable, or non-regular revocation evidence fails
-closed. As with all canonical Session data, arbitrary removal or rollback of
-canonical files by the operating-system user is outside the storage trust
-boundary; no second index reconstructs deleted revocations. Deletions completed
-by older Bamboo versions before revocation evidence existed cannot be recovered
-retroactively. Unreadable canonical birth files must be repaired before a new
-deletion can safely establish their cutoff.
+既有的损坏、不匹配、不可读或非 regular 文件的吊销证据都会失败关闭。与所有规范 Session 数据一样，操作系统用户对规范文件的任意删除或回滚位于存储信任边界之外；没有第二个索引可以重建已删除的吊销记录。在吊销证据出现之前由旧版 Bamboo 完成的删除无法追溯恢复。不可读的规范 birth 文件必须先修复，新的删除才能安全地确立它们的截断值。
 
-The typed writer error also prevents the existing runtime persistence callbacks
-from publishing a rejected snapshot to caches or events, including callers that
-normally publish runtime state after an unrelated I/O error. A cached role, old
-snapshot, or recreated ID is not management authority; Supervisor controls must
-read the strict current Root and bind to its new birth/context.
+该类型化的写入者错误还会防止既有的运行时持久化回调把被拒绝的快照发布到缓存或事件，包括那些通常会在无关 I/O 错误之后仍发布运行时状态的调用者。缓存的角色、旧快照或重建的 ID 都不是管理权限；Supervisor 控制必须读取严格的当前 Root，并绑定到它的新 birth/context。
 
-This boundary does not implement Supervisor relationships or control tools, and
-does not add generic Child or Task incarnations. In particular, it does not claim
-to distinguish an old child snapshot from a newly created child after the parent
-Root has been explicitly recreated; that requires its own lifecycle contract.
+该边界不实现 Supervisor 关系或控制工具，也不添加通用的 Child 或 Task 化身。特别地，它并不声称能在父 Root 被显式重建之后区分旧的子代快照与新建的子代；那需要其自己的生命周期契约。

@@ -1,27 +1,27 @@
-# Migration Guide
+# 迁移指南
 
-This guide helps you migrate from the old `agent-*` crates to the unified `bamboo-agent` crate.
+本指南帮助你从旧的 `agent-*` crate 迁移到统一的 `bamboo-agent` crate。
 
-## Overview
+## 概述
 
-Bamboo is now organized as a Cargo workspace with the following crates under `crates/`:
+Bamboo 现在组织为一个 Cargo workspace，`crates/` 下包含以下 crate：
 
-- `bamboo-agent-core` -- Agent runtime core, composition, storage, tools
-- `bamboo-compression` -- Context compression and summarization
-- `bamboo-domain` -- Domain types: sessions, tools, workflows, schedules, MCP
-- `bamboo-engine` -- Agent engine: MCP, metrics, runtime, skills
-- `bamboo-infrastructure` -- Config, LLM providers, process management, storage
-- `bamboo-memory` -- Memory system: durable memory, budget, Dream notebook
-- `bamboo-server` -- HTTP server, handlers, routes, app state
-- `bamboo-tools` -- Tool registry, executor, orchestrator, built-in tools
+- `bamboo-agent-core` —— agent 运行时核心、组合、存储、工具
+- `bamboo-compression` —— 上下文压缩与摘要
+- `bamboo-domain` —— 领域类型：会话、工具、工作流、调度、MCP
+- `bamboo-engine` —— agent 引擎：MCP、指标、运行时、skill
+- `bamboo-infrastructure` —— 配置、LLM provider、进程管理、存储
+- `bamboo-memory` —— 记忆系统：持久记忆、预算、Dream 笔记本
+- `bamboo-server` —— HTTP 服务器、handler、路由、应用状态
+- `bamboo-tools` —— 工具注册表、执行器、编排器、内置工具
 
-These replace the earlier monolithic `bamboo-agent` crate with internal modules such as `chat_core`, `agent-core`, `agent-llm`, `agent-tools`, `agent-metrics`, `agent-mcp`, `agent-loop`, `agent-server`, `agent-skill`, `agent-cli`, and `web_service`.
+它们取代的是早先那个单体 `bamboo-agent` crate——其内部模块包括 `chat_core`、`agent-core`、`agent-llm`、`agent-tools`、`agent-metrics`、`agent-mcp`、`agent-loop`、`agent-server`、`agent-skill`、`agent-cli` 和 `web_service`。
 
-## Migration Steps
+## 迁移步骤
 
-### 1. Update Cargo.toml
+### 1. 更新 Cargo.toml
 
-**Before:**
+**迁移前：**
 ```toml
 [dependencies]
 chat_core = { path = "../chat_core" }
@@ -31,175 +31,175 @@ agent-tools = { path = "../agent-tools" }
 web_service = { path = "../web_service" }
 ```
 
-**After:**
+**迁移后：**
 ```toml
 [dependencies]
 bamboo-agent = "2026.4"
-# Or use individual workspace crates:
+# 或者使用各个 workspace crate：
 # bamboo-domain = { path = "../crates/bamboo-domain" }
 # bamboo-server = { path = "../crates/bamboo-server" }
 # bamboo-tools = { path = "../crates/bamboo-tools" }
 ```
 
-### 2. Update Imports
+### 2. 更新导入
 
-#### Core Types
+#### 核心类型
 
-**Before:**
+**迁移前：**
 ```rust
 use chat_core::Config;
 use chat_core::paths::bamboo_dir;
 use chat_core::keyword_masking::KeywordMaskingConfig;
 ```
 
-**After:**
+**迁移后：**
 ```rust
 use bamboo_infrastructure::config::Config;
 use bamboo_domain::paths::bamboo_dir;
 use bamboo_domain::keyword_masking::KeywordMaskingConfig;
 ```
 
-#### Agent Types
+#### Agent 类型
 
-**Before:**
+**迁移前：**
 ```rust
 use agent_core::{AgentError, Session, Message};
 use agent_core::tools::{ToolCall, ToolResult, ToolExecutor};
 ```
 
-**After:**
+**迁移后：**
 ```rust
 use bamboo_agent_core::agent::{AgentError, Session, Message};
 use bamboo_tools::{ToolCall, ToolResult, ToolExecutor};
 ```
 
-#### LLM Providers
+#### LLM provider
 
-**Before:**
+**迁移前：**
 ```rust
 use agent_llm::{LLMProvider, LLMError};
 use agent_llm::providers::{OpenAIProvider, AnthropicProvider};
 use agent_llm::create_provider;
 ```
 
-**After:**
+**迁移后：**
 ```rust
 use bamboo_infrastructure::llm::{LLMProvider, LLMError};
 use bamboo_infrastructure::llm::providers::{OpenAIProvider, AnthropicProvider};
 use bamboo_infrastructure::llm::create_provider;
 ```
 
-#### Tools
+#### 工具
 
-**Before:**
+**迁移前：**
 ```rust
 use agent_tools::{BuiltinToolExecutor, ToolRegistry};
 use agent_tools::tools::ReadFileTool;
 ```
 
-**After:**
+**迁移后：**
 ```rust
 use bamboo_tools::{BuiltinToolExecutor, ToolRegistry};
 use bamboo_tools::tools::ReadFileTool;
 ```
 
-#### Metrics
+#### 指标
 
-**Before:**
+**迁移前：**
 ```rust
 use agent_metrics::{MetricsBus, MetricsWorker};
 ```
 
-**After:**
+**迁移后：**
 ```rust
 use bamboo_engine::metrics::{MetricsBus, MetricsWorker};
 ```
 
-#### Web Service
+#### Web 服务
 
-**Before (v0.1.x):**
+**迁移前（v0.1.x）：**
 ```rust
 use bamboo::web_service::WebService;
 use bamboo::web_service::controllers::agent_controller;
 ```
 
-**After (v0.1.x):**
+**迁移后（v0.1.x）：**
 ```rust
 use bamboo::web_service::WebService;
 use bamboo::web_service::controllers::agent_controller;
 ```
 
-**Latest (v0.2.0+ / workspace):**
+**最新（v0.2.0+ / workspace）：**
 ```rust
 use bamboo_server::WebService;
 use bamboo_server::handlers;
-// Handlers are under crates/bamboo-server/src/handlers/
+// handler 位于 crates/bamboo-server/src/handlers/ 下
 ```
 
-#### Claude Integration
+#### Claude 集成
 
-**Before:**
+**迁移前：**
 ```rust
-// In src-tauri
+// 位于 src-tauri 中
 use crate::claude::find_claude_binary;
 use crate::command::slash_commands::SlashCommand;
 use crate::command::workflows::save_workflow;
 ```
 
-**After:**
+**迁移后：**
 ```rust
 use bamboo_server::claude_runner::find_claude_binary;
 use bamboo_tools::slash_commands::SlashCommand;
 use bamboo_server::workflow::save_workflow;
 ```
 
-### 3. Update Function Calls
+### 3. 更新函数调用
 
-Most function calls remain the same, but some paths have changed:
+大多数函数调用保持不变，但部分路径有变化：
 
-#### Creating Providers
+#### 创建 provider
 
-**Before:**
+**迁移前：**
 ```rust
 let provider = agent_llm::create_provider(&config)?;
 ```
 
-**After:**
+**迁移后：**
 ```rust
 let provider = bamboo_infrastructure::llm::create_provider(&config)?;
 ```
 
-#### Tool Execution
+#### 工具执行
 
-**Before:**
+**迁移前：**
 ```rust
 let executor = agent_tools::BuiltinToolExecutor::new();
 let result = executor.execute(&tool_call).await;
 ```
 
-**After:**
+**迁移后：**
 ```rust
 let executor = bamboo_tools::BuiltinToolExecutor::new();
 let result = executor.execute(&tool_call).await;
 ```
 
-### 4. Update Configuration
+### 4. 更新配置
 
-Bamboo now uses a unified data directory for all configuration and data:
-- `BAMBOO_DATA_DIR` (default `${HOME}/.bamboo`)
+Bamboo 现在为所有配置和数据使用统一的数据目录：
+- `BAMBOO_DATA_DIR`（默认 `${HOME}/.bamboo`）
 
-**Before:**
+**迁移前：**
 ```rust
 let config_dir = dirs::home_dir().unwrap().join(".bamboo");
 ```
 
-**After:**
+**迁移后：**
 ```rust
 let config_dir = bamboo_infrastructure::config::paths::bamboo_home();
 let data_dir = bamboo_infrastructure::config::paths::bamboo_home();
 ```
 
-You can also use the provided helper functions:
+也可以使用提供的辅助函数：
 
 ```rust
 use bamboo_infrastructure::config::paths;
@@ -209,9 +209,9 @@ let sessions_dir = paths::sessions_dir();
 let workflows_dir = paths::workflows_dir();
 ```
 
-### 5. Update Server Configuration
+### 5. 更新服务器配置
 
-**Before:**
+**迁移前：**
 ```rust
 use web_service::WebService;
 
@@ -223,7 +223,7 @@ let server = WebService::new(
 );
 ```
 
-**After:**
+**迁移后：**
 ```rust
 use bamboo_server::WebService;
 
@@ -235,7 +235,7 @@ let server = WebService::new(
 );
 ```
 
-**Latest (workspace):**
+**最新（workspace）：**
 ```rust
 use bamboo_server::app_state::AppState;
 use bamboo_server::routes;
@@ -243,11 +243,11 @@ use bamboo_server::routes;
 let app = bamboo_server::build_app(data_dir, config);
 ```
 
-## API Changes
+## API 变更
 
-### ToolSchema Structure
+### ToolSchema 结构
 
-**Before:**
+**迁移前：**
 ```rust
 let schema = ToolSchema {
     name: "read_file".to_string(),
@@ -256,7 +256,7 @@ let schema = ToolSchema {
 };
 ```
 
-**After:**
+**迁移后：**
 ```rust
 let schema = ToolSchema {
     schema_type: "function".to_string(),
@@ -268,9 +268,9 @@ let schema = ToolSchema {
 };
 ```
 
-### KeywordEntry Fields
+### KeywordEntry 字段
 
-**Before:**
+**迁移前：**
 ```rust
 let entry = KeywordEntry {
     pattern: "secret".to_string(),
@@ -280,7 +280,7 @@ let entry = KeywordEntry {
 };
 ```
 
-**After:**
+**迁移后：**
 ```rust
 let entry = KeywordEntry {
     pattern: "secret".to_string(),
@@ -289,11 +289,11 @@ let entry = KeywordEntry {
 };
 ```
 
-## Common Migration Patterns
+## 常见迁移模式
 
-### Pattern 1: Using Prelude
+### 模式 1：使用 prelude
 
-Create a prelude module to simplify imports:
+创建一个 prelude 模块来简化导入：
 
 ```rust
 // src/prelude.rs
@@ -302,14 +302,14 @@ pub use bamboo_infrastructure::llm::LLMProvider;
 pub use bamboo_tools::BuiltinToolExecutor;
 pub use bamboo_infrastructure::config::Config;
 
-// In your code
+// 在你的代码中
 mod prelude;
 use prelude::*;
 ```
 
-### Pattern 2: Type Aliases
+### 模式 2：类型别名
 
-If you have many type references, create aliases:
+如果类型引用很多，可以创建别名：
 
 ```rust
 type Provider = bamboo_infrastructure::llm::LLMProvider;
@@ -317,9 +317,9 @@ type Executor = bamboo_tools::BuiltinToolExecutor;
 type Result<T> = std::result::Result<T, bamboo_agent_core::AgentError>;
 ```
 
-### Pattern 3: Re-export Common Types
+### 模式 3：重导出常用类型
 
-In your lib.rs:
+在你的 lib.rs 中：
 
 ```rust
 pub use bamboo_agent_core::{
@@ -328,117 +328,118 @@ pub use bamboo_agent_core::{
 pub use bamboo_infrastructure::config::Config;
 ```
 
-## Testing Your Migration
+## 测试你的迁移
 
-1. **Run cargo check**: `cargo check`
-2. **Run tests**: `cargo test`
-3. **Check imports**: Look for any remaining old crate references
-4. **Test functionality**: Ensure all features work as expected
+1. **运行 cargo check**：`cargo check`
+2. **运行测试**：`cargo test`
+3. **检查导入**：查找是否还残留旧 crate 的引用
+4. **测试功能**：确保所有功能按预期工作
 
-## Troubleshooting
+## 故障排查
 
-### Error: "cannot find type `Session` in crate `bamboo`"
+### 错误：“cannot find type `Session` in crate `bamboo`”
 
-**Solution**: Update your import paths. `Session` is now at `bamboo_domain::session::Session`.
+**解决方案**：更新导入路径。`Session` 现在位于 `bamboo_domain::session::Session`。
 
-### Error: "no field `name` on type `ToolSchema`"
+### 错误：“no field `name` on type `ToolSchema`”
 
-**Solution**: `ToolSchema` now has a nested structure. Access the name via `schema.function.name`.
+**解决方案**：`ToolSchema` 现在是嵌套结构，通过 `schema.function.name` 访问名称。
 
-### Error: "unresolved import `chat_core`"
+### 错误：“unresolved import `chat_core`”
 
-**Solution**: Replace all `chat_core` imports with `bamboo_domain` (domain types) or `bamboo_infrastructure` (config, llm).
+**解决方案**：把所有 `chat_core` 导入替换为 `bamboo_domain`（领域类型）或 `bamboo_infrastructure`（配置、llm）。
 
-### Error: "no module named `agent_loop`"
+### 错误：“no module named `agent_loop`”
 
-**Solution**: The loop module is now `bamboo_engine::runtime` (the engine crate handles agent runtime and execution).
+**解决方案**：loop 模块现在是 `bamboo_engine::runtime`（engine crate 负责 agent 运行时和执行）。
 
-## Additional Resources
+## 更多资源
 
-- [API Documentation](https://docs.rs/bamboo-agent)
-- [Repository](https://github.com/bigduu/Bamboo-agent)
+- [API 文档](https://docs.rs/bamboo-agent)
+- [仓库](https://github.com/bigduu/Bamboo-agent)
 - [GitHub Issues](https://github.com/bigduu/Bamboo-agent/issues)
 
-## Getting Help
+## 获取帮助
 
-If you encounter issues during migration:
+如果迁移过程中遇到问题：
 
-1. Check the [API documentation](https://docs.rs/bamboo-agent)
-2. Search [existing issues](https://github.com/bigduu/Bamboo-agent/issues)
-3. Open a new issue with the "migration" label
-4. Start a [discussion](https://github.com/bigduu/Bamboo-agent/discussions)
+1. 查阅 [API 文档](https://docs.rs/bamboo-agent)
+2. 搜索[已有 issue](https://github.com/bigduu/Bamboo-agent/issues)
+3. 提一个带“migration”标签的新 issue
+4. 发起一个[讨论](https://github.com/bigduu/Bamboo-agent/discussions)
 
-## Changelog
+## 更新日志
 
-See [CHANGELOG.md](../../CHANGELOG.md) for a complete list of changes.
+完整变更列表见 [CHANGELOG.md](../../CHANGELOG.md)。
 
-## v0.2.0 Server Consolidation
+## v0.2.0 服务器整合
 
-Version 0.2.0 introduces a major refactoring that consolidates the dual server architecture into a unified module.
+v0.2.0 引入了一次重大重构，把双服务器架构整合为统一模块。
 
-### Key Changes
+### 关键变更
 
-1. **Workspace crates**: Monolithic `bamboo-agent` crate split into `crates/bamboo-server`, `crates/bamboo-domain`, etc.
-2. **Explicit routing**: All routes registered in `crates/bamboo-server/src/routes/`
-3. **Unified handlers**: Controllers and handlers merged into `bamboo_server::handlers`
-4. **Direct provider access**: Eliminated proxy pattern with HTTP callbacks
+1. **workspace crate**：单体 `bamboo-agent` crate 拆分为 `crates/bamboo-server`、`crates/bamboo-domain` 等。
+2. **显式路由**：所有路由都注册在 `crates/bamboo-server/src/routes/`。
+3. **统一 handler**：controller 与 handler 合并进 `bamboo_server::handlers`。
+4. **直接访问 provider**：去掉了带 HTTP 回调的代理模式。
 
-### Migration from v0.1.x to v0.2.0
+### 从 v0.1.x 迁移到 v0.2.0
 
-#### Server Imports
+#### 服务器导入
 
-**Before (v0.1.x):**
+**迁移前（v0.1.x）：**
 ```rust
-// NOTE: this legacy import path was removed in v0.2.8.
+// 注意：这条旧导入路径已在 v0.2.8 中移除。
 // use bamboo::agent::server::state::AppState;
 use bamboo::agent::server::handlers;
 use bamboo::web_service::WebService;
 use bamboo::web_service::controllers::*;
 ```
 
-**After (v0.2.0+ / workspace):**
+**迁移后（v0.2.0+ / workspace）：**
 ```rust
 use bamboo_server::app_state::AppState;
 use bamboo_server::handlers;
 use bamboo_server::WebService;
-// Note: controllers::* → handlers::*
+// 注意：controllers::* → handlers::*
 ```
 
-#### Handler Organization
+#### handler 组织
 
-**Agent handlers** (under `crates/bamboo-server/src/handlers/agent/`):
+**agent handler**（位于 `crates/bamboo-server/src/handlers/agent/`）：
 - `chat`, `execute`, `events`, `stream`, `stop`, `history`, `respond`, `delete`, `health`, `metrics`, `todo`, `mcp`
 
-**Provider handlers** (under `crates/bamboo-server/src/handlers/`):
+**provider handler**（位于 `crates/bamboo-server/src/handlers/`）：
 - `openai/`, `anthropic/`, `gemini/`, `copilot_auth/`, `agent_api.rs`, `command/`, `settings/`, `skill/`, `tools/`, `workspace/`
 
-### Backward Compatibility
-Legacy import paths were deprecated in v0.2.0 and removed in v0.2.8.
+### 向后兼容性
+
+旧导入路径在 v0.2.0 中弃用，并在 v0.2.8 中移除。
 
 ```rust
-// Old (removed in v0.2.8)
+// 旧写法（v0.2.8 中已移除）
 // use bamboo::agent::server::state::AppState;
 // use bamboo::web_service::WebService;
 // use bamboo::server::controllers::agent_api;
 
-// Current (workspace crates)
+// 当前写法（workspace crate）
 use bamboo_server::app_state::AppState;
 use bamboo_server::WebService;
 use bamboo_server::handlers::agent_api;
 ```
 
-### Benefits
+### 收益
 
-- ✅ **No route duplication**: Single source of truth for all routes
-- ✅ **Clearer architecture**: Workspace crate separation with clear boundaries
-- ✅ **Better performance**: Direct provider access (no HTTP callbacks)
-- **Easier maintenance**: All routes visible in `crates/bamboo-server/src/routes/`
-- ✅ **-430 lines of code**: Cleaner, more maintainable codebase
+- ✅ **无路由重复**：所有路由的单一事实来源
+- ✅ **架构更清晰**：workspace crate 按清晰边界分离
+- ✅ **性能更好**：直接访问 provider（没有 HTTP 回调）
+- **更容易维护**：所有路由都集中在 `crates/bamboo-server/src/routes/` 里一目了然
+- ✅ **减少 430 行代码**：更干净、更易维护的代码库
 
-### For More Details
+### 更多细节
 
-See [CHANGELOG.md](../../CHANGELOG.md) for the full change history.
+完整变更历史见 [CHANGELOG.md](../../CHANGELOG.md)。
 
 ---
 
-Need help? Open an issue or start a discussion on GitHub!
+需要帮助？在 GitHub 上提 issue 或发起讨论！

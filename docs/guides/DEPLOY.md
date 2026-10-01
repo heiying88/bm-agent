@@ -1,20 +1,18 @@
-# How-to: deploy `bamboo serve`
+# 操作指南：部署 `bamboo serve`
 
-Three ways to run Bamboo as a long-lived server, in increasing order of
-isolation: bare binary, systemd unit, Docker.
+以长期运行的服务器方式跑 Bamboo 有三种途径，隔离程度依次递增：裸二进制、systemd unit、Docker。
 
-## Option 1 — bare binary
+## 方式 1 —— 裸二进制
 
 ```bash
-cargo install --path .          # or: cargo install bamboo-agent
+cargo install --path .          # 或者：cargo install bamboo-agent
 bamboo init --non-interactive --provider anthropic --api-key "sk-ant-..."
 bamboo serve
 ```
 
-Good for a single-user desktop/laptop setup, or as the target a sidecar
-process manager (like Bodhi) launches directly.
+适合单用户的桌面/笔记本环境，或者作为 sidecar 进程管理器（如 Bodhi）直接拉起的目标。
 
-## Option 2 — systemd (bare-metal Linux server)
+## 方式 2 —— systemd（裸机 Linux 服务器）
 
 ```ini
 # /etc/systemd/system/bamboo.service
@@ -31,7 +29,7 @@ Environment=BAMBOO_PORT=9562
 ExecStart=/usr/local/bin/bamboo serve
 Restart=on-failure
 RestartSec=5
-# Hardening (optional but recommended for an always-on service)
+# 加固（可选，但对常驻服务推荐）
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/bamboo
@@ -48,90 +46,62 @@ sudo -u bamboo BAMBOO_DATA_DIR=/var/lib/bamboo bamboo init --non-interactive --p
 sudo systemctl enable --now bamboo
 ```
 
-## Option 3 — Docker
+## 方式 3 —— Docker
 
 ```bash
 cd docker && docker compose up -d --build
 curl http://localhost:9562/api/v1/health
 ```
 
-`docker-compose.yml` (in `docker/`) already does the right things by default:
+`docker-compose.yml`（位于 `docker/`）默认就已经把该做的事都做对了：
 
-- **Publishes to the host loopback only** (`127.0.0.1:9562:9562`) — see
-  [Network exposure](#network-exposure-the-part-you-must-not-skip) below for
-  why this matters.
-- Runs as a non-root user, drops all Linux capabilities (`cap_drop: [ALL]`,
-  the agent needs none), sets `no-new-privileges`, and caps `pids_limit`.
-- Uses an isolated named volume (`bamboo-data`) rather than bind-mounting your
-  entire `~/.bamboo` read-write into the container. Uncomment the alternate
-  bind-mount line in the compose file if you specifically want to share the
-  host profile.
-- Sets `BAMBOO_DATA_DIR=/data`, `BAMBOO_PORT=9562`, `BAMBOO_BIND=0.0.0.0`
-  (the in-container bind — actual host exposure is controlled at the
-  `ports:` publish layer above, not this bind address).
+- **仅发布到主机回环地址**（`127.0.0.1:9562:9562`）——为什么这很重要，
+  见下文[网络暴露](#网络暴露绝不能跳过的部分)一节。
+- 以非 root 用户运行，丢弃全部 Linux capabilities（`cap_drop: [ALL]`，
+  agent 用不到），设置 `no-new-privileges`，并限制 `pids_limit`。
+- 使用隔离的命名卷（`bamboo-data`），而不是把你整个 `~/.bamboo` 以读写
+  方式绑定挂载进容器。如果你确实想共享宿主机上的 profile，把 compose
+  文件里备用的 bind-mount 行取消注释即可。
+- 设置 `BAMBOO_DATA_DIR=/data`、`BAMBOO_PORT=9562`、`BAMBOO_BIND=0.0.0.0`
+  （这是容器内绑定——对宿主机的实际暴露由上面 `ports:` 发布层控制，而不是
+  这个绑定地址）。
 
-Configure the provider either by mounting a `config.json` into the volume
-before first start, or via the [provider API key env vars](../config-reference.md#environment-variables)
-(`BAMBOO_ANTHROPIC_API_KEY`, etc.) added to the `environment:` block — these
-are in-memory-only and never written to disk, which is the preferred pattern
-for container/CI deploys. `docker/config.example.json` is a starting point if
-you'd rather mount a file.
+配置 provider 有两种方式：首次启动前把 `config.json` 挂载进卷，或者把
+[provider API key 环境变量](../config-reference.md#environment-variables)
+（`BAMBOO_ANTHROPIC_API_KEY` 等）加进 `environment:` 块——这些值只存在于内存，从不落盘，是容器/CI 部署的首选模式。如果你更愿意挂载文件，`docker/config.example.json` 可以作为起点。
 
-## Network exposure — the part you must not skip
+## 网络暴露——绝不能跳过的部分
 
-**Do not widen the Docker publish (or any bind) to `0.0.0.0`/a LAN IP without
-also putting an authenticating reverse proxy in front.** Two things compound:
+**在没加一层带认证的反向代理之前，不要把 Docker 发布（或任何绑定）扩大到 `0.0.0.0`/局域网 IP。** 有两个问题会叠加：
 
-1. A fresh instance has no credential configured — the access-control gate is
-   inert until you set a password.
-2. Even once a password **is** set, the server treats every private-range
-   (RFC1918) peer as trusted-local and skips the password check by design
-   (desktop-mode convenience) — so any host on the same subnet reaches the
-   tool-executing agent unauthenticated.
+1. 全新实例没有配置任何凭据——在你设置密码之前，访问控制这道门是无效的。
+2. 即使**已经**设置了密码，服务器也会按设计把所有私网（RFC1918）对端视为
+   可信本地并跳过密码校验（桌面模式的便利性）——于是同一子网内的任何主机
+   都能不经认证地触达能执行工具的 agent。
 
-Keep the loopback-only publish/bind and put a real reverse proxy (nginx,
-Caddy, Traefik) in front on whichever network needs remote access, terminating
-TLS and its own auth there. Alternatively, set `server.tls` (`cert_file`/
-`key_file` in `config.json` — see the [config reference](../config-reference.md#server))
-for manual TLS termination inside Bamboo itself, if a separate proxy isn't an
-option.
+保持仅回环的发布/绑定，哪条网络需要远程访问，就在它前面放一个真正的反向代理（nginx、Caddy、Traefik），在那一层终结 TLS 并做自己的认证。或者，如果实在没法用独立代理，可设置 `server.tls`（`config.json` 中的 `cert_file`/`key_file`——参见[配置参考](../config-reference.md#server)）在 Bamboo 内部手动终结 TLS。
 
-## Reverse proxy example (Caddy)
+## 反向代理示例（Caddy）
 
 ```
 bamboo.example.com {
   reverse_proxy 127.0.0.1:9562
   basicauth {
-    admin JDJhJDE0JC4uLg==   # bcrypt hash, generate with `caddy hash-password`
+    admin JDJhJDE0JC4uLg==   # bcrypt 哈希，用 `caddy hash-password` 生成
   }
 }
 ```
 
-Caddy handles TLS (via Let's Encrypt) and HTTP basic auth in front of a
-loopback-only Bamboo — the recommended pattern instead of Bamboo's own
-`server.tls`/`access_control` for anything beyond a single trusted LAN.
+Caddy 在仅回环的 Bamboo 前面处理 TLS（通过 Let's Encrypt）和 HTTP basic auth——只要超出单个可信局域网的范围，就推荐用这个模式，而不是 Bamboo 自带的 `server.tls`/`access_control`。
 
 ## CORS
 
-If a browser-based client (e.g. a self-hosted Lotus frontend on a different
-origin) talks to this server directly, set `BAMBOO_CORS_ALLOW_ORIGINS` (or
-the equivalent config key) to an explicit allowlist — exact origins
-(`https://app.example.com`), bare hosts (`app.example.com`), or wildcard
-subdomains (`*.example.com`). Leave it empty for a same-origin-only setup
-(e.g. Bodhi's embedded sidecar, which talks to `127.0.0.1` directly).
+如果有基于浏览器的客户端（例如部署在其他 origin 的自托管 Lotus 前端）直接访问这台服务器，请把 `BAMBOO_CORS_ALLOW_ORIGINS`（或等价的配置键）设为显式允许列表——完整 origin（`https://app.example.com`）、裸主机名（`app.example.com`）或通配符子域名（`*.example.com`）。纯同源场景（例如 Bodhi 内嵌的 sidecar，它直接访问 `127.0.0.1`）留空即可。
 
-## Backing up a deployment
+## 备份部署
 
-Back up the whole data directory (`BAMBOO_DATA_DIR`, default `~/.bamboo`) as
-one unit — it holds `config.json`, `connect.json`, `schedules.json`,
-`model_limits.json`, every session, and (critically) `.bamboo_encryption_key`.
-Losing the key file without a copy of `BAMBOO_CONFIG_ENCRYPTION_KEY` makes
-every encrypted-at-rest secret (provider API keys, IM bridge tokens,
-notification push tokens, …) in that directory permanently unrecoverable —
-see [Encryption at rest](../config-reference.md#encryption-at-rest).
+把整个数据目录（`BAMBOO_DATA_DIR`，默认 `~/.bamboo`）作为一个整体备份——它装着 `config.json`、`connect.json`、`schedules.json`、`model_limits.json`、全部会话，以及（至关重要的）`.bamboo_encryption_key`。在没有 `BAMBOO_CONFIG_ENCRYPTION_KEY` 副本的情况下丢失密钥文件，会让该目录中所有静态加密的机密（provider API key、IM 桥接 token、通知推送 token……）永久无法恢复——参见[静态加密](../config-reference.md#encryption-at-rest)。
 
-## Health checks
+## 健康检查
 
-`GET /api/v1/health` (used by the Docker example above) or `bamboo health`
-(same check, from the CLI) — both exit/return non-zero if the server is
-unreachable or unhealthy, so either works as a readiness/liveness probe.
+`GET /api/v1/health`（上面 Docker 示例使用的）或 `bamboo health`（同一项检查，从 CLI 执行）——服务器不可达或不健康时两者都会以非零值退出/返回，因此任何一个都能当就绪/存活探针用。

@@ -1,27 +1,5 @@
-# Existing model-context representation checkpoint (#1363)
+# 现有模型上下文表示 checkpoint（#1363）
 
-`SessionStoreV2::checkpoint_actor_model_context` is storage-only, no production
-caller/admission/ACK. Current Running Actor/full normalized expected/schema1/same
-scope+epoch+prepared vector+reset history are required. None/reset/initialization/
-extension/repair are unsupported. Pure digest/render witnesses do not establish
-Task/Role/Project/provider truth or permission; Host generator binding is separate.
-Each borrowed Main/Runtime raw ledger span is capped at4MiB before typed decode
-of those exact buffers; private unique-key closed-schema checks leave old readers
-unchanged. Checked bounded Write caps candidate JSON at4MiB including Already.
-Independent limits:256 events,2MiB rendered text, exact unique Snapshot witnesses
-(max256, metadata None, original untrimmed title+content≤2MiB before rendering).
-Escaping over JSON cap rejects whole, never truncates. No full Session/request/
-process memory bound. Checked revisions/IDs/baselines, fixed-vector anchors and
-ordered suffixes are verified; historical Snapshot text stays byte-exact.
+`SessionStoreV2::checkpoint_actor_model_context` 仅是存储层操作，没有生产调用方/准入/ACK。要求：当前处于 Running 的 Actor、完整规范化的 expected/schema1、相同的 scope+epoch+prepared vector+reset 历史。不支持 None/reset/初始化/扩展/修复。单纯的 digest/render 见证不能确立 Task/Role/Project/provider 的事实或权限；Host 生成器绑定是独立事项。每段借用的 Main/Runtime 原始账本切片在对其精确缓冲区做类型化解码前，上限为 4 MiB；私有的唯一键封闭 schema 校验不会改变旧读取方。带检查的有界 Write 把候选 JSON（包括 Already）限制在 4 MiB。独立上限：256 条事件、2 MiB 渲染文本，以及精确唯一的 Snapshot 见证（最多 256 条、metadata 为 None、渲染前未裁剪的原始 title+content ≤ 2 MiB）。超出 JSON 上限时整体拒绝，绝不截断。没有覆盖完整 Session/请求/进程的内存边界。已检查的 revision/ID/baseline、固定向量锚点与有序后缀都会被校验；历史 Snapshot 文本保持字节精确。
 
-Only Runtime.model_context_state changes; Main/native/admission/compact CP,
-other Runtime/summary/compression, Actor/proof/index/attachments stay byte-exact.
-Physical side messages/native/admission must be empty/default/None before both
-New/Already. Full expected uses serde Values and Root stale-budget normalization,
-not skipped-index Eq. Owned lifecycle→Task→Session Arcs cover complete filesystem
-jobs/cleanup through caller abort/started-job runtime stop, never provider await.
-Fresh UTC after BeforeReplace rechecks source/Running lease. Postreplace/sync/
-readback errors are OutcomeUnconfirmed: reload actual Session/current fence for
-exact Already/no witnesses/no write, never replay a stale fence automatically.
-Tests use same-process Stores and real reconcile→V2→cold reopen/fixture scope;
-no production/exactly-once claim. #1350 ordinary context rejection stays in force.
+只有 Runtime.model_context_state 发生变化；Main/native/admission/compact CP、其余 Runtime/summary/compression、Actor/proof/index/attachments 均保持字节精确。物理侧消息/native/admission 在 New 与 Already 两者之前都必须为空/默认值/None。完整 expected 使用 serde Values 与 Root 的陈旧预算规范化，而不是跳过索引的相等比较。自有的 lifecycle→Task→Session Arc 覆盖完整的文件系统作业/清理，贯穿调用方中止与已启动作业的运行时停止，绝不含 provider 等待。BeforeReplace 之后取新的 UTC 复查 source/Running 租约。替换后/同步/回读错误属于 OutcomeUnconfirmed：重新加载实际 Session/当前围栏，以精确判定 Already/不生成见证/不写入，绝不自动重放陈旧围栏。测试使用同进程 Store 与真实的 reconcile→V2→cold 重开/fixture 范围；不主张生产可用/恰好一次。#1350 的普通上下文拒绝仍然有效。

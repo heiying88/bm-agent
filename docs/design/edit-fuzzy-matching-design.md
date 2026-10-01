@@ -1,218 +1,218 @@
-# Bamboo Edit Fuzzy Matching Design
+# Bamboo Edit 模糊匹配设计
 
-## Background
+## 背景
 
-Bamboo `Edit` currently relies on exact substring matching with line-ending normalization (`LF` / `CRLF`). This is safe and predictable, but it creates a practical failure mode for LLM-driven editing:
+Bamboo 的 `Edit` 目前依赖带行尾归一化（`LF` / `CRLF`）的精确子串匹配。这安全且可预测，但给 LLM 驱动的编辑带来了一个现实失效模式：
 
-- the model often reproduces the target block with minor whitespace drift
-- exact matching then fails with `not found`
-- the model may respond by shortening the `SEARCH` block or using `replace_all`
-- that fallback behavior increases the risk of larger-than-intended edits
+- 模型复现目标块时常常带轻微的空白漂移
+- 精确匹配随之以 `not found` 失败
+- 模型可能以缩短 `SEARCH` 块或改用 `replace_all` 来应对
+- 这种回退行为加大了改动范围超出预期的风险
 
-We already tightened `replace_all` and large-scope safeguards. The next step is to improve matching ergonomics without weakening safety.
-
----
-
-## Goals
-
-1. Reduce `not found` failures caused only by harmless whitespace variation.
-2. Preserve Bamboo's current safety model:
-   - read-before-edit
-   - ambiguity rejection by default
-   - touched-lines scope limits
-   - patch-mode preference for larger edits
-3. Keep matching behavior explainable and testable.
-4. Avoid silently turning a precise edit into a broad structural rewrite.
+我们已收紧 `replace_all` 与大范围防护。下一步是在不削弱安全性的前提下改进匹配易用性。
 
 ---
 
-## Non-goals
+## 目标
 
-1. Do not support semantic AST rewriting in the first iteration.
-2. Do not fuzzy-match arbitrary unrelated text blocks.
-3. Do not auto-pick among several weak matches.
-4. Do not apply fuzzy matching to `replace_all` in the first phase.
+1. 减少仅由无害空白变化引起的 `not found` 失败。
+2. 保留 Bamboo 现有的安全模型：
+   - 先读后改（read-before-edit）
+   - 默认拒绝歧义
+   - touched-lines 范围限制
+   - 较大改动优先走 patch 模式
+3. 保持匹配行为可解释、可测试。
+4. 避免把一次精确编辑悄悄变成大范围结构性重写。
 
 ---
 
-## Current State
+## 非目标
 
-`Edit` currently does:
+1. 第一轮迭代不支持语义级 AST 重写。
+2. 不对任意无关文本块做模糊匹配。
+3. 不在多个弱匹配之间自动挑选。
+4. 第一阶段不把模糊匹配用于 `replace_all`。
 
-- exact search in legacy mode (`old_string` / `new_string`)
-- exact `SEARCH` block matching in patch mode
-- `LF` / `CRLF` normalization variants
-- duplicate detection with `line_number`
-- rejection on ambiguity
+---
 
-This is implemented primarily in:
+## 现状
+
+`Edit` 目前做的事：
+
+- legacy 模式下精确搜索（`old_string` / `new_string`）
+- patch 模式下精确匹配 `SEARCH` 块
+- `LF` / `CRLF` 归一化变体
+- 借助 `line_number` 的重复检测
+- 歧义即拒绝
+
+实现主要位于：
 
 - `crates/bamboo-tools/src/tools/edit.rs`
 - `crates/bamboo-tools/src/tools/file_change.rs`
 
 ---
 
-## Design Principles
+## 设计原则
 
-### 1. Exact-first, fuzzy-second
+### 1. 精确优先，模糊其次
 
-Matching order should be:
+匹配顺序应为：
 
-1. exact match
-2. normalized-exact match (already present)
-3. fuzzy whitespace-aware match
-4. otherwise fail
+1. 精确匹配
+2. 归一化精确匹配（已有）
+3. 空白感知的模糊匹配
+4. 否则失败
 
-This preserves current behavior for all existing exact matches.
+这让所有现有精确匹配的行为保持不变。
 
-### 2. Fuzzy match must still be unique
+### 2. 模糊匹配仍必须唯一
 
-A fuzzy match is only acceptable if:
+仅当以下条件全部满足，模糊匹配才可接受：
 
-- there is exactly one sufficiently strong candidate, and
-- any runner-up candidate is meaningfully worse, and
-- the touched-lines scope still passes current safety guards
+- 恰好只有一个足够强的候选，且
+- 任何次优候选都明显更差，且
+- touched-lines 范围仍通过现有安全护栏
 
-If several candidates are similarly good, return an ambiguity error.
+若多个候选同样好，返回歧义错误。
 
-### 3. Fuzzy matching should only forgive formatting drift
+### 3. 模糊匹配只应宽容格式漂移
 
-First phase fuzzy matching should tolerate:
+第一阶段模糊匹配应容忍：
 
-- indentation width differences
-- trailing whitespace differences
-- blank-line normalization in a narrow sense
-- LF/CRLF differences
+- 缩进宽度差异
+- 行尾空白差异
+- 狭义上的空行归一化
+- LF/CRLF 差异
 
-It should not tolerate:
+不应容忍：
 
-- reordered lines
-- inserted or deleted non-whitespace tokens
-- identifier or punctuation drift
-- matching across very distant regions
-
----
-
-## Proposed 3-Phase Rollout
-
-## Phase 1: Whitespace-normalized block matching
-
-### Scope
-
-Apply only to patch mode first.
-
-### Behavior
-
-If exact matching fails for a `SEARCH` block:
-
-1. split both `SEARCH` and candidate windows into lines
-2. normalize each line by:
-   - trimming trailing whitespace
-   - converting tabs to a canonical representation or preserving them but comparing indentation width separately
-3. compare lines after removing common indentation offset
-4. require identical non-whitespace token content line-by-line
-
-### Candidate generation
-
-Instead of scanning every possible byte offset in the file, generate candidate windows by line span:
-
-- if `SEARCH` block has `n` lines, compare against contiguous windows of `n` lines
-- optionally also compare `n +/- 1` only if blank-line normalization is enabled, but not in Phase 1 by default
-
-### Acceptance rule
-
-Accept only if exactly one window satisfies:
-
-- same line count
-- same per-line non-whitespace token content
-- indentation differences allowed
-- no token changes
-
-### Why patch-only first
-
-Patch mode already encourages richer context and is the safer place to introduce fuzzy behavior.
+- 行序重排
+- 非空白 token 的插入或删除
+- 标识符或标点漂移
+- 跨相距很远区域的匹配
 
 ---
 
-## Phase 2: Legacy mode fuzzy fallback
+## 拟议的三阶段推进
 
-Apply a narrower version of fuzzy matching to legacy mode, but only when:
+## 阶段 1：空白归一化的块匹配
+
+### 范围
+
+先只应用于 patch 模式。
+
+### 行为
+
+当 `SEARCH` 块精确匹配失败时：
+
+1. 把 `SEARCH` 与候选窗口都切成行
+2. 逐行归一化：
+   - 去掉行尾空白
+   - 把 tab 转成 canonical 表示，或保留 tab 但单独比较缩进宽度
+3. 去掉公共缩进偏移后再逐行比较
+4. 要求逐行的非空白 token 内容完全一致
+
+### 候选生成
+
+不在文件里扫描每个可能的字节偏移，而是按行跨度生成候选窗口：
+
+- 若 `SEARCH` 块有 `n` 行，则与连续 `n` 行的窗口比较
+- 可选地也比较 `n +/- 1`——仅在启用空行归一化时；阶段 1 默认不启用
+
+### 接受规则
+
+仅当恰好一个窗口满足以下条件才接受：
+
+- 行数相同
+- 每行非空白 token 内容相同
+- 允许缩进差异
+- 无 token 变化
+
+### 为什么先只做 patch 模式
+
+patch 模式本就鼓励更丰富的上下文，是引入模糊行为更安全的位置。
+
+---
+
+## 阶段 2：legacy 模式模糊回退
+
+把更窄版本的模糊匹配应用于 legacy 模式，但仅当：
 
 - `replace_all == false`
-- `line_number` is absent or points near a single candidate
-- `old_string` spans multiple lines or is sufficiently specific
+- `line_number` 缺失，或指向单一候选附近
+- `old_string` 跨多行，或足够特异
 
-### Additional guardrails
+### 附加护栏
 
-Do not use fuzzy matching in legacy mode when:
+legacy 模式下不使用模糊匹配的情形：
 
-- `old_string` is a single short line
-- `old_string` is fewer than a configurable token threshold
-- the best match would touch a large diff region
+- `old_string` 是单条短行
+- `old_string` 少于可配置的 token 阈值
+- 最佳匹配会触及大块 diff 区域
 
-This avoids fuzzy-matching tiny fragments like `}` or `foo`.
-
----
-
-## Phase 3: Structural matching (optional, later)
-
-Optional future work for specific languages:
-
-- Rust: use parser-aware block boundaries
-- TS/JS: use lightweight AST node anchoring
-- JSON/YAML/TOML: key-path aware edits
-
-This should likely be separate from the generic `Edit` algorithm and may become specialized helpers rather than one universal fuzzy layer.
+这样避免了去模糊匹配 `}` 或 `foo` 这类细小片段。
 
 ---
 
-## Matching Algorithm Recommendation
+## 阶段 3：结构化匹配（可选，延后）
 
-## Phase 1 algorithm: normalized line fingerprint match
+面向特定语言的可选后续工作：
 
-For each line:
+- Rust：使用解析器感知的块边界
+- TS/JS：使用轻量 AST 节点锚定
+- JSON/YAML/TOML：键路径感知的编辑
 
-- preserve original line text for replacement boundaries
-- compute a comparison fingerprint:
-  - remove trailing whitespace
-  - convert runs of leading whitespace into an `INDENT(n)` marker or ignore exact width
-  - keep interior non-whitespace characters exact
+这大概率应与通用 `Edit` 算法分开，可能做成若干专用 helper，而不是一层万能的模糊层。
 
-Example:
+---
+
+## 匹配算法建议
+
+## 阶段 1 算法：归一化行指纹匹配
+
+对每一行：
+
+- 保留原始行文本，用作替换边界
+- 计算比较指纹：
+  - 去掉行尾空白
+  - 把前导空白串转成 `INDENT(n)` 标记，或忽略精确宽度
+  - 行内非空白字符保持精确
+
+示例：
 
 ```text
 "    let x = 1;   " -> fingerprint: "let x = 1;"
 "\tlet x = 1;"      -> fingerprint: "let x = 1;"
 ```
 
-For a block:
+对一个块：
 
-- compute fingerprints for all lines
-- require exact equality of the fingerprint sequence
-- optionally require the same count of blank lines in Phase 1
+- 为所有行计算指纹
+- 要求指纹序列完全相等
+- 阶段 1 可选地要求空行数量一致
 
-### Advantages
+### 优点
 
-- simple
-- deterministic
-- easy to explain in errors
-- low risk of false positives compared with edit-distance search
+- 简单
+- 确定性
+- 错误信息里容易解释
+- 相比编辑距离搜索，误报风险更低
 
-### Why not Levenshtein first
+### 为什么不先用 Levenshtein
 
-A pure edit-distance approach is harder to reason about and easier to abuse:
+纯编辑距离方案更难推理，也更容易被滥用：
 
-- multiple weakly similar blocks may appear equivalent
-- punctuation/token loss may still score highly enough
-- threshold tuning becomes brittle
+- 多个弱相似块可能显得等价
+- 标点/token 丢失仍可能得到足够高的分
+- 阈值调参会变得脆弱
 
-For Bamboo, a token-preserving whitespace-normalized strategy is a better first step.
+对 Bamboo 来说，保留 token 的空白归一化策略是更好的第一步。
 
 ---
 
-## Proposed Internal API Shape
+## 拟议的内部 API 形态
 
-Inside `edit.rs`, introduce a match mode abstraction such as:
+在 `edit.rs` 内部引入一个匹配模式抽象，例如：
 
 ```rust
 enum MatchStrategy {
@@ -221,25 +221,24 @@ enum MatchStrategy {
 }
 ```
 
-And candidate collection functions like:
+以及候选收集函数，例如：
 
 ```rust
 fn collect_exact_candidates(...)
 fn collect_whitespace_normalized_candidates(...)
 ```
 
-Then orchestrate with:
+再用一个函数编排：
 
 ```rust
 fn collect_candidates(...) -> Vec<ReplacementCandidate>
 ```
 
-Where the exact collector runs first and fuzzy collector runs only if exact returns empty.
+其中精确收集器先运行，只有当精确收集结果为空时才运行模糊收集器。
 
-### Important
+### 重要
 
-Do not mix exact and fuzzy candidates into one undifferentiated pool without metadata.
-Add provenance such as:
+不要在无元数据的情况下把精确候选与模糊候选混进同一个不加区分的池子。加上来源标记，例如：
 
 ```rust
 enum MatchKind {
@@ -248,23 +247,23 @@ enum MatchKind {
 }
 ```
 
-This enables:
+这带来：
 
-- clearer error messages
-- telemetry later
-- policy decisions such as “allow fuzzy only in patch mode”
+- 更清晰的错误信息
+- 后续遥测
+- 诸如「仅 patch 模式允许模糊匹配」的 policy 决策
 
 ---
 
-## Safety Rules for Fuzzy Matching
+## 模糊匹配安全规则
 
-1. **No fuzzy matching for `replace_all` in Phase 1 or 2**.
-2. **No fuzzy matching when more than one candidate passes the threshold**.
-3. **No fuzzy matching for extremely short search text**.
-4. **Always apply existing touched-lines guard after replacement**.
-5. **Error messages must say whether fuzzy matching was attempted**.
+1. **阶段 1、2 均不对 `replace_all` 做模糊匹配**。
+2. **多于一个候选通过阈值时不做模糊匹配**。
+3. **搜索文本极短时不做模糊匹配**。
+4. **替换后始终应用现有 touched-lines 护栏**。
+5. **错误信息必须说明是否尝试过模糊匹配**。
 
-Example error:
+示例错误：
 
 ```text
 SEARCH content not found exactly. A whitespace-normalized match was attempted but found 2 ambiguous candidates at lines 120 and 188. Add more context.
@@ -272,115 +271,115 @@ SEARCH content not found exactly. A whitespace-normalized match was attempted bu
 
 ---
 
-## Error Message Strategy
+## 错误信息策略
 
-We should improve errors so the model learns the right retry behavior.
+我们应改进错误信息，让模型学会正确的重试行为。
 
-### Good retry guidance
+### 好的重试引导
 
-- add more surrounding lines to `SEARCH`
-- prefer patch mode over `replace_all`
-- use `line_number` only when the target block is known
+- 给 `SEARCH` 增加更多上下文行
+- 优先 patch 模式而非 `replace_all`
+- 仅在目标块明确时使用 `line_number`
 
-### Avoid
+### 避免
 
-- suggesting `replace_all=true` too eagerly
-- vague `not found` without context
-
----
-
-## Testing Plan
-
-## Unit tests
-
-### Exact behavior unchanged
-
-- exact single-match still works
-- duplicate exact match still rejects without `line_number`
-- `line_number` still disambiguates exact duplicates
-
-### Whitespace-normalized success cases
-
-- different indentation width, same tokens
-- tabs vs spaces in leading indentation
-- trailing whitespace differences
-- LF vs CRLF (already present, should remain green)
-
-### Whitespace-normalized rejection cases
-
-- different identifier names
-- different punctuation
-- missing line in middle of block
-- two equally good whitespace-normalized candidates
-- fuzzy match would exceed touched-lines guard
-
-### Legacy mode restrictions
-
-- legacy fuzzy disabled for short single-line search
-- replace_all does not use fuzzy logic
-
-## E2E tests
-
-- patch request with indentation drift succeeds
-- patch request with two whitespace-equivalent duplicate blocks returns ambiguity error
-- short replace_all still rejected
-- large-scope fuzzy candidate still rejected by touched-lines limit
+- 过于急切地建议 `replace_all=true`
+- 不带上下文的含糊 `not found`
 
 ---
 
-## Telemetry / Observability (optional but recommended)
+## 测试计划
 
-Return additional payload fields when fuzzy matching is introduced:
+## 单元测试
+
+### 精确行为不变
+
+- 精确单匹配仍可用
+- 无 `line_number` 时重复精确匹配仍被拒绝
+- `line_number` 仍能为精确重复消歧
+
+### 空白归一化成功用例
+
+- 缩进宽度不同、token 相同
+- 前导缩进 tab 与空格的差异
+- 行尾空白差异
+- LF 与 CRLF（已有，应保持绿）
+
+### 空白归一化拒绝用例
+
+- 标识符名不同
+- 标点不同
+- 块中间缺一行
+- 两个同样好的空白归一化候选
+- 模糊匹配会超出 touched-lines 护栏
+
+### legacy 模式限制
+
+- 短单行搜索禁用 legacy 模糊
+- `replace_all` 不使用模糊逻辑
+
+## E2E 测试
+
+- 带缩进漂移的 patch 请求成功
+- 含两个空白等价重复块的 patch 请求返回歧义错误
+- 短 `replace_all` 仍被拒绝
+- 大范围模糊候选仍被 touched-lines 限制拒绝
+
+---
+
+## 遥测 / 可观测性（可选但推荐）
+
+引入模糊匹配时返回额外的 payload 字段：
 
 - `match_kind: exact | normalized_whitespace`
 - `fuzzy_match_attempted: bool`
 - `fuzzy_candidate_count: number`
 
-This is useful for evaluating:
+这有助于评估：
 
-- how often fuzzy is needed
-- whether ambiguity is common
-- whether exact matching remains dominant
-
----
-
-## Migration Path
-
-### Step 1
-
-Current step already completed:
-
-- touched-lines real diff accounting
-- stronger replace_all guardrails
-- no legacy compatibility dependence on `estimated_touched_lines`
-
-### Step 2
-
-Implement patch-mode-only whitespace-normalized matching behind an internal feature flag or conservative default.
-
-### Step 3
-
-Add targeted tests and compare:
-
-- exact success rate
-- not-found rate
-- ambiguity rate
-- accidental large-edit rate
-
-### Step 4
-
-Only if metrics look good, consider legacy-mode fuzzy fallback.
+- 模糊匹配的刚需频率
+- 歧义是否常见
+- 精确匹配是否仍占主导
 
 ---
 
-## Recommendation Summary
+## 迁移路径
 
-The recommended next implementation is:
+### 第 1 步
 
-1. keep exact matching as primary behavior
-2. add **patch-mode-only whitespace-normalized matching**
-3. reject on any ambiguity
-4. do not enable fuzzy for `replace_all`
-5. preserve current touched-lines and read-before-edit safety guards
+当前这步已完成：
 
-This gives Bamboo most of the practical UX win of Claude-style matching, without taking on the full risk of a generic fuzzy text search engine.
+- touched-lines 按真实 diff 计量
+- 更强的 replace_all 护栏
+- legacy 兼容不再依赖 `estimated_touched_lines`
+
+### 第 2 步
+
+在内部 feature flag 或保守默认值之下，实现仅限 patch 模式的空白归一化匹配。
+
+### 第 3 步
+
+增加针对性测试并对比：
+
+- 精确成功率
+- not-found 率
+- 歧义率
+- 意外大改动率
+
+### 第 4 步
+
+仅当指标表现良好时，才考虑 legacy 模式模糊回退。
+
+---
+
+## 建议小结
+
+推荐的下一步实现是：
+
+1. 保持精确匹配为主行为
+2. 新增**仅 patch 模式的空白归一化匹配**
+3. 任何歧义都拒绝
+4. 不为 `replace_all` 启用模糊
+5. 保留现有 touched-lines 与先读后改安全护栏
+
+这让 Bamboo 获得 Claude 式匹配的大部分实际 UX 收益，而不必承担一个通用模糊文本搜索引擎的全部风险。

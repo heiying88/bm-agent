@@ -1,16 +1,16 @@
 ---
 name: research
-description: Investigate a technical or product question using current primary sources and relevant repository evidence, then synthesize cited facts, explicit inferences, uncertainties, and implications. Use when freshness, external documentation, comparisons, or multi-source evidence matter; do not use for simple stable facts, pure code implementation, or a review confined to an already provided patch.
+description: 利用最新的原始资料和相关仓库证据调研技术或产品问题，然后综合出带引用的事实、明确的推断、不确定性与影响。当时效性、外部文档、横向比较或多源证据很重要时使用；不要用于简单稳定的事实、纯代码实现，或局限于已提供补丁的审查。
 ---
 
-# Research
+# 调研
 
-Research the decision, not just the keywords.
+调研的是决策，而不只是关键词。
 
-1. Define the question, decision context, freshness requirement, and what evidence would change the answer.
-2. Inspect relevant local code and documentation when the question concerns the workspace.
-3. Prefer official documentation, specifications, standards, source repositories, and research papers. Use secondary sources only to discover or contrast primary evidence.
-4. Verify dates, versions, scope, and definitions. Cross-check material claims when independent primary sources exist.
-5. Separate sourced facts from inference and recommendation. Cite the direct source next to each material claim and explain uncertainty or conflicting evidence.
+1. 界定问题、决策背景、时效性要求，以及什么样的证据会改变结论。
+2. 当问题涉及 workspace 时，检查相关的本地代码和文档。
+3. 优先使用官方文档、规范、标准、源码仓库和研究论文。二手资料仅用于发现或对照原始证据。
+4. 核实日期、版本、范围和定义。存在独立原始来源时，对关键论断进行交叉验证。
+5. 把有来源的事实与推断、建议区分开。在每条关键论断旁标注直接来源，并解释不确定性或相互矛盾的证据。
 
-Keep research read-only unless the user separately asks for changes. If browsing, repository access, or a source is unavailable, state the limitation and avoid presenting memory as current verification. End with a concise synthesis tailored to the user's decision and list unresolved questions only when they matter.
+除非用户另行要求变更，调研保持只读。如果浏览、仓库访问或某个来源不可用，说明该限制，避免把记忆当作当前验证。最后给出贴合用户决策的简短综合结论，只列出真正重要的未解决问题。

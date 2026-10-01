@@ -1,73 +1,70 @@
-# Known Security Issues
+# 已知安全问题
 
-This document tracks security advisories that cannot be immediately resolved
-due to upstream dependency constraints.
+本文档跟踪因上游依赖限制而无法立即解决的安全公告。
 
-## Audit Status
+## 审计状态
 
-Last audited: 2026-04-24
-Command: `cargo audit`
+最近审计：2026-04-24
+命令：`cargo audit`
 
 ---
 
-## Fixed
+## 已修复
 
 ### RUSTSEC-2026-0104 — rustls-webpki (HIGH)
-- **Issue**: Reachable panic in certificate revocation list parsing
-- **Original version**: 0.103.12
-- **Fixed version**: 0.103.13
-- **Status**: Resolved via `cargo update -p rustls-webpki`
-- **Commit**: See git history for rustls-webpki upgrade
+- **问题**：证书吊销列表解析中的可达 panic
+- **原版本**：0.103.12
+- **修复版本**：0.103.13
+- **状态**：已通过 `cargo update -p rustls-webpki` 解决
+- **提交**：见 git 历史中的 rustls-webpki 升级
 
 ---
 
-## Pending Upstream Fixes
+## 等待上游修复
 
-The following warnings are **informational only** (not exploitable vulnerabilities).
-They require upstream crate updates and cannot be resolved without breaking API changes.
+以下警告**仅供参考**（并非可利用的漏洞）。它们需要上游 crate 更新，不进行破坏性 API 变更就无法解决。
 
-### RUSTSEC-2024-0384 — instant (unmaintained)
-- **Version**: 0.1.13
-- **Dependency chain**: `parking_lot 0.11.2` -> `wasm-timer 0.2.5` -> `reqwest-retry 0.7.0`
-- **Blocked by**: `reqwest-retry` upgrade requires `reqwest 0.13` + `reqwest-middleware 0.5`
-- **Impact**: Low. `instant` is a WASM compatibility shim; unused in production (desktop/server targets only).
-- **Tracking**: Upgrade `reqwest-retry` to 0.9+ when `reqwest-middleware` 0.5 migration is feasible.
+### RUSTSEC-2024-0384 — instant（不再维护）
+- **版本**：0.1.13
+- **依赖链**：`parking_lot 0.11.2` -> `wasm-timer 0.2.5` -> `reqwest-retry 0.7.0`
+- **受阻于**：升级 `reqwest-retry` 需要 `reqwest 0.13` + `reqwest-middleware 0.5`
+- **影响**：低。`instant` 是 WASM 兼容垫片；生产环境未使用（仅桌面/服务器目标）。
+- **跟踪**：待 `reqwest-middleware` 0.5 迁移可行时，将 `reqwest-retry` 升级到 0.9+。
 
-### RUSTSEC-2024-0436 — paste (unmaintained)
-- **Version**: 1.0.15
-- **Dependency chain**: `ratatui 0.29.0` -> `bamboo-tui`
-- **Blocked by**: `ratatui` 0.30 has breaking API changes (`Widget` trait moved to `ratatui-core`)
-- **Impact**: Low. `paste` is a compile-time macro crate; no runtime exposure.
-- **Tracking**: Upgrade `ratatui` to 0.30+ and fix `bamboo-tui` widget imports.
+### RUSTSEC-2024-0436 — paste（不再维护）
+- **版本**：1.0.15
+- **依赖链**：`ratatui 0.29.0` -> `bamboo-tui`
+- **受阻于**：`ratatui` 0.30 有破坏性 API 变更（`Widget` trait 移至 `ratatui-core`）
+- **影响**：低。`paste` 是编译期宏 crate；无运行时暴露。
+- **跟踪**：将 `ratatui` 升级到 0.30+ 并修复 `bamboo-tui` 的 widget 导入。
 
-### RUSTSEC-2025-0134 — rustls-pemfile (unmaintained)
-- **Version**: 2.2.0
-- **Dependency chain**: `rustls-native-certs 0.7.3` -> `hyper-http-proxy 1.1.0` -> `launchdarkly-sdk-transport 0.1.1`
-- **Blocked by**: `rustls-native-certs` 0.8+ may have API changes
-- **Impact**: Low. Only used for GrowthBook/launchdarkly SDK transport.
-- **Tracking**: Monitor `hyper-http-proxy` and `launchdarkly-sdk-transport` for updates.
+### RUSTSEC-2025-0134 — rustls-pemfile（不再维护）
+- **版本**：2.2.0
+- **依赖链**：`rustls-native-certs 0.7.3` -> `hyper-http-proxy 1.1.0` -> `launchdarkly-sdk-transport 0.1.1`
+- **受阻于**：`rustls-native-certs` 0.8+ 可能有 API 变更
+- **影响**：低。仅用于 GrowthBook/launchdarkly SDK 传输。
+- **跟踪**：关注 `hyper-http-proxy` 和 `launchdarkly-sdk-transport` 的更新。
 
-### RUSTSEC-2026-0002 — lru (unsound)
-- **Version**: 0.12.5
-- **Dependency chain**: `ratatui 0.29.0` -> `bamboo-tui`
-- **Blocked by**: Same as `paste` — requires `ratatui` 0.30+
-- **Impact**: Low. `IterMut` violation only affects unsafe code paths; ratatui usage is safe.
-- **Tracking**: Upgrade `ratatui` to 0.30+ (bundles `lru` 0.16+ which fixes this).
+### RUSTSEC-2026-0002 — lru（不健全）
+- **版本**：0.12.5
+- **依赖链**：`ratatui 0.29.0` -> `bamboo-tui`
+- **受阻于**：与 `paste` 相同——需要 `ratatui` 0.30+
+- **影响**：低。`IterMut` 违规只影响 unsafe 代码路径；ratatui 的用法是安全的。
+- **跟踪**：将 `ratatui` 升级到 0.30+（自带修复此问题的 `lru` 0.16+）。
 
 ---
 
-## Resolution Plan
+## 解决计划
 
-| Advisory | Effort | ETA | Owner |
+| 公告 | 工作量 | 预计时间 | 负责人 |
 |----------|--------|-----|-------|
-| RUSTSEC-2024-0384 (instant) | Medium | Next reqwest upgrade cycle | Backend |
-| RUSTSEC-2024-0436 (paste) | Low | With ratatui 0.30 upgrade | TUI |
-| RUSTSEC-2025-0134 (rustls-pemfile) | Low | Monitor upstream | Backend |
-| RUSTSEC-2026-0002 (lru) | Low | With ratatui 0.30 upgrade | TUI |
+| RUSTSEC-2024-0384 (instant) | 中 | 下一次 reqwest 升级周期 | 后端 |
+| RUSTSEC-2024-0436 (paste) | 低 | 随 ratatui 0.30 升级 | TUI |
+| RUSTSEC-2025-0134 (rustls-pemfile) | 低 | 关注上游 | 后端 |
+| RUSTSEC-2026-0002 (lru) | 低 | 随 ratatui 0.30 升级 | TUI |
 
 ---
 
-## CI Configuration
+## CI 配置
 
-These warnings are allowed in CI via `cargo audit` defaults.
-They will be re-evaluated monthly or when major dependency updates occur.
+这些警告通过 `cargo audit` 默认配置在 CI 中被允许。它们将每月重新评估一次，或在重大依赖更新时重新评估。

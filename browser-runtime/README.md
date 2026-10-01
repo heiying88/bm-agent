@@ -1,8 +1,8 @@
-# Bamboo browser runtime
+# Bamboo 浏览器运行时
 
-The server starts `host.cjs` in a separate Node process for each open chat browser. The host uses the pinned `playwright-core` package and Chromium headless shell; Lotus and Nova are not runtime dependencies.
+server 会为每个打开的聊天浏览器在独立的 Node 进程中启动 `host.cjs`。host 使用固定版本的 `playwright-core` 包和 Chromium headless shell；Lotus 和 Nova 不是运行时依赖。
 
-For local development on macOS (Node 20 or newer):
+在 macOS 上本地开发（Node 20 或更高版本）：
 
 ```sh
 cd browser-runtime
@@ -11,4 +11,4 @@ npm ci
 npm run test:runtime
 ```
 
-`BAMBOO_BROWSER_NODE`, `BAMBOO_BROWSER_HOST_SCRIPT`, and `BAMBOO_BROWSER_EXECUTABLE` may point to absolute bundled paths. Without those overrides, Bamboo uses `node` on `PATH`, this source `host.cjs`, and Playwright's installed browser cache. `PLAYWRIGHT_BROWSERS_PATH` can select a different development browser cache. Bodhi sets all three bundled paths for the desktop app.
+`BAMBOO_BROWSER_NODE`、`BAMBOO_BROWSER_HOST_SCRIPT` 和 `BAMBOO_BROWSER_EXECUTABLE` 可以指向打包产物的绝对路径。没有这些覆盖时，Bamboo 使用 `PATH` 上的 `node`、本源码中的 `host.cjs`，以及 Playwright 已安装的浏览器缓存。`PLAYWRIGHT_BROWSERS_PATH` 可以选择另一个开发用浏览器缓存。桌面应用由 Bodhi 设置全部三个打包路径。

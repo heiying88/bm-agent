@@ -1,16 +1,16 @@
 ---
 name: simplify
-description: Reduce unnecessary code complexity, duplication, indirection, or abstraction while preserving observable behavior and validating equivalence. Use for simplify, cleanup, or behavior-preserving refactor requests; do not use for adding features, diagnosing an unexplained failure, broad code review without a simplification goal, or cosmetic churn without a complexity benefit.
+description: 在保持可观察行为不变并验证等价性的前提下，削减不必要的代码复杂度、重复、间接层或抽象。用于简化、清理或保持行为的重构请求；不要用于新增功能、诊断原因不明的故障、没有简化目标的宽泛代码审查，或没有复杂度收益的表面改动。
 ---
 
-# Simplify
+# 简化
 
-Make the code easier to understand for the next maintainer without changing its contract.
+在不改变代码契约的前提下，让下一位维护者更容易理解它。
 
-1. Define the scoped behavior that must remain stable and read its callers, tests, error semantics, and compatibility constraints.
-2. Identify concrete complexity: duplicated decisions, unnecessary layers, misleading state, premature generality, or control flow that can be made direct.
-3. Prefer deletion, consolidation, and existing project patterns over a new abstraction. Keep the diff focused and avoid opportunistic cleanup.
-4. Modify files only when the user asked for the refactor. For a read-only request, present the smallest behavior-preserving proposal instead.
-5. Run the narrow equivalence tests first, then affected suites. Add a regression test when existing coverage cannot prove the preserved behavior.
+1. 明确必须保持稳定的范围行为，阅读其调用方、测试、错误语义和兼容性约束。
+2. 识别具体的复杂度：重复的判断、多余的层次、有误导性的状态、过早的泛化，或可以变得更直接的控制流。
+3. 优先选择删除、合并和既有的项目模式，而不是引入新抽象。保持 diff 聚焦，避免顺手清理。
+4. 只有当用户要求重构时才修改文件。对于只读请求，改为提出最小的保持行为不变的方案。
+5. 先运行窄范围的等价性测试，再运行受影响的测试套件。当现有覆盖无法证明行为得以保持时，补充回归测试。
 
-Explain what became simpler and why, the behavior evidence, validation, and any residual risk. If the proposed simplification would alter behavior or public contracts, stop and present it as a separate decision. Respect permission failures and preserve the established behavior baseline across context compaction.
+说明什么变简单了、为什么，以及行为证据、验证情况和任何残余风险。如果拟议的简化会改变行为或公开契约，停下来，把它作为一个单独的决策呈报。尊重权限失败，并在上下文压缩过程中保持已确立的行为基线。

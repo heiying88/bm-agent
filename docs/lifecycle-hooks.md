@@ -1,17 +1,10 @@
-# Lifecycle hooks
+# 生命周期钩子
 
-Bamboo can run ordered command or external script handlers at agent lifecycle
-events. Configure them in the `lifecycle_hooks` object in
-`$BAMBOO_DATA_DIR/hooks.json` (normally `~/.bamboo/hooks.json`). Changes are
-validated and hot-reloaded. Engine-owned hooks are snapshotted when an
-execution starts. Notification hooks read the current configuration, and a
-background Bash completion reads the configuration available when it arrives.
+Bamboo 可以在 agent 生命周期的各个事件上运行有序的命令或外部脚本处理器。在 `$BAMBOO_DATA_DIR/hooks.json`（通常是 `~/.bamboo/hooks.json`）中的 `lifecycle_hooks` 对象里配置。变更会被校验并热加载。引擎拥有的钩子会在执行开始时建立快照。通知钩子读取当前配置，后台 Bash 完成事件则读取其到达时可用的配置。
 
-Hook matching, process orchestration, and handler execution live in the
-standalone `bamboo-hooks` crate. The engine owns the lifecycle seams and
-applies returned decisions or context.
+钩子匹配、进程编排和处理器执行位于独立的 `bamboo-hooks` crate 中。引擎拥有这些生命周期接缝，并应用返回的决策或上下文。
 
-## Configuration
+## 配置
 
 ```json
 {
@@ -39,64 +32,49 @@ applies returned decisions or context.
 }
 ```
 
-Each event contains ordered groups. A group and the whole section can be
-disabled without deleting them. `matcher` is a Rust regular expression over
-the tool name and is supported only for `PreToolUse` and `PostToolUse`.
+每个事件包含若干有序的组。组和整个区段都可以在不删除的情况下被禁用。`matcher` 是作用于工具名称的 Rust 正则表达式，仅 `PreToolUse` 和 `PostToolUse` 支持它。
 
-Handlers run sequentially in configuration order. A control decision stops
-normal dispatch; observer events always run every matching handler.
-Programmatic hooks and configured handlers share the same dispatcher and
-priority ordering.
+处理器按配置顺序依次运行。控制决策会停止正常分发；观察者事件始终运行每一个匹配的处理器。程序化钩子与配置的处理器共享同一个分发器和优先级排序。
 
-Handler settings:
+处理器设置：
 
-| Type | Required field | Optional fields | Default timeout |
+| 类型 | 必填字段 | 可选字段 | 默认超时 |
 |---|---|---|---:|
 | `command` | `command` | `timeout_ms` | 60000 ms |
 | `script` | `path` | `runner`, `timeout_ms` | 60000 ms |
 
-Every `timeout_ms` must be between 1 and 600000. Stdout and stderr are each
-captured up to 64 KiB. A relative script path is resolved against the session
-workspace. Server-owned hooks fall back to the configured default work area
-and then Bamboo's data directory.
+每个 `timeout_ms` 必须介于 1 到 600000 之间。stdout 和 stderr 各自最多捕获 64 KiB。相对脚本路径以 session workspace 为基准解析。服务器拥有的钩子会回退到配置的默认工作区，然后再回退到 Bamboo 的数据目录。
 
-`runner` defaults to `auto`:
+`runner` 默认为 `auto`：
 
-| Script extension | Auto runtime order | Explicit runner |
+| 脚本扩展名 | 自动运行时顺序 | 显式 runner |
 |---|---|---|
-| `.js`, `.mjs`, `.cjs` | `node`, then `bun run` | `node` or `bun` |
-| `.py` | `python3`, then `python`; Windows also tries `py -3` | `python` |
-| `.sh` | system sh/Bash-compatible runtime | `bash` |
-| `.ps1` | `pwsh`, then Windows PowerShell | `powershell` |
-| `.bat`, `.cmd` | `cmd.exe` on Windows | `cmd` |
+| `.js`, `.mjs`, `.cjs` | `node`，然后 `bun run` | `node` 或 `bun` |
+| `.py` | `python3`，然后 `python`；Windows 还会尝试 `py -3` | `python` |
+| `.sh` | 系统 sh/Bash 兼容运行时 | `bash` |
+| `.ps1` | `pwsh`，然后 Windows PowerShell | `powershell` |
+| `.bat`, `.cmd` | Windows 上的 `cmd.exe` | `cmd` |
 
-Bamboo does not bundle any of these runtimes. The selected executable must be
-available in the environment prepared for Bamboo child processes. An explicit
-runner must be compatible with the script extension. Batch files remain valid
-in shared configuration but report a platform diagnostic when run outside
-Windows.
+Bamboo 不捆绑其中任何运行时。选定的可执行文件必须存在于为 Bamboo 子进程准备的环境中。显式 runner 必须与脚本扩展名兼容。批处理文件在共享配置中仍然有效，但在 Windows 之外运行时会报告平台诊断。
 
-Command handlers continue to run through Bamboo's preferred Bash-compatible
-shell. Agent events use the session workspace; server-owned notification hooks
-fall back to the configured default work area and then the server process
-directory.
+命令处理器继续通过 Bamboo 首选的 Bash 兼容 shell 运行。agent 事件使用 session workspace；服务器拥有的通知钩子会回退到配置的默认工作区，然后再回退到服务器进程目录。
 
-Supported events:
+支持的事件：
 
-| Event | When it runs | Control behavior |
+| 事件 | 运行时机 | 控制行为 |
 |---|---|---|
-| `SessionStart` | A run is initialized or resumed | May inject context or stop the run. |
-| `UserPromptSubmit` | Before a submitted prompt is persisted | May block or extend the effective prompt. |
-| `PreToolUse` | After arguments are parsed, before permission and dispatch | `allow`, `block`, and `ask` participate in the parent-agent permission path. |
-| `PostToolUse` | After a foreground or background tool completes | May attach feedback; background Bash completion uses `tool_name: "Bash"`. |
-| `Stop` | Before the run emits its terminal completion | May force a bounded continuation. |
-| `SessionEnd` | After a terminal status is known | Observer only; decisions cannot change the settled result. |
-| `PreCompact` | Immediately before LLM context summarization | `additional_context` becomes custom summarizer instructions. Decisions are ignored because blocking compaction risks context overflow. |
-| `Notification` | After notification policy and dedup, alongside desktop/ntfy/Bark delivery | Fire-and-forget observer; decisions and output are ignored. |
+| `SessionStart` | 一次运行被初始化或恢复时 | 可注入上下文或停止该运行。 |
+| `UserPromptSubmit` | 在已提交的提示词被持久化之前 | 可阻塞或扩展生效的提示词。 |
+| `PreToolUse` | 参数解析之后、权限检查与分发之前 | `allow`、`block` 和 `ask` 参与父 agent 的权限路径。 |
+| `PostToolUse` | 前台或后台工具完成之后 | 可附加反馈；后台 Bash 完成事件使用 `tool_name: "Bash"`。 |
+| `Stop` | 在运行发出终态完成之前 | 可强制一次有界的继续执行。 |
+| `SessionEnd` | 终态状态已知之后 | 仅观察者；决策无法改变已定局的结果。 |
+| `PreCompact` | 紧接在 LLM 上下文摘要化之前 | `additional_context` 会成为自定义摘要器指令。决策会被忽略，因为阻塞压缩有上下文溢出的风险。 |
+| `Notification` | 在通知策略与去重之后，与桌面/ntfy/Bark 投递同时 | 即发即忘的观察者；决策与输出均被忽略。 |
 
-## Input envelope
+## 输入信封
 
-Both handler types receive the same schema-versioned JSON object on stdin:
+两类处理器都会通过 stdin 收到同一个带 schema 版本的 JSON 对象：
 
 ```json
 {
@@ -118,24 +96,18 @@ Both handler types receive the same schema-versioned JSON object on stdin:
 }
 ```
 
-Compression `trigger` is `threshold`, `forced_overflow_recovery`, or `manual`.
-A delivered notification payload contains `id`, `category`, `priority`,
-`title`, `body`, `dedup_key`, `created_at`, and an optional `click_url`.
-Tool-oriented envelopes also keep the convenience fields `tool_name`,
-`tool_input`, and `tool_response` for compatibility.
+压缩的 `trigger` 为 `threshold`、`forced_overflow_recovery` 或 `manual`。已投递的通知负载包含 `id`、`category`、`priority`、`title`、`body`、`dedup_key`、`created_at` 以及可选的 `click_url`。面向工具的信封还保留便捷字段 `tool_name`、`tool_input` 和 `tool_response` 以保持兼容。
 
-All handlers also receive:
+所有处理器还会收到：
 
-- `BAMBOO_HOOK_EVENT`: the event name from the table above.
-- `BAMBOO_SESSION_ID`: the owning session id.
+- `BAMBOO_HOOK_EVENT`：上表中的事件名称。
+- `BAMBOO_SESSION_ID`：所属 session 的 id。
 
-Script handlers additionally receive `BAMBOO_HOOK_SCRIPT`, the resolved script
-path.
+脚本处理器额外收到 `BAMBOO_HOOK_SCRIPT`，即解析后的脚本路径。
 
-## Output contract
+## 输出契约
 
-For decision-capable events, a handler can write one response object to
-stdout:
+对于具备决策能力的事件，处理器可以向 stdout 写入一个响应对象：
 
 ```json
 {
@@ -145,22 +117,15 @@ stdout:
 }
 ```
 
-`decision` is `allow`, `block`, or `ask`. `additional_context` can be returned
-with or without a decision.
+`decision` 为 `allow`、`block` 或 `ask`。`additional_context` 可以随决策一起返回，也可以不带决策单独返回。
 
-A handler exits 0 and writes either no stdout or exactly one JSON response.
-Exit 2 blocks with stderr as the reason. Other non-zero exits, malformed or
-truncated stdout, missing runtimes, and timeouts are logged and treated as
-non-blocking failures. The dry-run endpoint returns these diagnostics without
-persisting configuration.
+处理器以退出码 0 结束，并写入空 stdout 或恰好一个 JSON 响应。退出码 2 表示阻塞，原因取自 stderr。其他非零退出、格式错误或被截断的 stdout、缺失的运行时以及超时都会被记录并视为非阻塞失败。dry-run 端点会返回这些诊断信息，而不持久化配置。
 
-Observer events (`SessionEnd`, `Notification`) never change control flow.
-`PreCompact` consumes only `additional_context`; its decision and an exit-2
-block signal are deliberately ignored.
+观察者事件（`SessionEnd`、`Notification`）从不改变控制流。`PreCompact` 只消费 `additional_context`；其决策与退出码 2 的阻塞信号会被有意忽略。
 
-## Script examples
+## 脚本示例
 
-Node.js or Bun (`.bamboo/hooks/check-command.js`):
+Node.js 或 Bun（`.bamboo/hooks/check-command.js`）：
 
 ```javascript
 let raw = "";
@@ -176,7 +141,7 @@ process.stdin.on("end", () => {
 });
 ```
 
-Python (`.bamboo/hooks/add-context.py`):
+Python（`.bamboo/hooks/add-context.py`）：
 
 ```python
 import json
@@ -188,7 +153,7 @@ print(json.dumps({
 }))
 ```
 
-Shell (`.bamboo/hooks/block-dangerous-bash.sh`):
+Shell（`.bamboo/hooks/block-dangerous-bash.sh`）：
 
 ```bash
 #!/usr/bin/env bash
@@ -201,21 +166,13 @@ if printf '%s' "$command" | grep -Eq '(^|[;&|[:space:]])rm[[:space:]]+-rf[[:spac
 fi
 ```
 
-## Process and security model
+## 进程与安全模型
 
-Every script invocation is a fresh child process. Bamboo supplies the prepared
-environment and working directory, writes the envelope to stdin, drains
-bounded stdout/stderr concurrently, enforces the configured wall-clock
-deadline, and kills the process tree on timeout.
+每次脚本调用都是一个全新的子进程。Bamboo 提供准备好的环境和工作目录，把信封写入 stdin，并发地抽取有界的 stdout/stderr，强制执行配置的挂钟期限，并在超时时杀死进程树。
 
-External scripts are not sandboxed. They run with the filesystem, network,
-environment, and operating-system permissions of the Bamboo process user.
-Only trusted, user-owned hook configuration and scripts should be enabled.
-Project-local hook discovery requires a separate trust gate. Use an
-OS/container sandbox or a restricted service account when stronger isolation
-is required.
+外部脚本不受沙箱保护。它们以 Bamboo 进程用户的文件系统、网络、环境和操作系统权限运行。只应启用可信的、用户自有的钩子配置和脚本。项目本地钩子的发现需要一个单独的信任门禁。需要更强隔离时，请使用操作系统/容器沙箱或受限的服务账户。
 
-Auto-format after an edit:
+编辑后自动格式化：
 
 ```json
 {
@@ -226,6 +183,4 @@ Auto-format after an edit:
 }
 ```
 
-The lifecycle-hook dry-run endpoint accepts either handler type and uses the
-production input schema, timeout, output limits, working directory, runtime
-selection, and a deterministic synthetic payload for the selected event.
+生命周期钩子 dry-run 端点接受两种处理器类型，并使用生产级的输入 schema、超时、输出上限、工作目录、运行时选择，以及为所选事件生成的确定性合成负载。

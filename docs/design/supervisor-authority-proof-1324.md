@@ -1,48 +1,15 @@
-# Default Supervisor authority proof (#1324)
+# 默认 Supervisor 权限证明（#1324）
 
-The fixed default Supervisor stores a bounded `supervisor-authority.json` beside
-its canonical `session.json`, `runtime.json`, and Root tool proof. The new file
-binds the Session ID, birth time, incarnation, Root tool selection/revision, and
-the complete bounded management state (Project scope, links/tombstones and
-revision). It is a canonical authority fence, not a directory or a second
-management writer. The management state remains in `runtime.json`.
+固定的默认 Supervisor 在其规范的 `session.json`、`runtime.json` 与 Root 工具证明旁边存储一个有界的 `supervisor-authority.json`。该新文件绑定 Session ID、出生时间、incarnation、Root 工具选择/修订版本，以及完整的有界管理状态（Project 范围、链接/墓碑与修订版本）。它是规范权限围栏，不是目录，也不是第二个管理写入者。管理状态仍保存在 `runtime.json` 中。
 
-## Operational reads
+## 运营读取
 
-`load_root_authority`, Supervisor scope/link reads, followups, and management
-mutations acquire the existing lifecycle, Task, and Session locks. They parse
-`runtime.json`, check the physical Root placement and regular main file, then
-require committed Root tool and Supervisor proofs matching that runtime
-snapshot. They do not read conversation bytes from `session.json`. After a
-same-ID recreation, the durable revocation cutoff is compared with the proved
-birth time, rather than scanning the main transcript. Full Session loads and
-full saves still parse `session.json` and verify its identity and management
-overlay against the sidecar.
+`load_root_authority`、Supervisor 范围/链接读取、followup 与管理变更都会获取既有的 lifecycle、Task 与 Session 锁。它们解析 `runtime.json`，检查物理 Root 位置与常规 main 文件，然后要求与该运行时快照匹配的已提交 Root 工具证明与 Supervisor 证明。它们不读取 `session.json` 中的对话字节。同 ID 重建之后，用持久化的吊销截止时间与已证明的出生时间比较，而不是扫描 main 会话记录。完整 Session 加载与完整保存仍会解析 `session.json`，并对照 sidecar 校验其身份与管理覆盖层。
 
-## Publication and recovery
+## 发布与恢复
 
-- Bootstrap stages the complete main/runtime/proof set before publishing the
-  directory and index. Copying a Supervisor still creates an Ordinary Root and
-  never copies Supervisor authority.
-- A management mutation durably publishes `Prepared` proof, then the new
-  `runtime.json`, then `Committed` proof. A full save coordinates this order
-  with the Root tool proof and writes the main before committing both proofs.
-  Any interrupted intermediate phase denies operational authority. If the
-  final commit succeeded but acknowledgement failed, a read after restart
-  observes the committed revision; the caller should reload before retrying.
-- The existing Task journal changes Task fields only. Startup performs a
-  one-time Supervisor proof upgrade before Task recovery, then checks for a
-  newly recovered pair before publishing the durable migration marker.
-  Thereafter a missing, corrupt, pending, or stale proof is never regenerated.
-  An old pair is upgraded only after full main/runtime parsing, Supervisor
-  overlay validation, and existing Root proof validation. An old runtime
-  management revision ahead of main is valid when it satisfies the overlay
-  rules, as management updates historically wrote the sidecar alone.
+- Bootstrap 在发布目录与索引之前，先暂存完整的 main/runtime/证明集合。复制 Supervisor 仍会创建 Ordinary Root，绝不复制 Supervisor 权限。
+- 管理变更先持久化发布 `Prepared` 证明，然后是新的 `runtime.json`，最后是 `Committed` 证明。完整保存会将该顺序与 Root 工具证明协调，并在提交两份证明之前写入 main。任何被中断的中间阶段都会拒绝运营权限。如果最终提交已成功但确认失败，重启后的读取会观察到已提交的修订版本；调用方应在重试之前重新加载。
+- 既有的 Task journal 只变更 Task 字段。启动会在 Task 恢复之前执行一次性的 Supervisor 证明升级，然后在发布持久迁移标记之前检查新恢复出的配对。此后，缺失、损坏、pending 或过期的证明绝不会被重新生成。旧配对只有在完整解析 main/runtime、校验 Supervisor 覆盖层并通过既有 Root 证明校验之后才会升级。旧运行时管理修订版本领先于 main 时，只要满足覆盖层规则即有效，因为历史上管理更新曾单独写入 sidecar。
 
-The proof is bounded to 256 KiB; management capacity is at most 64 Projects
-and 256 links. Its per-operation cost is independent of transcript length.
-The protocol handles interrupted local writes and stale single-file state. It
-does not claim to detect coordinated rollback of all canonical files and the
-migration marker. Repairs of an interrupted `Prepared` management publication
-require explicit recovery from trusted prior evidence; ordinary writers cannot
-guess or silently roll it forward.
+证明上限为 256 KiB；管理容量最多为 64 个 Project 和 256 个链接。其单次操作成本与会话记录长度无关。该协议处理被中断的本地写入与过期的单文件状态。它不宣称能检测所有规范文件与迁移标记被协同回滚的情形。修复被中断的 `Prepared` 管理发布需要基于可信的历史证据进行显式恢复；普通写入者无法猜测或悄悄将其前滚。
