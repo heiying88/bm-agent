@@ -37,6 +37,12 @@ use super::super::render::chunk_message;
 
 /// iLink 网关官方域名（登录响应可能返回按 bot 区分的 `baseurl`，届时覆盖）。
 const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
+/// 媒体 CDN 根地址（入站图片/文件的下载源）。
+const DEFAULT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+/// 单个媒体的最大字节数（对齐 cc-connect 的 100 MB 上限）。
+const MAX_MEDIA_BYTES: usize = 100 * 1024 * 1024;
+/// 媒体下载超时。
+const MEDIA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// 服务端长轮询挂起时长（响应里的 `longpolling_timeout_ms` 为 35000）。
 const LONG_POLL_TIMEOUT_SECS: u64 = 35;
 /// HTTP 客户端超时在服务端挂起时长之上留的余量，避免客户端先掐断合法长轮询。
@@ -69,6 +75,10 @@ const MSG_TYPE_OUTBOUND: i64 = 2;
 const MSG_STATE_FINISH: i64 = 2;
 /// `item_list[].type == 1`：文本条目。
 const ITEM_TYPE_TEXT: i64 = 1;
+/// `item_list[].type == 2`：图片条目（CDN 加密媒体）。
+const ITEM_TYPE_IMAGE: i64 = 2;
+/// `item_list[].type == 3`：语音条目（含微信 ASR 转写文本）。
+const ITEM_TYPE_VOICE: i64 = 3;
 
 /// 全仓库共享一个 `reqwest::Client`（对齐 telegram 适配器的 `http_client` 惯例，
 /// 复用 workspace 锁定的 native-tls 栈，绝不另建第二个连接池）。
@@ -83,6 +93,107 @@ fn random_wechat_uin() -> String {
     use rand::Rng;
     let value = rand::rng().next_u32();
     base64::engine::general_purpose::STANDARD.encode(value.to_string().as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// 入站媒体：CDN 下载 + AES-128-ECB 解密（对齐 cc-connect 的 cdn.go 实现）
+// ---------------------------------------------------------------------------
+
+/// 归一化媒体密钥：图片走 32 位 hex 字段；否则用 base64 的 `aes_key`
+/// （解码后为 16 字节密钥，或 32 字符的 hex ASCII 字符串再解一次）。
+fn normalize_media_key(hex_field: Option<&str>, b64_field: Option<&str>) -> Option<[u8; 16]> {
+    if let Some(hex) = hex_field
+        .map(str::trim)
+        .filter(|value| value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        let mut key = [0u8; 16];
+        for (index, byte) in key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+        }
+        return Some(key);
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(b64_field?.trim().as_bytes())
+        .ok()?;
+    match decoded.len() {
+        16 => Some(decoded[..].try_into().expect("16 bytes")),
+        32 => {
+            // 32 字节且全是 hex 字符：实为 hex 字符串（cc-connect 的同款兼容）。
+            let text = std::str::from_utf8(&decoded).ok()?;
+            if text.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let mut key = [0u8; 16];
+                for (index, byte) in key.iter_mut().enumerate() {
+                    *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?;
+                }
+                Some(key)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// AES-128-ECB 解密（无 IV），逐块解密后剥 PKCS#7 填充。密文长度非 16 的
+/// 整数倍视为损坏返回 `None`。
+fn decrypt_aes_128_ecb(key: &[u8; 16], ciphertext: &[u8]) -> Option<Vec<u8>> {
+    use aes_gcm::aes::cipher::common::Block;
+    use aes_gcm::aes::cipher::{BlockCipherDecrypt, KeyInit};
+
+    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
+        return None;
+    }
+    let cipher = aes_gcm::aes::Aes128::new(Block::<aes_gcm::aes::Aes128>::from_slice(key));
+    let mut plain = ciphertext.to_vec();
+    for chunk in plain.chunks_exact_mut(16) {
+        cipher.decrypt_block(Block::<aes_gcm::aes::Aes128>::from_mut_slice(chunk));
+    }
+    pkcs7_unpad(&plain)
+}
+
+/// PKCS#7 去填充（块大小 16）：填充长度必须在 1..=16 且所有填充字节一致。
+fn pkcs7_unpad(data: &[u8]) -> Option<Vec<u8>> {
+    const BLOCK: usize = 16;
+    if data.len() < BLOCK || data.len() % BLOCK != 0 {
+        return None;
+    }
+    let pad = *data.last()? as usize;
+    if pad == 0 || pad > BLOCK {
+        return None;
+    }
+    if !data[data.len() - pad..].iter().all(|byte| *byte as usize == pad) {
+        return None;
+    }
+    Some(data[..data.len() - pad].to_vec())
+}
+
+/// 魔数嗅探图片扩展名（对齐 cc-connect 的 detectImageMime）。
+fn sniff_image_ext(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "jpg"
+    } else if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "png"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        "jpg"
+    }
+}
+
+/// RFC 3986 查询参数编码：除未保留字符（`A-Za-z0-9-_.~`）外全部百分号编码。
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// 每个会话的出站限流桶：阻塞（绝不丢弃）直到距上次发送至少 `min_interval`。
@@ -166,12 +277,43 @@ struct IlinkItem {
     kind: Option<i64>,
     #[serde(default)]
     text_item: Option<IlinkTextItem>,
+    /// 语音条：微信 ASR 转写文本在 `text` 字段里——有转写时无需下载音频。
+    #[serde(default)]
+    voice_item: Option<IlinkVoiceItem>,
+    #[serde(default)]
+    image_item: Option<IlinkImageItem>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct IlinkTextItem {
     #[serde(default)]
     text: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IlinkVoiceItem {
+    /// 微信自带的语音转写文本。
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct IlinkImageItem {
+    #[serde(default)]
+    media: Option<IlinkCdnMedia>,
+    /// 图片特有的 32 位十六进制 AES 密钥（优先于 media.aes_key）。
+    #[serde(default, rename = "aeskey")]
+    aes_key_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct IlinkCdnMedia {
+    /// CDN 下载凭据（拼进 `/download?encrypted_query_param=...`）。
+    #[serde(default)]
+    encrypt_query_param: Option<String>,
+    /// base64 的 AES-128 密钥（或 32 位 hex 的 ASCII 字符串）。
+    #[serde(default)]
+    aes_key: Option<String>,
 }
 
 /// `sendmessage` 响应。注意错误有两条通道：`ret`（信封级）与 `errcode`
@@ -248,6 +390,8 @@ pub struct WechatPlatform {
     /// 网关地址：构造时为配置解析出的默认/自定义域；扫码重登成功后若返回
     /// 了按 bot 区分的 `baseurl` 则覆盖。
     base_url: RwLock<String>,
+    /// 媒体 CDN 根地址（生产为官方域名；测试注入本地桩）。
+    cdn_base_url: String,
     /// Bearer token。正常来自 connect.json（加密管道解出）；扫码重登成功后
     /// 在内存中替换（进程重启即失效，日志会提示写入 connect.json 持久化）。
     token: RwLock<String>,
@@ -273,11 +417,19 @@ impl WechatPlatform {
     ) -> Self {
         Self {
             base_url: RwLock::new(base_url),
+            cdn_base_url: DEFAULT_CDN_BASE_URL.to_string(),
             token: RwLock::new(token),
             state_dir,
             cursor: AsyncMutex::new(None),
             rate_limiter: RateLimiter::new(rate_limit_interval),
         }
+    }
+
+    /// 测试专用：注入本地 CDN 桩地址。
+    #[cfg(test)]
+    fn with_cdn_base(mut self, cdn_base_url: String) -> Self {
+        self.cdn_base_url = cdn_base_url;
+        self
     }
 
     fn base_url(&self) -> String {
@@ -393,33 +545,51 @@ impl WechatPlatform {
             self.persist_cursor(&new_cursor);
         }
 
-        Ok(parsed
-            .msgs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, msg)| Self::to_inbound_message(msg, index))
-            .map(Inbound::Message)
-            .collect())
+        let mut events = Vec::with_capacity(parsed.msgs.len());
+        for (index, msg) in parsed.msgs.iter().enumerate() {
+            if msg.message_type != MSG_TYPE_INBOUND {
+                continue;
+            }
+            // 内容行：文本 + 语音转写在映射时同步生成；图片需要异步下载，
+            // 先落盘再把路径追加为文本行（agent 的看图工具可以打开它）。
+            let (mut lines, images) = extract_content_lines(msg);
+            // 图片即使下载失败也保留占位行——纯图片消息不能因为 CDN
+            // 抖动就整条消失。
+            for image in &images {
+                match self.fetch_and_save_image(image, index).await {
+                    Ok(path) => lines.push(format!("[图片] {}", path.display())),
+                    Err(error) => {
+                        tracing::warn!("connect: wechat inbound image failed: {error}");
+                        lines.push("[图片]（下载或解密失败，未能保存）".to_string());
+                    }
+                }
+            }
+            if let Some(message) = Self::build_inbound_message(msg, index, lines) {
+                events.push(Inbound::Message(message));
+            }
+        }
+        Ok(events)
     }
 
-    /// 把一条 iLink 消息映射为 bridge 的 [`InboundMessage`]。
+    /// 把一条 iLink 消息映射为 bridge 的 [`InboundMessage`]，消息文本取
+    /// `lines`（文本行 + 语音转写行 + 图片路径行，由调用方组装）。
     ///
-    /// 返回 `None` 的消息（出站回显、无文本、无 `from_user_id`、无
+    /// 返回 `None` 的消息（出站回显、无内容、无 `from_user_id`、无
     /// `context_token`）只是不转发——游标已在 `poll_once` 里推进，网关不会
     /// 重发它们（这点与 telegram 的 offset 语义一致）。
-    ///
-    /// `message_id` 是合成值：协议没有消息 id，用
-    /// `from + context_token + 文本 + 批内序号` 的确定性哈希，保证同一条
-    /// 消息在游标重放时哈希一致、bridge 去重键 `wechat:<hash>` 能命中。
-    fn to_inbound_message(msg: &IlinkMessage, batch_index: usize) -> Option<InboundMessage> {
-        if msg.message_type != MSG_TYPE_INBOUND {
-            return None;
-        }
+    fn build_inbound_message(
+        msg: &IlinkMessage,
+        batch_index: usize,
+        lines: Vec<String>,
+    ) -> Option<InboundMessage> {
         let from = msg
             .from_user_id
             .as_deref()
             .filter(|value| !value.trim().is_empty())?;
-        let text = extract_text(msg)?;
+        let text = lines.join("\n");
+        if text.trim().is_empty() {
+            return None;
+        }
         let context_token = msg
             .context_token
             .clone()
@@ -448,6 +618,90 @@ impl WechatPlatform {
                 "context_token": context_token,
             })),
         })
+    }
+
+    /// 下载并解密一张入站图片，保存到 `state_dir/media/` 下，返回落盘路径。
+    ///
+    /// 流程对齐 cc-connect 的 cdn.go：
+    /// `GET {cdn}/download?encrypted_query_param=...` → AES-128-ECB 解密
+    /// （密钥取 `aeskey` hex 字段或 base64 的 `media.aes_key`）→ 魔数嗅探
+    /// 扩展名 → 落盘。无密钥时走明文直下兜底（cc-connect 对图片同款）。
+    async fn fetch_and_save_image(
+        &self,
+        image: &IlinkImageItem,
+        batch_index: usize,
+    ) -> PlatformResult<PathBuf> {
+        let dir = self
+            .state_dir
+            .as_deref()
+            .ok_or_else(|| PlatformError::other("wechat media requires a state dir"))?
+            .join("media");
+        let media = image.media.as_ref().ok_or_else(|| {
+            PlatformError::other("weixin image item is missing its media descriptor")
+        })?;
+        let enc_param = media
+            .encrypt_query_param
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlatformError::other("weixin image media is missing encrypt_query_param"))?;
+
+        let url = format!(
+            "{}/download?encrypted_query_param={}",
+            self.cdn_base_url.trim_end_matches('/'),
+            percent_encode_query(enc_param)
+        );
+        let response = http_client()
+            .get(&url)
+            .timeout(MEDIA_DOWNLOAD_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| {
+                // CDN 参数不是秘密，但保持与网关错误同款的脱敏习惯。
+                PlatformError::other(format!(
+                    "image CDN request failed: {}",
+                    error.without_url()
+                ))
+            })?;
+        if !response.status().is_success() {
+            return Err(PlatformError::other(format!(
+                "image CDN returned HTTP {}",
+                response.status()
+            )));
+        }
+        let ciphertext = response
+            .bytes()
+            .await
+            .map_err(|error| PlatformError::other(format!("image CDN read failed: {error}")))?;
+        if ciphertext.len() > MAX_MEDIA_BYTES {
+            return Err(PlatformError::other("image exceeds the 100 MB media cap"));
+        }
+
+        let plain = match normalize_media_key(
+            image.aes_key_hex.as_deref(),
+            media.aes_key.as_deref(),
+        ) {
+            Some(key) => decrypt_aes_128_ecb(&key, &ciphertext).ok_or_else(|| {
+                PlatformError::other("image AES-128-ECB decrypt failed (bad key or padding)")
+            })?,
+            // 无密钥：cc-connect 对图片走明文直下兜底。
+            None => ciphertext.to_vec(),
+        };
+        if plain.is_empty() {
+            return Err(PlatformError::other("decrypted image is empty"));
+        }
+
+        std::fs::create_dir_all(&dir).map_err(|error| {
+            PlatformError::other(format!("media dir create failed: {error}"))
+        })?;
+        let path = dir.join(format!(
+            "wechat_img_{}_{batch_index}.{}",
+            chrono::Utc::now().timestamp_millis(),
+            sniff_image_ext(&plain)
+        ));
+        std::fs::write(&path, &plain)
+            .map_err(|error| PlatformError::other(format!("media write failed: {error}")))?;
+        Ok(path)
     }
 
     /// 发送一条文本消息（`reply` 对每个分块调用一次）。线格式对齐 cc-connect
@@ -644,22 +898,51 @@ impl WechatPlatform {
     }
 }
 
-/// 拼接一条消息里的全部文本条目（`item_list` 里可能有多段文本）。
-/// 没有任何文本内容的消息（图片/语音/文件等，v1 不支持）返回 `None`。
-fn extract_text(msg: &IlinkMessage) -> Option<String> {
-    let parts: Vec<&str> = msg
-        .item_list
-        .iter()
-        .filter(|item| item.kind == Some(ITEM_TYPE_TEXT))
-        .filter_map(|item| item.text_item.as_ref())
-        .filter_map(|text_item| text_item.text.as_deref())
-        .filter(|text| !text.trim().is_empty())
-        .collect();
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
+/// 拆解一条消息的内容：文本条目与语音转写生成文本行（语音无转写时也保留
+/// 占位行），图片条目收集起来交给调用方异步下载（`poll_once`）。
+fn extract_content_lines(msg: &IlinkMessage) -> (Vec<String>, Vec<IlinkImageItem>) {
+    let mut lines = Vec::new();
+    let mut images = Vec::new();
+
+    for item in &msg.item_list {
+        match item.kind {
+            Some(ITEM_TYPE_TEXT) => {
+                if let Some(text) = item
+                    .text_item
+                    .as_ref()
+                    .and_then(|text_item| text_item.text.as_deref())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    lines.push(text.to_string());
+                }
+            }
+            Some(ITEM_TYPE_VOICE) => {
+                // 微信 ASR 转写在 voice_item.text；有转写就不下载 SILK 音频。
+                match item
+                    .voice_item
+                    .as_ref()
+                    .and_then(|voice| voice.text.as_deref())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                {
+                    Some(text) => lines.push(format!("[语音] {text}")),
+                    None => lines.push("[语音]（无转写文本）".to_string()),
+                }
+            }
+            Some(ITEM_TYPE_IMAGE) => {
+                if let Some(image) = item.image_item.as_ref() {
+                    images.push(IlinkImageItem {
+                        media: image.media.clone(),
+                        aes_key_hex: image.aes_key_hex.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
     }
+
+    (lines, images)
 }
 
 /// 合成确定性 message_id（见 [`WechatPlatform::to_inbound_message`] 的说明）。
@@ -1179,5 +1462,192 @@ mod tests {
             elapsed >= Duration::from_millis(150),
             "second reply must be delayed by the per-chat rate limit"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // 入站媒体：语音转写 / 图片 CDN 下载解密
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn poll_once_maps_voice_transcription_as_text() {
+        let server = wiremock::MockServer::start().await;
+        mount_getupdates(
+            &server,
+            serde_json::json!({
+                "ret": 0,
+                "msgs": [
+                    {
+                        "from_user_id": "wxid_user@im.wechat",
+                        "message_type": 1,
+                        "context_token": "CTX-V",
+                        "item_list": [ { "type": 3, "voice_item": { "text": " 明天提醒我开会 " } } ]
+                    },
+                    {
+                        "from_user_id": "wxid_user@im.wechat",
+                        "message_type": 1,
+                        "context_token": "CTX-V2",
+                        "item_list": [ { "type": 3, "voice_item": {} } ]
+                    }
+                ],
+                "get_updates_buf": "CURSOR-V"
+            }),
+        )
+            .await;
+
+        let platform = platform_with_stub(server.uri());
+        let events = platform.poll_once().await.expect("poll_once succeeds");
+
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            Inbound::Message(message) => {
+                assert_eq!(message.text, "[语音] 明天提醒我开会");
+            }
+            Inbound::Callback(_) => panic!("expected a message event"),
+        }
+        match &events[1] {
+            Inbound::Message(message) => {
+                assert_eq!(message.text, "[语音]（无转写文本）");
+            }
+            Inbound::Callback(_) => panic!("expected a message event"),
+        }
+    }
+
+    /// AES-128-ECB + PKCS#7 的往返自测（用 Aes128 加密再解密，断言还原）。
+    #[test]
+    fn aes_ecb_roundtrip() {
+        use aes_gcm::aes::cipher::common::Block;
+        use aes_gcm::aes::cipher::{BlockCipherEncrypt, KeyInit};
+
+        let key = [7u8; 16];
+        let plain = b"hello wechat media!".to_vec();
+        // PKCS#7 填充到 16 的整数倍。
+        let pad = 16 - plain.len() % 16;
+        let mut padded = plain.clone();
+        padded.extend(std::iter::repeat(pad as u8).take(pad));
+
+        let cipher = aes_gcm::aes::Aes128::new(Block::<aes_gcm::aes::Aes128>::from_slice(&key));
+        let mut buf = padded.clone();
+        for chunk in buf.chunks_exact_mut(16) {
+            cipher.encrypt_block(Block::<aes_gcm::aes::Aes128>::from_mut_slice(chunk));
+        }
+        let decrypted = decrypt_aes_128_ecb(&key, &buf).expect("decrypt succeeds");
+        assert_eq!(decrypted, plain);
+
+        // 非块对齐 / 坏填充都要拒绝。
+        assert!(decrypt_aes_128_ecb(&key, b"short").is_none());
+        let mut bad = buf.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF; // 破坏填充字节
+        assert!(decrypt_aes_128_ecb(&key, &bad).is_none());
+    }
+
+    #[test]
+    fn normalize_media_key_accepts_hex_and_base64_forms() {
+        // hex 字段：32 个 hex 字符。
+        let hex_key = normalize_media_key(Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0"), None);
+        assert_eq!(hex_key, Some([0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0]));
+        // base64 字段：16 字节密钥。
+        let b64 = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
+        assert_eq!(
+            normalize_media_key(None, Some(&b64)),
+            Some([1u8; 16])
+        );
+        // base64 字段装的是 32 字符 hex ASCII（cc-connect 兼容形态）。
+        let b64_hex = base64::engine::general_purpose::STANDARD
+            .encode(b"0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        assert!(normalize_media_key(None, Some(&b64_hex)).is_some());
+        assert_eq!(normalize_media_key(None, Some("!!!!")), None);
+        assert_eq!(normalize_media_key(None, None), None);
+    }
+
+    /// 完整图片链路：CDN 桩返回 ECB 密文 → 适配器下载解密落盘 → 消息文本
+    /// 带上 `[图片] <路径>`，路径真实存在且内容即明文 PNG。
+    #[tokio::test]
+    async fn poll_once_downloads_decrypts_and_saves_inbound_images() {
+        use aes_gcm::aes::cipher::common::Block;
+        use aes_gcm::aes::cipher::{BlockCipherEncrypt, KeyInit};
+
+        // 明文：最小 PNG 魔数 + 内容。
+        let mut plain = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        plain.extend_from_slice(b"fake-png-body");
+        let pad = 16 - plain.len() % 16;
+        let mut padded = plain.clone();
+        padded.extend(std::iter::repeat(pad as u8).take(pad));
+        let key = [42u8; 16];
+        let cipher = aes_gcm::aes::Aes128::new(Block::<aes_gcm::aes::Aes128>::from_slice(&key));
+        let mut encrypted = padded;
+        for chunk in encrypted.chunks_exact_mut(16) {
+            cipher.encrypt_block(Block::<aes_gcm::aes::Aes128>::from_mut_slice(chunk));
+        }
+
+        let cdn = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(encrypted.clone()),
+            )
+            .mount(&cdn)
+            .await;
+
+        let api = wiremock::MockServer::start().await;
+        mount_getupdates(
+            &api,
+            serde_json::json!({
+                "ret": 0,
+                "msgs": [
+                    {
+                        "from_user_id": "wxid_user@im.wechat",
+                        "message_type": 1,
+                        "context_token": "CTX-IMG",
+                        "item_list": [
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {
+                                        "encrypt_query_param": "enc-param/with+special=&chars",
+                                        "aes_key": base64::engine::general_purpose::STANDARD.encode(key)
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "get_updates_buf": "CURSOR-IMG"
+            }),
+        )
+            .await;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "bamboo-wechat-img-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let platform = WechatPlatform::with_options(
+            TEST_TOKEN.to_string(),
+            api.uri(),
+            Duration::from_millis(50),
+            Some(state_dir.clone()),
+        )
+        .with_cdn_base(cdn.uri());
+
+        let events = platform.poll_once().await.expect("poll_once succeeds");
+        assert_eq!(events.len(), 1, "a pure-image message must map");
+        match &events[0] {
+            Inbound::Message(message) => {
+                assert!(message.text.starts_with("[图片] "), "text was: {}", message.text);
+                let path = message.text.trim_start_matches("[图片] ").trim();
+                let saved = std::fs::read(path).expect("image file exists on disk");
+                assert_eq!(saved, plain, "decrypted bytes must match the plaintext");
+                // CDN 请求确实带上了编码后的查询参数。
+                let requests = wait_for_requests(&cdn, 1).await;
+                assert!(requests[0]
+                    .url
+                    .query()
+                    .unwrap_or_default()
+                    .contains("encrypted_query_param=enc-param%2Fwith%2Bspecial%3D%26chars"));
+            }
+            Inbound::Callback(_) => panic!("expected a message event"),
+        }
+
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 }

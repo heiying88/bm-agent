@@ -55,7 +55,11 @@
    `~/.bamboo/connect_wechat/cursor.json`，保证重启不重复消费）；
 3. **翻译**：适配器把 JSON 翻成统一的 `InboundMessage`
    （`chat_id`/`user_id` = 发送者微信 id，`reply_ctx` = `to_user_id` +
-   `context_token`；出站回显 `message_type=2` 在此被过滤，防止自回复死循环）；
+   `context_token`；出站回显 `message_type=2` 在此被过滤，防止自回复死循环）。
+   入站媒体也在这层处理：**语音条**取微信自带的 ASR 转写文本（`[语音] ...`）；
+   **图片**从 CDN（`novac2c.cdn.weixin.qq.com`）下载密文、AES-128-ECB 解密、
+   落盘到 `connect_wechat/media/`，并以 `[图片] <路径>` 告知 Agent（其图像
+   工具可直接打开该文件）；
 4. **路由**：bridge 校验 `allow_from`（空列表全拒）→ 按
    `platform:message_id` 去重 → 查 `wechat:<chat_id>:<user_id>` 对应的
    Bamboo 会话（没有则新建）→ 若该会话空闲则启动一次 agent run，

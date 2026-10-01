@@ -1,0 +1,824 @@
+/**
+ * Tests for ToolStepsCard component.
+ *
+ * Verifies step rendering, status mapping, mini output preview, drawer interaction,
+ * and the new `tools` prop path (ToolSessionItem[]) with result-aware status.
+ */
+import React from "react";
+import { describe, expect, it, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent, act } from "@testing-library/react";
+import type { ToolSessionItem } from "../../ToolSessionCard";
+import {
+  buildToolStreamingKey,
+  toolStreamingAtomFamily,
+  toolStreamingStore,
+  type ToolStreamingState,
+} from "../../../streaming/toolStreamingAtoms";
+import { setBashCompleted, clearBackgroundBashState } from "../../../streaming/backgroundBashAtoms";
+
+// Mock antd components
+vi.mock("antd", () => ({
+  Steps: ({ items, current, status, direction, size }: any) => (
+    <div
+      data-testid="steps"
+      data-current={current}
+      data-status={status}
+      data-direction={direction}
+      data-size={size}
+    >
+      {items?.map((item: any) => (
+        <div key={item.key} data-testid={`step-${item.key}`} data-status={item.status}>
+          <div data-testid={`step-title-${item.key}`}>{item.title}</div>
+          <div data-testid={`step-subtitle-${item.key}`}>{item.subTitle}</div>
+          <div data-testid={`step-description-${item.key}`}>{item.description}</div>
+        </div>
+      ))}
+    </div>
+  ),
+  Typography: {
+    Text: ({ children, strong, ellipsis, type, code, ...props }: any) => (
+      <span
+        data-testid="text"
+        data-strong={strong ? "true" : undefined}
+        data-ellipsis={ellipsis ? "true" : undefined}
+        data-type={type}
+        data-code={code ? "true" : undefined}
+        {...props}
+      >
+        {children}
+      </span>
+    ),
+  },
+  theme: {
+    useToken: () => ({
+      token: {
+        colorPrimary: "#1677ff",
+        colorText: "#000",
+        colorTextSecondary: "#666",
+        colorBorderSecondary: "#ddd",
+        borderRadiusLG: 8,
+        borderRadiusSM: 4,
+        marginSM: 8,
+        marginXS: 4,
+        marginXXS: 2,
+        paddingSM: 8,
+        paddingXS: 4,
+        paddingLG: 16,
+        fontSizeSM: 12,
+        colorBgContainer: "#fff",
+        colorFillTertiary: "#f5f5f5",
+      },
+    }),
+  },
+  Tag: ({ children, color, ...props }: any) => (
+    <span data-testid="tag" data-color={color} {...props}>
+      {children}
+    </span>
+  ),
+  Button: ({
+    children,
+    onClick,
+    icon,
+    type,
+    size,
+    danger,
+    "data-testid": testId,
+    ...props
+  }: any) => (
+    <button
+      type="button"
+      data-testid={testId || "button"}
+      data-variant={type}
+      data-size={size}
+      data-danger={danger ? "true" : undefined}
+      onClick={onClick}
+      {...props}
+    >
+      {icon}
+      {children}
+    </button>
+  ),
+  Space: ({ children }: any) => <div data-testid="space">{children}</div>,
+  Drawer: ({ open, onClose, title, children }: any) => (
+    <div data-testid="drawer" data-open={open ? "true" : "false"}>
+      <div data-testid="drawer-title">{title}</div>
+      <button type="button" data-testid="drawer-close" onClick={onClose}>
+        Close
+      </button>
+      {open ? children : null}
+    </div>
+  ),
+  Tabs: ({ items, defaultActiveKey }: any) => (
+    <div data-testid="tabs" data-default-active-key={defaultActiveKey}>
+      {items?.map((item: any) => (
+        <div key={item.key} data-testid={`tab-${item.key}`}>
+          <div data-testid={`tab-label-${item.key}`}>{item.label}</div>
+          <div data-testid={`tab-content-${item.key}`}>{item.children}</div>
+        </div>
+      ))}
+    </div>
+  ),
+  Empty: ({ description }: any) => <div data-testid="empty">{description}</div>,
+  Tooltip: ({ children }: any) => <div data-testid="tooltip">{children}</div>,
+}));
+
+// Mock icons
+vi.mock("@ant-design/icons", () => ({
+  ClockCircleOutlined: () => <span data-testid="icon-clock">Clock</span>,
+  LoadingOutlined: () => <span data-testid="icon-loading">Loading</span>,
+  CheckCircleOutlined: () => <span data-testid="icon-check">Check</span>,
+  CloseCircleOutlined: () => <span data-testid="icon-close">Close</span>,
+  EyeOutlined: () => <span data-testid="icon-eye">Eye</span>,
+  DownOutlined: () => <span data-testid="icon-down">Down</span>,
+  RightOutlined: () => <span data-testid="icon-right">Right</span>,
+  CopyOutlined: () => <span data-testid="icon-copy">Copy</span>,
+  SyncOutlined: () => <span data-testid="icon-sync">Sync</span>,
+  MinusCircleOutlined: () => <span data-testid="icon-minus">Minus</span>,
+}));
+
+// Mock i18n
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
+}));
+
+// Mock syntax highlighter
+vi.mock("react-syntax-highlighter", () => ({
+  Prism: ({ children }: any) => <pre data-testid="syntax-highlighter">{children}</pre>,
+}));
+vi.mock("react-syntax-highlighter/dist/esm/styles/prism", () => ({
+  oneDark: {},
+}));
+
+// Mock clipboard
+vi.mock("@shared/utils/clipboard", () => ({
+  copyText: vi.fn(),
+}));
+
+// Mock mcpAlias utility
+vi.mock("../../../utils/mcpAlias", () => ({
+  parseMcpToolAlias: (name: string) => {
+    if (name.startsWith("mcp__")) {
+      const rest = name.slice(5);
+      const sep = rest.indexOf("__");
+      if (sep > 0) {
+        return { serverId: rest.slice(0, sep), toolName: rest.slice(sep + 2) };
+      }
+    }
+    return null;
+  },
+}));
+
+// Mock toolIntent
+vi.mock("../../../utils/toolIntent", () => ({
+  generateIntentDescription: (toolName: string, params: Record<string, unknown>) => {
+    if (params.command) return `Executing: ${params.command}`;
+    return `Calling ${toolName}`;
+  },
+}));
+
+// Mock resultFormatters
+vi.mock("@shared/utils/resultFormatters", () => ({
+  safeStringify: (obj: unknown, indent = 2) =>
+    typeof obj === "string" ? obj : JSON.stringify(obj, null, indent),
+  formatResultContent: (content: string) => {
+    const trimmed = content.trim();
+    if (
+      (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]"))
+    ) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return {
+          isJson: true,
+          formattedText: JSON.stringify(parsed, null, 2),
+          parsedJson: parsed,
+        };
+      } catch {
+        // Fall through to plain text rendering.
+      }
+    }
+
+    return {
+      isJson: false,
+      formattedText: content,
+    };
+  },
+  parseFileChangeResultPayload: (content: string) => {
+    try {
+      const parsed = JSON.parse(content);
+      if (
+        parsed &&
+        typeof parsed === "object" &&
+        typeof parsed.operation === "string" &&
+        typeof parsed.file_path === "string" &&
+        parsed.diff &&
+        typeof parsed.diff.unified === "string"
+      ) {
+        return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  },
+  getFileChangeDiffStats: (content: string) => {
+    try {
+      const parsed = JSON.parse(content);
+      if (!parsed?.diff?.unified) return null;
+      return {
+        added:
+          typeof parsed.diff.added_lines === "number"
+            ? parsed.diff.added_lines
+            : (parsed.diff.unified.match(/^\+/gm) || []).filter(
+                (line: string) => !line.startsWith("+++"),
+              ).length,
+        removed:
+          typeof parsed.diff.removed_lines === "number"
+            ? parsed.diff.removed_lines
+            : (parsed.diff.unified.match(/^-/gm) || []).filter(
+                (line: string) => !line.startsWith("---"),
+              ).length,
+      };
+    } catch {
+      return null;
+    }
+  },
+  createFocusedUnifiedDiffPreview: () => [
+    { kind: "meta", text: "--- a/demo.ts" },
+    { kind: "hunk", text: "@@ -10,4 +10,4 @@" },
+    { kind: "modified_remove", text: "-old line" },
+    { kind: "modified_add", text: "+new line" },
+    { kind: "gap", text: "⋯" },
+    { kind: "add", text: "+extra line" },
+  ],
+  parseBackgroundBashResultPayload: (content: string) => {
+    try {
+      const parsed = JSON.parse(content);
+      if (parsed && typeof parsed.bash_id === "string" && parsed.status === "running") {
+        return {
+          bashId: parsed.bash_id,
+          command: typeof parsed.command === "string" ? parsed.command : "",
+        };
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  },
+}));
+
+vi.mock("../../FileChangeViewer", () => ({
+  default: ({ payload, defaultViewMode, maxHeight, unifiedLinesOverride }: any) => (
+    <div
+      data-testid="file-change-viewer"
+      data-default-view-mode={defaultViewMode}
+      data-max-height={String(maxHeight ?? "")}
+      data-unified-lines-override={unifiedLinesOverride ? JSON.stringify(unifiedLinesOverride) : ""}
+    >
+      {payload?.file_path}
+    </div>
+  ),
+}));
+
+vi.mock("../FormattedContentPreview", () => ({
+  default: ({ value }: any) => (
+    <div data-testid="formatted-content-preview">{String(value ?? "")}</div>
+  ),
+}));
+
+vi.mock("../ToolStepDetailDrawer", () => ({
+  default: ({ open, onClose, initialTab = "preview", result }: any) =>
+    open ? (
+      <div data-testid="drawer" data-open="true">
+        <button type="button" data-testid="drawer-close" onClick={onClose}>
+          Close
+        </button>
+        <div data-testid="tabs" data-default-active-key={initialTab}>
+          <div data-testid="tab-preview">Preview</div>
+          <div data-testid="tab-parameters">Parameters</div>
+          <div data-testid="tab-result">Result</div>
+          <div data-testid="tab-diff">Diff</div>
+          <div data-testid="tab-content-result">{result?.result?.result ?? ""}</div>
+        </div>
+      </div>
+    ) : null,
+}));
+import { ToolStepsCard } from "../index";
+
+const EMPTY_LIVE_STATE: ToolStreamingState = {
+  output: "",
+  status: "idle",
+  updatedAt: 0,
+};
+
+const setLiveToolState = (
+  sessionId: string,
+  toolCallId: string,
+  patch: Partial<ToolStreamingState>,
+): void => {
+  const streamKey = buildToolStreamingKey(sessionId, toolCallId);
+  toolStreamingStore.set(toolStreamingAtomFamily(streamKey), {
+    ...EMPTY_LIVE_STATE,
+    ...patch,
+  });
+};
+
+const clearLiveToolState = (sessionId: string, toolCallId: string): void => {
+  const streamKey = buildToolStreamingKey(sessionId, toolCallId);
+  toolStreamingStore.set(toolStreamingAtomFamily(streamKey), EMPTY_LIVE_STATE);
+  toolStreamingAtomFamily.remove(streamKey);
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────
+
+const makeCall = (
+  overrides: Partial<{
+    toolCallId: string;
+    toolName: string;
+    parameters: Record<string, unknown>;
+    streamingOutput?: string;
+  }> = {},
+) => ({
+  toolCallId: overrides.toolCallId ?? `call-${Math.random().toString(36).slice(2, 8)}`,
+  toolName: overrides.toolName ?? "bash",
+  parameters: overrides.parameters ?? { command: "ls -la" },
+  streamingOutput: overrides.streamingOutput,
+});
+
+const makeToolSessionItem = (
+  overrides: Partial<{
+    toolCallId: string;
+    toolName: string;
+    parameters: Record<string, unknown>;
+    streamingOutput?: string;
+    hasResult?: boolean;
+    isError?: boolean;
+    resultContent?: string;
+  }> = {},
+): ToolSessionItem => ({
+  call: {
+    id: `assistant-msg:${overrides.toolCallId ?? "call-1"}`,
+    role: "assistant",
+    type: "tool_call",
+    createdAt: "2026-03-24T00:00:00.000Z",
+    toolCalls: [
+      {
+        toolCallId: overrides.toolCallId ?? "call-1",
+        toolName: overrides.toolName ?? "bash",
+        parameters: overrides.parameters ?? { command: "ls" },
+        streamingOutput: overrides.streamingOutput,
+      },
+    ],
+  },
+  ...(overrides.hasResult
+    ? {
+        result: {
+          id: `result-${overrides.toolCallId ?? "call-1"}`,
+          role: "assistant" as const,
+          type: "tool_result" as const,
+          createdAt: "2026-03-24T00:00:01.000Z",
+          toolName: overrides.toolName ?? "bash",
+          toolCallId: overrides.toolCallId ?? "call-1",
+          isError: overrides.isError ?? false,
+          result: {
+            tool_name: overrides.toolName ?? "bash",
+            result: overrides.resultContent ?? "ok",
+            display_preference: "Default" as const,
+          },
+        },
+      }
+    : {}),
+});
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+describe("ToolStepsCard", () => {
+  beforeEach(() => {
+    clearLiveToolState("session-1", "c1");
+    clearLiveToolState("session-1", "c2");
+    clearLiveToolState("session-1", "call-1");
+  });
+
+  // ── Legacy toolCalls prop ─────────────────────────────────────────
+
+  it("renders correct number of steps for multiple toolCalls", () => {
+    const calls = [
+      makeCall({ toolCallId: "c1" }),
+      makeCall({ toolCallId: "c2" }),
+      makeCall({ toolCallId: "c3" }),
+    ];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    const steps = screen.getByTestId("steps");
+    const stepEls = steps.querySelectorAll(':scope > [data-testid^="step-"]');
+    expect(stepEls).toHaveLength(3);
+  });
+
+  it("maps step status to 'wait' when no streamingOutput", () => {
+    const calls = [makeCall({ toolCallId: "c1", streamingOutput: undefined })];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    const step = screen.getByTestId("step-c1");
+    expect(step.getAttribute("data-status")).toBe("wait");
+  });
+
+  it("maps step status to 'process' when streamingOutput exists", () => {
+    const calls = [makeCall({ toolCallId: "c1", streamingOutput: "some output" })];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    const step = screen.getByTestId("step-c1");
+    expect(step.getAttribute("data-status")).toBe("process");
+  });
+
+  it("shows mini output preview with last 3 lines when streaming", () => {
+    const output = "line1\nline2\nline3\nline4\nline5";
+    const calls = [makeCall({ toolCallId: "c1", streamingOutput: output })];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    const desc = screen.getByTestId("step-description-c1");
+    expect(desc.textContent).toContain("line3");
+    expect(desc.textContent).toContain("line4");
+    expect(desc.textContent).toContain("line5");
+    expect(desc.textContent).not.toContain("line1");
+    expect(desc.textContent).not.toContain("line2");
+  });
+
+  it("does not show mini output preview when status is wait", () => {
+    const calls = [makeCall({ toolCallId: "c1", streamingOutput: undefined })];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    const desc = screen.getByTestId("step-description-c1");
+    expect(desc.textContent).not.toContain("components.toolSteps.viewFullOutput");
+  });
+
+  it("shows 'Details' button per step", () => {
+    const calls = [makeCall({ toolCallId: "c1" }), makeCall({ toolCallId: "c2" })];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    expect(screen.getByTestId("tool-step-details-c1")).toBeDefined();
+    expect(screen.getByTestId("tool-step-details-c2")).toBeDefined();
+  });
+
+  it("clicking 'Details' opens the drawer with correct tabs", () => {
+    const calls = [makeCall({ toolCallId: "c1", toolName: "bash", parameters: { command: "ls" } })];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    expect(screen.queryByTestId("drawer")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("tool-step-details-c1"));
+
+    expect(screen.getByTestId("drawer").getAttribute("data-open")).toBe("true");
+    expect(screen.getByTestId("tab-preview")).toBeDefined();
+    expect(screen.getByTestId("tab-parameters")).toBeDefined();
+    expect(screen.getByTestId("tab-result")).toBeDefined();
+  });
+
+  it("shows tool name in step title", () => {
+    const calls = [makeCall({ toolCallId: "c1", toolName: "file_read" })];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    const title = screen.getByTestId("step-title-c1");
+    expect(title.textContent).toContain("file_read");
+  });
+
+  it("renders MCP tag when tool is an MCP alias", () => {
+    const calls = [makeCall({ toolCallId: "c1", toolName: "mcp__server1__tool_a" })];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    const title = screen.getByTestId("step-title-c1");
+    expect(title.textContent).toContain("MCP");
+    expect(title.textContent).toContain("tool_a");
+  });
+
+  it("renders header with title and count", () => {
+    const calls = [makeCall({ toolCallId: "c1" }), makeCall({ toolCallId: "c2" })];
+    render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+    const header = screen.getByTestId("tool-steps-header");
+    expect(header.textContent).toContain("components.toolSteps.title");
+    expect(header.textContent).toContain("0/2");
+  });
+
+  it("renders header with elapsed time when metadata provided", () => {
+    const calls = [makeCall({ toolCallId: "c1" })];
+    render(
+      <ToolStepsCard
+        toolCalls={calls}
+        metadata={{ elapsed_ms: 1500, is_mutating: false }}
+        defaultExpanded={true}
+      />,
+    );
+
+    const header = screen.getByTestId("tool-steps-header");
+    expect(header.textContent).toContain("1.5s");
+  });
+
+  // ── New `tools` prop (ToolSessionItem[]) ──────────────────────────
+
+  describe("tools prop", () => {
+    it("maps step status to 'finish' when result exists and no error", () => {
+      const tools = [makeToolSessionItem({ toolCallId: "c1", hasResult: true, isError: false })];
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      const step = screen.getByTestId("step-c1");
+      expect(step.getAttribute("data-status")).toBe("finish");
+    });
+
+    it("maps step status to 'error' when result has isError=true", () => {
+      const tools = [makeToolSessionItem({ toolCallId: "c1", hasResult: true, isError: true })];
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      const step = screen.getByTestId("step-c1");
+      expect(step.getAttribute("data-status")).toBe("error");
+    });
+
+    it("maps step status to 'wait' when no result and no streamingOutput", () => {
+      const tools = [
+        makeToolSessionItem({ toolCallId: "c1", hasResult: false, streamingOutput: undefined }),
+      ];
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      const step = screen.getByTestId("step-c1");
+      expect(step.getAttribute("data-status")).toBe("wait");
+    });
+
+    it("maps step status to 'process' when no result but has streamingOutput", () => {
+      const tools = [
+        makeToolSessionItem({ toolCallId: "c1", hasResult: false, streamingOutput: "running..." }),
+      ];
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      const step = screen.getByTestId("step-c1");
+      expect(step.getAttribute("data-status")).toBe("process");
+    });
+
+    it("prefers Jotai live output over persisted fallback for active tools", () => {
+      const tools = [
+        makeToolSessionItem({
+          toolCallId: "c1",
+          hasResult: false,
+          streamingOutput: "persisted fallback",
+        }),
+      ];
+      setLiveToolState("session-1", "c1", {
+        output: "lineA\nlineB\nlineC\nlineD",
+        status: "running",
+        updatedAt: Date.now(),
+      });
+
+      render(<ToolStepsCard sessionId="session-1" tools={tools} defaultExpanded={true} />);
+
+      const step = screen.getByTestId("step-c1");
+      const desc = screen.getByTestId("step-description-c1");
+      expect(step.getAttribute("data-status")).toBe("process");
+      expect(desc.textContent).toContain("lineB");
+      expect(desc.textContent).toContain("lineC");
+      expect(desc.textContent).toContain("lineD");
+      expect(desc.textContent).not.toContain("persisted fallback");
+    });
+
+    it("renders correct number of steps from tools array", () => {
+      const tools = [
+        makeToolSessionItem({ toolCallId: "c1" }),
+        makeToolSessionItem({ toolCallId: "c2" }),
+        makeToolSessionItem({ toolCallId: "c3" }),
+      ];
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      const steps = screen.getByTestId("steps");
+      const stepEls = steps.querySelectorAll(':scope > [data-testid^="step-"]');
+      expect(stepEls).toHaveLength(3);
+    });
+
+    it("passes result to drawer so Result tab is populated", () => {
+      const tools = [
+        makeToolSessionItem({
+          toolCallId: "c1",
+          hasResult: true,
+          isError: false,
+          resultContent: "operation completed",
+        }),
+      ];
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      // Click Details to open the drawer
+      fireEvent.click(screen.getByTestId("tool-step-details-c1"));
+
+      // The Result tab content should contain the actual result text
+      const resultTab = screen.getByTestId("tab-content-result");
+      expect(resultTab.textContent).toContain("operation completed");
+    });
+
+    it("renders inline file change summary for file-changing tool results", () => {
+      const payload = JSON.stringify({
+        operation: "Edit",
+        file_path: "/tmp/demo.ts",
+        diff: {
+          unified:
+            "--- a/demo.ts\n+++ b/demo.ts\n@@ -1,1 +1,1 @@\n-console.log('a')\n+console.log('b')",
+          added_lines: 1,
+          removed_lines: 1,
+        },
+      });
+
+      const tools = [
+        makeToolSessionItem({
+          toolCallId: "c1",
+          toolName: "edit",
+          hasResult: true,
+          isError: false,
+          resultContent: payload,
+        }),
+      ];
+
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      expect(screen.getByTestId("tool-step-file-change-c1").textContent).toContain(
+        "Edit(/tmp/demo.ts)",
+      );
+      expect(screen.getByTestId("file-change-viewer").getAttribute("data-default-view-mode")).toBe(
+        "unified",
+      );
+      expect(screen.getByTestId("file-change-viewer").getAttribute("data-max-height")).toBe("1760");
+      expect(
+        screen.getByTestId("file-change-viewer").getAttribute("data-unified-lines-override"),
+      ).toContain('"kind":"gap"');
+      expect(
+        screen.getByTestId("file-change-viewer").getAttribute("data-unified-lines-override"),
+      ).toContain('"kind":"modified_add"');
+      expect(screen.getByText("components.toolSteps.viewFullDiff")).toBeDefined();
+    });
+
+    it("opens file change detail drawer on diff tab by default", () => {
+      const payload = JSON.stringify({
+        operation: "Edit",
+        file_path: "/tmp/demo.ts",
+        diff: {
+          unified:
+            "--- a/demo.ts\n+++ b/demo.ts\n@@ -1,1 +1,1 @@\n-console.log('a')\n+console.log('b')",
+          added_lines: 1,
+          removed_lines: 1,
+        },
+      });
+
+      const tools = [
+        makeToolSessionItem({
+          toolCallId: "c1",
+          toolName: "edit",
+          hasResult: true,
+          isError: false,
+          resultContent: payload,
+        }),
+      ];
+
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      fireEvent.click(screen.getByTestId("tool-step-details-c1"));
+
+      expect(screen.getByTestId("tabs").getAttribute("data-default-active-key")).toBe("diff");
+      expect(screen.getByTestId("tab-diff")).toBeDefined();
+    });
+  });
+
+  // ── background/async shell ─────────────────────────────────────────
+
+  describe("background bash", () => {
+    const BACKGROUND_RESULT = JSON.stringify({
+      bash_id: "bg-1",
+      command: "npm run build",
+      status: "running",
+    });
+
+    beforeEach(() => {
+      clearBackgroundBashState("bg-1");
+    });
+
+    it("keeps a running spinner (not the green finish) while the shell runs in background", () => {
+      const tools = [
+        makeToolSessionItem({
+          toolCallId: "c1",
+          hasResult: true,
+          isError: false,
+          resultContent: BACKGROUND_RESULT,
+        }),
+      ];
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      // Result is present, but the background shell has NOT completed → process.
+      expect(screen.getByTestId("step-c1").getAttribute("data-status")).toBe("process");
+      expect(screen.getByTestId("step-subtitle-c1").textContent).toContain(
+        "components.toolSteps.runningInBackground",
+      );
+    });
+
+    it("flips to a completed badge when the bash_completed event reconciles", () => {
+      const tools = [
+        makeToolSessionItem({
+          toolCallId: "c1",
+          hasResult: true,
+          isError: false,
+          resultContent: BACKGROUND_RESULT,
+        }),
+      ];
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      act(() => {
+        setBashCompleted("bg-1", "completed", 0);
+      });
+
+      expect(screen.getByTestId("step-c1").getAttribute("data-status")).toBe("finish");
+      expect(screen.getByTestId("step-subtitle-c1").textContent).toContain(
+        "components.toolSteps.backgroundCompleted",
+      );
+    });
+
+    it("flips to an error status for a nonzero exit", () => {
+      const tools = [
+        makeToolSessionItem({
+          toolCallId: "c1",
+          hasResult: true,
+          isError: false,
+          resultContent: BACKGROUND_RESULT,
+        }),
+      ];
+      render(<ToolStepsCard tools={tools} defaultExpanded={true} />);
+
+      act(() => {
+        setBashCompleted("bg-1", "error", 1);
+      });
+
+      expect(screen.getByTestId("step-c1").getAttribute("data-status")).toBe("error");
+      expect(screen.getByTestId("step-subtitle-c1").textContent).toContain(
+        "components.toolSteps.backgroundFailed",
+      );
+    });
+  });
+
+  // ── hideHeader ────────────────────────────────────────────────────
+
+  describe("hideHeader", () => {
+    it("hides mini header when hideHeader=true", () => {
+      const calls = [makeCall({ toolCallId: "c1" })];
+      render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} hideHeader={true} />);
+
+      expect(screen.queryByTestId("tool-steps-header")).toBeNull();
+    });
+
+    it("shows mini header when hideHeader=false (default)", () => {
+      const calls = [makeCall({ toolCallId: "c1" })];
+      render(<ToolStepsCard toolCalls={calls} defaultExpanded={true} />);
+
+      expect(screen.getByTestId("tool-steps-header")).toBeDefined();
+    });
+
+    it("renders steps body immediately when hideHeader=true regardless of expanded state", () => {
+      const calls = [makeCall({ toolCallId: "c1" })];
+      // Even with defaultExpanded=false, steps should render because hideHeader=true
+      render(<ToolStepsCard toolCalls={calls} defaultExpanded={false} hideHeader={true} />);
+
+      expect(screen.getByTestId("steps")).toBeDefined();
+    });
+  });
+
+  // ── Header keyboard accessibility (issue #58) ─────────────────────
+
+  describe("header keyboard accessibility", () => {
+    it("exposes the header as a focusable button with aria-expanded", () => {
+      const calls = [makeCall({ toolCallId: "c1" })];
+      render(<ToolStepsCard toolCalls={calls} defaultExpanded={false} />);
+
+      const header = screen.getByTestId("tool-steps-header");
+      expect(header.getAttribute("role")).toBe("button");
+      expect(header.getAttribute("tabindex")).toBe("0");
+      expect(header.getAttribute("aria-expanded")).toBe("false");
+    });
+
+    it("expands on Enter and collapses on Space", () => {
+      const calls = [makeCall({ toolCallId: "c1" })];
+      render(<ToolStepsCard toolCalls={calls} defaultExpanded={false} />);
+
+      const header = screen.getByTestId("tool-steps-header");
+      expect(screen.queryByTestId("steps")).toBeNull();
+
+      fireEvent.keyDown(header, { key: "Enter" });
+      expect(screen.getByTestId("steps")).toBeDefined();
+      expect(header.getAttribute("aria-expanded")).toBe("true");
+
+      fireEvent.keyDown(header, { key: " " });
+      expect(screen.queryByTestId("steps")).toBeNull();
+      expect(header.getAttribute("aria-expanded")).toBe("false");
+    });
+
+    it("ignores unrelated keys", () => {
+      const calls = [makeCall({ toolCallId: "c1" })];
+      render(<ToolStepsCard toolCalls={calls} defaultExpanded={false} />);
+
+      const header = screen.getByTestId("tool-steps-header");
+      fireEvent.keyDown(header, { key: "a" });
+      fireEvent.keyDown(header, { key: "Escape" });
+      expect(screen.queryByTestId("steps")).toBeNull();
+    });
+  });
+});

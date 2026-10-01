@@ -1,0 +1,1574 @@
+import { StateCreator } from "zustand";
+import { ChatItem, Message } from "@shared/types/chat";
+import {
+  AgentClient,
+  isSessionCreateRecoveryError,
+  type CreateSessionResponse,
+  type SessionSummary,
+} from "@services/chat/AgentService";
+import { ApiError } from "@services/api";
+import type { AppState } from "../";
+import { useProviderStore } from "./providerSlice";
+import { applyExecutionEvent } from "./executionStateSlice";
+import { applyReplayableSessionEventToList, isSessionMetadataEvent } from "./sessionMetadataSlice";
+import i18n from "@shared/i18n";
+import { debugLog } from "@shared/utils/debugFlags";
+import { resolveProviderDefaultReasoningEffort } from "@shared/utils/reasoningEffort";
+import {
+  DEFAULT_BASE_SYSTEM_PROMPT,
+  mapHistoryMessagesToUi,
+  mapActiveWorkflowReceipt,
+  sessionSummaryToChatItem,
+} from "./chatSessionSlice/messageMapping";
+import {
+  REFRESH_CHATS_THROTTLE_MS,
+  clearRefreshChatsThrottleWindow,
+  consumeTrailingRefreshCallbacks,
+  executeForcedRefreshChats,
+  executeRefreshChats,
+  protectSessionFromStaleLists,
+  refreshChatsState,
+  settleTrailingRefreshCallbacks,
+} from "./chatSessionSlice/refreshChats";
+import { ChatSessionCreateRecoveryError } from "./chatSessionSlice/sessionCreateRecovery";
+import {
+  acquireInitialSessionCreateOperation,
+  clearInitialSessionCreateOperation,
+  getInitialSessionCreateOperation,
+} from "./chatSessionSlice/initialSessionCreateOperation";
+import { useSessionReadStateStore } from "@shared/store/sessionReadStateStore";
+
+// Re-export public types + the test-only history mapper so existing import
+// paths (`@shared/store/appStore/slices/chatSessionSlice`) keep resolving.
+export type {
+  ChatSlice,
+  DeleteMessageResult,
+  DeleteMessageFailureReason,
+} from "./chatSessionSlice/types";
+export { mapHistoryMessagesToUi } from "./chatSessionSlice/messageMapping";
+export {
+  ChatSessionCreateRecoveryError,
+  isChatSessionCreateRecoveryError,
+} from "./chatSessionSlice/sessionCreateRecovery";
+
+import type { ChatSlice } from "./chatSessionSlice/types";
+
+const agentClient = AgentClient.getInstance();
+
+// Multi-device reconcile debounce: coalesce a burst of account-feed events for
+// the open session (e.g. a turn driven on another device emits several change
+// events) into a single history+pending reload.
+const reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
+// A clear/truncate is stronger than every ordinary event in the same debounce
+// burst. Keep that requirement sticky even if a later event replaces the
+// timer and therefore its diagnostic `reason`.
+const reconcileReplaceSessions = new Set<string>();
+const RECONCILE_DEBOUNCE_MS = 300;
+
+// In-flight backend PATCH tracking per session (#163): the first dispatch
+// captures a baseline (the pre-optimistic chat record); a failure while a
+// NEWER patch is still in flight does NOT roll back (the newer write owns
+// the outcome), while the LAST failed write restores the baseline — so a
+// retry-then-fail sequence can never leave an unconfirmed optimistic value
+// "locked in" (it would otherwise beat the authoritative server value via
+// preferLocalSessionFields).
+const patchInFlight = new Map<string, { count: number; baseline: ChatItem | null }>();
+const sessionDetailGeneration = new Map<string, number>();
+const sessionDetailInFlight = new Map<string, Promise<boolean>>();
+
+const normalizedProjectId = (projectId: string | null | undefined): string | null =>
+  projectId?.trim() || null;
+
+const normalizedWorkspacePath = (workspacePath: string | null | undefined): string | null =>
+  workspacePath?.trim() || null;
+
+export const createChatSlice: StateCreator<AppState, [], [], ChatSlice> = (set, get) => ({
+  chats: [],
+  currentSessionId: null,
+  latestActiveSessionId: null,
+
+  addChat: async (chatData) => {
+    const title = (chatData.title || i18n.t("chat.sidebar.newSession")).trim();
+    const basePrompt = chatData.config?.baseSystemPrompt?.trim() || "";
+    const activeModel = useProviderStore.getState().getActiveModel()?.trim();
+    const model = chatData.config?.model?.trim() || activeModel || undefined;
+
+    // Resolve model_ref when feature flag is ON
+    // Always use provider defaults for new sessions, not the global selectedModelRef.
+    // selectedModelRef is session-scoped user selection and should not leak into new sessions.
+    let modelRef: { provider: string; model: string } | undefined;
+    let providerValue: string | undefined;
+    if (useProviderStore.getState().isProviderModelRefEnabled()) {
+      // Prefer caller-provided model_ref (e.g. from EmptyTaskLauncher with explicit config)
+      const callerModelRef = chatData.config?.model_ref;
+      if (callerModelRef?.provider?.trim() && callerModelRef?.model?.trim()) {
+        modelRef = callerModelRef;
+        providerValue = callerModelRef.provider;
+      } else {
+        // Fall back to provider defaults (settings default model)
+        const defaultChat = useProviderStore.getState().providerConfig.defaults?.chat;
+        if (defaultChat?.provider?.trim() && defaultChat?.model?.trim()) {
+          modelRef = defaultChat;
+          providerValue = defaultChat.provider;
+        } else {
+          const m = useProviderStore.getState().getActiveModel();
+          if (m) {
+            modelRef = { provider: useProviderStore.getState().currentProvider, model: m };
+            providerValue = useProviderStore.getState().currentProvider;
+          }
+        }
+      }
+    }
+
+    // Resolve the reasoning effort for the new session. An explicit value from
+    // the caller wins; otherwise inherit the provider's configured default
+    // (e.g. "Max") so a new session matches what the input box shows, instead
+    // of letting the backend silently fall back to its own default ("medium").
+    const reasoningEffort =
+      chatData.config?.reasoningEffort ??
+      resolveProviderDefaultReasoningEffort(
+        useProviderStore.getState().providerConfig,
+        modelRef ?? null,
+        providerValue ?? null,
+        useProviderStore.getState().providerInstances,
+      );
+
+    // Resolve the Project identity once so the create request carries it
+    // (#134/#198): an explicit caller value wins, including an explicit null
+    // for "Unassigned". Explicit and fallback ids are both accepted only
+    // when their locally-known Project is active. A dangling/archived id must
+    // not be sent: the backend would reject creation with
+    // 409 `project_archived`, and falling back to another active Project
+    // would silently create the session under the wrong owner.
+    // The local chat config trusts ONLY the backend-assigned value — if an
+    // older backend ignores the field, the session lands in Unassigned
+    // instead of the client fabricating a membership the backend never
+    // persisted.
+    const projects = get().projects;
+    const hasExplicitProjectId =
+      !!chatData.config && Object.prototype.hasOwnProperty.call(chatData.config, "projectId");
+    const explicitProjectId = normalizedProjectId(chatData.config?.projectId);
+    const activeProjectId = normalizedProjectId(get().activeProjectId);
+    const candidateProjectId = hasExplicitProjectId ? explicitProjectId : activeProjectId;
+    const candidateProject = candidateProjectId ? projects[candidateProjectId] : undefined;
+    const requestedProjectId =
+      candidateProjectId && candidateProject?.status === "active" ? candidateProjectId : null;
+
+    const createRequest = {
+      title,
+      // Titles supplied while creating a blank chat are UI labels, not manual
+      // renames. Keep the lifecycle pending without inspecting localized text.
+      title_generated: chatData.titleGenerated ?? false,
+      system_prompt: basePrompt || undefined,
+      model,
+      model_ref: modelRef,
+      provider: providerValue,
+      reasoning_effort: reasoningEffort || undefined,
+      gold_config: chatData.config?.goldConfig ?? undefined,
+      project_id: requestedProjectId,
+      workspace_path: chatData.config?.workspacePath?.trim() || null,
+    };
+
+    const createAndInsert = async (
+      idempotencyKey?: string,
+      operationCreatedAtMs?: number,
+    ): Promise<string> => {
+      let created: CreateSessionResponse;
+      try {
+        created = idempotencyKey
+          ? await agentClient.createSession(createRequest, {
+              idempotencyKey,
+              operationCreatedAtMs,
+            })
+          : await agentClient.createSession(createRequest);
+      } catch (error) {
+        if (isSessionCreateRecoveryError(error)) {
+          throw new ChatSessionCreateRecoveryError(
+            error.idempotencyKey,
+            error.operationStatus,
+            () => createAndInsert(error.idempotencyKey, error.operationCreatedAtMs),
+            error.message,
+          );
+        }
+        throw error;
+      }
+
+      const mappedSession = sessionSummaryToChatItem(created.session);
+      const newChat: ChatItem = {
+        ...mappedSession,
+        title,
+        config: {
+          ...chatData.config,
+          projectId: created.session.project_id ?? undefined,
+          model: created.session.model,
+          model_ref: created.session.model_ref ?? null,
+          reasoningEffort: created.session.reasoning_effort ?? null,
+          goldConfig: created.session.gold_config ?? chatData.config?.goldConfig ?? null,
+          // The create response is authoritative for both the exact mode and
+          // typed-mode capability. Do not let the caller's pre-create config
+          // make a current Bamboo backend look legacy until the next refresh.
+          bypassPermissions: mappedSession.config.bypassPermissions,
+          permissionMode: mappedSession.config.permissionMode,
+          permissionModeSupported: mappedSession.config.permissionModeSupported,
+          // If the caller provided a base prompt, keep it; otherwise fall back.
+          baseSystemPrompt: basePrompt || DEFAULT_BASE_SYSTEM_PROMPT,
+        },
+        messages: [],
+      };
+
+      set((state) => {
+        const chats = [newChat, ...state.chats.filter((c) => c.id !== newChat.id)];
+        return {
+          ...state,
+          chats,
+          currentSessionId: newChat.id,
+          latestActiveSessionId: newChat.id,
+        };
+      });
+
+      // A session created by this user is already being opened. Baseline it
+      // synchronously so a persisted multi-pane layout cannot briefly make
+      // the new row appear unread before its pane mapping is updated.
+      useSessionReadStateStore.getState().markRead([newChat]);
+
+      return newChat.id;
+    };
+
+    return createAndInsert();
+  },
+
+  copySession: async (sourceSessionId) => {
+    // Backend first: never create an optimistic placeholder for a copy. The
+    // copy endpoint is transactional, and only its committed SessionSummary
+    // may enter local state.
+    const copied = await agentClient.copySession(sourceSessionId);
+    const summary = copied.session;
+    if (!summary?.id || summary.id === sourceSessionId) {
+      throw new Error("Bamboo returned an invalid copied session identity");
+    }
+
+    const copiedChat = sessionSummaryToChatItem(summary);
+    const releaseListProtection = protectSessionFromStaleLists(summary.id);
+    set((state) => ({
+      ...state,
+      // The account feed can race the POST response and hydrate this session
+      // first. Preserve any already-loaded messages while replacing all
+      // summary-backed fields with the authoritative copy response.
+      chats: [
+        {
+          ...copiedChat,
+          messages:
+            state.chats.find((chat) => chat.id === copiedChat.id)?.messages ?? copiedChat.messages,
+        },
+        ...state.chats.filter((chat) => chat.id !== copiedChat.id),
+      ],
+      executionBySession: applyExecutionEvent(state.executionBySession, {
+        type: "applySessionSummary",
+        sessionId: summary.id,
+        summary,
+      }),
+    }));
+    // The copy was initiated by this user and its caller will open it as soon
+    // as this Promise resolves. Baseline it before resolving so the Zustand
+    // publication above cannot render a transient unread row while
+    // `openSession` is still waiting for this action to return.
+    useSessionReadStateStore.getState().markRead([copiedChat]);
+    // Reconcile in the background: the caller must be able to assign the
+    // active pane and global selection together as soon as the transactional
+    // POST commits. Waiting here would leave the sidebar selection ahead of
+    // the pane mapping for the duration of a slow/retrying list request.
+    // Protection stays active until the forced read has followed any older
+    // in-flight snapshot, and a failed read never rolls back the committed
+    // copy.
+    void get()
+      .refreshChatsNow()
+      .catch((error) => {
+        console.warn("[ChatSlice] Failed to confirm copied session in session index:", error);
+      })
+      .finally(releaseListProtection);
+    return summary;
+  },
+
+  selectSession: (sessionId) => {
+    const prev = get();
+    if (prev.currentSessionId === sessionId && prev.latestActiveSessionId === sessionId) {
+      return;
+    }
+    set({ currentSessionId: sessionId, latestActiveSessionId: sessionId });
+    if (sessionId) {
+      void get().refreshSessionDetail(sessionId);
+    }
+  },
+
+  refreshSessionDetail: async (sessionId, options) => {
+    const normalizedSessionId = sessionId.trim();
+    if (!normalizedSessionId || !get().chats.some((chat) => chat.id === normalizedSessionId)) {
+      return false;
+    }
+    const existing = sessionDetailInFlight.get(normalizedSessionId);
+    if (existing && !options?.force) return existing;
+
+    const generation = (sessionDetailGeneration.get(normalizedSessionId) ?? 0) + 1;
+    sessionDetailGeneration.set(normalizedSessionId, generation);
+    const request = (async () => {
+      try {
+        const detail = await agentClient.getSession(normalizedSessionId);
+        if (sessionDetailGeneration.get(normalizedSessionId) !== generation) return false;
+        // This call is always the authoritative detail endpoint. Bamboo omits
+        // an empty Option, so a missing field means "no active Workflow" here
+        // (unlike a lightweight list row, which never reaches this path).
+        const wireReceipt = Object.prototype.hasOwnProperty.call(detail, "active_workflow")
+          ? detail.active_workflow
+          : null;
+        const activeWorkflow = wireReceipt === null ? null : mapActiveWorkflowReceipt(wireReceipt);
+        // A malformed non-null receipt is not an authoritative deactivation.
+        if (wireReceipt !== null && !activeWorkflow) return false;
+        set((state) => ({
+          ...state,
+          chats: state.chats.map((chat) =>
+            chat.id === normalizedSessionId ? { ...chat, activeWorkflow } : chat,
+          ),
+        }));
+        return true;
+      } catch (error) {
+        debugLog("[ChatSlice]", "refreshSessionDetail.error", {
+          sessionId: normalizedSessionId,
+          error,
+        });
+        return false;
+      }
+    })();
+    sessionDetailInFlight.set(normalizedSessionId, request);
+    try {
+      return await request;
+    } finally {
+      if (sessionDetailInFlight.get(normalizedSessionId) === request) {
+        sessionDetailInFlight.delete(normalizedSessionId);
+      }
+    }
+  },
+
+  deleteSession: async (sessionId) => {
+    // Backend first (#163): only remove locally once the delete is
+    // confirmed. A failed delete leaves the local state untouched instead
+    // of silently diverging (the session would "come back" on the next
+    // refresh anyway, after the user was told it was gone).
+    await agentClient.deleteSession(sessionId);
+
+    set((state) => {
+      const toDelete = new Set<string>();
+      for (const chat of state.chats) {
+        if (chat.id === sessionId) toDelete.add(chat.id);
+        if (chat.rootSessionId === sessionId) toDelete.add(chat.id);
+      }
+
+      const newChats = state.chats.filter((c) => !toDelete.has(c.id));
+      const nextCurrent =
+        state.currentSessionId && toDelete.has(state.currentSessionId)
+          ? null
+          : state.currentSessionId;
+      const nextLatest =
+        state.latestActiveSessionId && toDelete.has(state.latestActiveSessionId)
+          ? (newChats[0]?.id ?? null)
+          : state.latestActiveSessionId;
+
+      return {
+        ...state,
+        chats: newChats,
+        currentSessionId: nextCurrent,
+        latestActiveSessionId: nextLatest,
+      };
+    });
+  },
+
+  deleteSessions: async (sessionIds) => {
+    // All-settled so one failure does not abort the rest (#163); the
+    // caller surfaces the failures.
+    const results = await Promise.allSettled(sessionIds.map((id) => get().deleteSession(id)));
+    const failedIds = sessionIds.filter((_, index) => results[index].status === "rejected");
+    return { failedIds };
+  },
+
+  updateSession: (sessionId, updates, options) => {
+    const hasSessionLevelConfigUpdate =
+      !!updates.config &&
+      (Object.prototype.hasOwnProperty.call(updates.config, "model") ||
+        Object.prototype.hasOwnProperty.call(updates.config, "reasoningEffort") ||
+        Object.prototype.hasOwnProperty.call(updates.config, "goldConfig"));
+    const hasSessionLevelTopLevelUpdate =
+      typeof updates.title === "string" || typeof updates.pinned === "boolean";
+    const shouldBumpUpdatedAt = hasSessionLevelConfigUpdate || hasSessionLevelTopLevelUpdate;
+    const localUpdatedAt = shouldBumpUpdatedAt ? new Date().toISOString() : undefined;
+
+    // Captured BEFORE the optimistic write so a failed backend patch can
+    // roll the patched fields back (#163).
+    const previousChat = get().chats.find((c) => c.id === sessionId);
+
+    set((state) => {
+      const chats = state.chats.map((chat) =>
+        chat.id === sessionId
+          ? {
+              ...chat,
+              ...updates,
+              ...(localUpdatedAt ? { updatedAt: localUpdatedAt } : {}),
+            }
+          : chat,
+      );
+      return { ...state, chats };
+    });
+
+    // Best-effort backend patch for session-level metadata updates.
+    const patch: Record<string, unknown> = {};
+    if (typeof updates.title === "string") {
+      patch.title = updates.title;
+    }
+    if (typeof updates.pinned === "boolean") {
+      patch.pinned = updates.pinned;
+    }
+    if (updates.config && Object.prototype.hasOwnProperty.call(updates.config, "model")) {
+      patch.model = updates.config.model ?? null;
+    }
+    if (updates.config && Object.prototype.hasOwnProperty.call(updates.config, "model_ref")) {
+      if (useProviderStore.getState().isProviderModelRefEnabled()) {
+        patch.model_ref = updates.config.model_ref ?? null;
+        if (updates.config.model_ref) {
+          patch.provider = updates.config.model_ref.provider;
+        }
+      }
+    }
+    if (updates.config && Object.prototype.hasOwnProperty.call(updates.config, "reasoningEffort")) {
+      const reasoningEffort = updates.config.reasoningEffort;
+      if (reasoningEffort) {
+        patch.reasoning_effort = reasoningEffort;
+      } else {
+        patch.clear_reasoning_effort = true;
+      }
+    }
+    if (updates.config && Object.prototype.hasOwnProperty.call(updates.config, "goldConfig")) {
+      patch.gold_config = updates.config.goldConfig ?? {
+        enabled: false,
+        auto_answer_enabled: false,
+        auto_continue_enabled: false,
+      };
+    }
+    // Callers that already persisted these fields via an awaited direct
+    // `patchSession` (e.g. the model / reasoning-effort handlers) pass
+    // `skipBackendPatch` so we update local state only — otherwise this would
+    // fire a redundant second PATCH for the same change.
+    if (!options?.skipBackendPatch && Object.keys(patch).length > 0) {
+      // The first in-flight dispatch captures the baseline (the chat record
+      // before ANY optimistic write in this burst). See patchInFlight above.
+      const tracker = patchInFlight.get(sessionId) ?? { count: 0, baseline: null };
+      if (tracker.count === 0) {
+        tracker.baseline = previousChat ?? null;
+      }
+      tracker.count += 1;
+      patchInFlight.set(sessionId, tracker);
+
+      const rollbackFromBaseline = () => {
+        const current = patchInFlight.get(sessionId);
+        // A newer patch is still in flight — it owns the outcome; rolling
+        // back now could clobber its (possibly confirmed) values.
+        if (!current || current.count > 1) return;
+        const baseline = current.baseline;
+        if (!baseline) return;
+
+        const rollbackConfig: Partial<ChatItem["config"]> = {};
+        if (Object.prototype.hasOwnProperty.call(patch, "model")) {
+          rollbackConfig.model = baseline.config.model;
+        }
+        if (Object.prototype.hasOwnProperty.call(patch, "model_ref")) {
+          rollbackConfig.model_ref = baseline.config.model_ref;
+        }
+        if (
+          Object.prototype.hasOwnProperty.call(patch, "reasoning_effort") ||
+          Object.prototype.hasOwnProperty.call(patch, "clear_reasoning_effort")
+        ) {
+          rollbackConfig.reasoningEffort = baseline.config.reasoningEffort;
+        }
+        if (Object.prototype.hasOwnProperty.call(patch, "gold_config")) {
+          rollbackConfig.goldConfig = baseline.config.goldConfig;
+        }
+
+        set((state) => ({
+          ...state,
+          chats: state.chats.map((chat) =>
+            chat.id === sessionId
+              ? {
+                  ...chat,
+                  ...(typeof updates.title === "string" ? { title: baseline.title } : {}),
+                  ...(typeof updates.pinned === "boolean" ? { pinned: baseline.pinned } : {}),
+                  ...(localUpdatedAt ? { updatedAt: baseline.updatedAt } : {}),
+                  ...(Object.keys(rollbackConfig).length > 0
+                    ? { config: { ...chat.config, ...rollbackConfig } }
+                    : {}),
+                }
+              : chat,
+          ),
+        }));
+      };
+
+      // NOTE: `patchSession` returns void, so the backend's bumped
+      // `title_version` (and any other authoritative server fields) is not
+      // available here. The backend emits SSE events (e.g. `session_title_updated`)
+      // that `applyServerTitle` reconciles into local state.
+      agentClient
+        .patchSession(sessionId, patch)
+        .catch((e) => {
+          console.warn(`[ChatSlice] Failed to patch session ${sessionId}:`, e);
+          rollbackFromBaseline();
+        })
+        .finally(() => {
+          const current = patchInFlight.get(sessionId);
+          if (!current) return;
+          current.count -= 1;
+          if (current.count <= 0) {
+            patchInFlight.delete(sessionId);
+          }
+        });
+    }
+  },
+
+  switchSessionWorkspace: async (sessionId, requestedWorkspacePath) => {
+    const workspacePath = requestedWorkspacePath.trim();
+    if (!workspacePath) {
+      throw new Error("Workspace path cannot be empty");
+    }
+
+    const startingChat = get().chats.find((chat) => chat.id === sessionId);
+    if (!startingChat) {
+      throw new Error("Session not found");
+    }
+    const startingProjectId = normalizedProjectId(startingChat.config.projectId);
+    const startingWorkspacePath = normalizedWorkspacePath(startingChat.config.workspacePath);
+
+    // Read the durable baseline and CAS token before the optimistic write. This
+    // baseline is also the rollback target for ordinary 4xx/5xx failures.
+    const before = await agentClient.getSessionWithVersion(sessionId);
+    if (before.metadataVersion === null) {
+      throw new Error("Session metadata version is unavailable; reopen the picker and try again");
+    }
+    const serverProjectId = normalizedProjectId(before.session.project_id);
+    if (serverProjectId !== startingProjectId) {
+      throw new Error(
+        "Session Project changed while the workspace picker was open; reopen it and try again",
+      );
+    }
+
+    // A newer local/session-list update completed while the GET was in flight.
+    // Do not let this stale completion overwrite it.
+    const liveBeforeOptimistic = get().chats.find((chat) => chat.id === sessionId);
+    if (
+      !liveBeforeOptimistic ||
+      normalizedProjectId(liveBeforeOptimistic.config.projectId) !== startingProjectId ||
+      normalizedWorkspacePath(liveBeforeOptimistic.config.workspacePath) !== startingWorkspacePath
+    ) {
+      throw new Error(
+        "Session workspace changed while the picker was loading; review the latest value and retry",
+      );
+    }
+
+    const applyWorkspaceIfCurrent = (
+      expectedCurrentPath: string | null,
+      nextPath: string | null,
+    ): void => {
+      set((state) => {
+        let changed = false;
+        const chats = state.chats.map((chat) => {
+          if (
+            chat.id !== sessionId ||
+            normalizedProjectId(chat.config.projectId) !== startingProjectId ||
+            normalizedWorkspacePath(chat.config.workspacePath) !== expectedCurrentPath
+          ) {
+            return chat;
+          }
+          changed = true;
+          return {
+            ...chat,
+            config: {
+              ...chat.config,
+              workspacePath: nextPath ?? undefined,
+            },
+          };
+        });
+        return changed ? { ...state, chats } : state;
+      });
+    };
+
+    const serverWorkspacePath = normalizedWorkspacePath(before.session.workspace_path);
+    applyWorkspaceIfCurrent(startingWorkspacePath, workspacePath);
+
+    let confirmed: SessionSummary;
+    try {
+      confirmed = await agentClient.switchSessionWorkspace(
+        sessionId,
+        workspacePath,
+        before.metadataVersion,
+      );
+    } catch (error) {
+      let rollbackWorkspacePath = serverWorkspacePath;
+      let shouldRollbackWorkspace = true;
+
+      // A 412 proves the pre-PATCH snapshot is stale. Refetch before rollback
+      // so the UI reconciles to current server truth while retaining the
+      // user's attempted input in the modal.
+      if (error instanceof ApiError && error.status === 412) {
+        try {
+          const fresh = await agentClient.getSessionWithVersion(sessionId);
+          if (normalizedProjectId(fresh.session.project_id) === startingProjectId) {
+            rollbackWorkspacePath = normalizedWorkspacePath(fresh.session.workspace_path);
+          } else {
+            // Project membership changed independently. The account/session
+            // refresh owns that reconciliation; never rewrite it here.
+            shouldRollbackWorkspace = false;
+            void get()
+              .refreshChatsNow()
+              .catch(() => {});
+          }
+        } catch (refreshError) {
+          console.warn(
+            `[ChatSlice] Failed to refresh session ${sessionId} after workspace CAS conflict:`,
+            refreshError,
+          );
+        }
+      }
+
+      if (shouldRollbackWorkspace) {
+        applyWorkspaceIfCurrent(workspacePath, rollbackWorkspacePath);
+      }
+      throw error;
+    }
+
+    const confirmedWorkspacePath = normalizedWorkspacePath(confirmed.workspace_path);
+    const confirmedProjectId = normalizedProjectId(confirmed.project_id);
+    if (confirmedProjectId !== startingProjectId) {
+      // The PATCH already committed, so this is a response-contract violation,
+      // not a mutation failure. Keep Bamboo's confirmed canonical path when it
+      // supplied one (otherwise retain the optimistic requested path), never
+      // roll back to the stale pre-PATCH baseline, and let a forced refresh
+      // reconcile the complete authoritative session.
+      if (confirmedWorkspacePath !== null) {
+        applyWorkspaceIfCurrent(workspacePath, confirmedWorkspacePath);
+      }
+      void get()
+        .refreshChatsNow()
+        .catch((refreshError) => {
+          console.warn(
+            `[ChatSlice] Failed to refresh session ${sessionId} after a workspace response Project mismatch:`,
+            refreshError,
+          );
+        });
+      throw new Error(
+        "Workspace switch was saved, but Bamboo returned an unexpected Project; refreshing session state",
+      );
+    }
+
+    // Use Bamboo's canonical/display path, but only while this optimistic
+    // write still owns the local field. A newer operation or feed refresh
+    // wins and must not be clobbered by this completion.
+    applyWorkspaceIfCurrent(workspacePath, confirmedWorkspacePath);
+    return confirmed;
+  },
+
+  assignSessionProject: async (sessionId, requestedProjectId, requestedWorkspacePath) => {
+    const projectId = normalizedProjectId(requestedProjectId);
+    if (!projectId) {
+      throw new Error("Select a Project");
+    }
+    const refreshServerTruth = async (): Promise<void> => {
+      try {
+        await get().refreshChatsNow();
+      } catch {
+        // Preserve the Project assignment error that triggered reconciliation.
+      }
+    };
+    const startingChat = get().chats.find((chat) => chat.id === sessionId);
+    if (!startingChat) {
+      throw new Error("Session not found");
+    }
+    if (startingChat.kind === "child") {
+      throw new Error("Child sessions inherit their root session Project");
+    }
+
+    const startingProjectId = normalizedProjectId(startingChat.config.projectId);
+    const startingWorkspacePath = normalizedWorkspacePath(startingChat.config.workspacePath);
+
+    const targetProject = get().projects[projectId];
+    if (targetProject?.status !== "active") {
+      throw new Error("Select an active Project");
+    }
+    const primaryWorkspacePath =
+      targetProject.project_path_status === "configured"
+        ? normalizedWorkspacePath(targetProject.project_path)
+        : null;
+    const targetWorkspacePath =
+      requestedWorkspacePath === undefined
+        ? primaryWorkspacePath
+        : normalizedWorkspacePath(requestedWorkspacePath);
+    if (!targetWorkspacePath) {
+      throw new Error(
+        requestedWorkspacePath === undefined
+          ? "The selected Project has no available primary folder"
+          : "Select an available workspace from the target Project",
+      );
+    }
+    if (projectId === startingProjectId && targetWorkspacePath === startingWorkspacePath) {
+      const current = await agentClient.getSessionWithVersion(sessionId);
+      return current.session;
+    }
+
+    // Read both server truth and the CAS token before mutation. Project
+    // reassignment is not optimistic: it can also replace the effective
+    // workspace, so the UI keeps showing the confirmed pair atomically.
+    const before = await agentClient.getSessionWithVersion(sessionId);
+    if (before.metadataVersion === null) {
+      throw new Error("Session metadata version is unavailable; reopen the Project picker");
+    }
+    if (
+      normalizedProjectId(before.session.project_id) !== startingProjectId ||
+      normalizedWorkspacePath(before.session.workspace_path) !== startingWorkspacePath
+    ) {
+      await refreshServerTruth();
+      throw new Error("Session context changed while the picker was open; reopen it and try again");
+    }
+
+    const liveBeforeMutation = get().chats.find((chat) => chat.id === sessionId);
+    if (
+      !liveBeforeMutation ||
+      normalizedProjectId(liveBeforeMutation.config.projectId) !== startingProjectId ||
+      normalizedWorkspacePath(liveBeforeMutation.config.workspacePath) !== startingWorkspacePath
+    ) {
+      throw new Error("Session context changed while the Project picker was loading");
+    }
+
+    let confirmed: SessionSummary;
+    try {
+      confirmed = await agentClient.reassignSessionProject(
+        sessionId,
+        projectId,
+        before.metadataVersion,
+        targetWorkspacePath,
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 412) {
+        await refreshServerTruth();
+      }
+      throw error;
+    }
+
+    const confirmedProjectId = normalizedProjectId(confirmed.project_id);
+    if (confirmedProjectId !== projectId) {
+      await refreshServerTruth();
+      throw new Error(
+        "Project assignment was saved, but Bamboo returned an unexpected Project; refreshing session state",
+      );
+    }
+
+    const confirmedWorkspacePath = normalizedWorkspacePath(confirmed.workspace_path);
+    if (!confirmedWorkspacePath) {
+      await refreshServerTruth();
+      throw new Error(
+        "Project assignment was saved, but Bamboo returned no execution directory; refreshing session state",
+      );
+    }
+    let applied = false;
+    set((state) => {
+      const chats = state.chats.map((chat) => {
+        if (
+          chat.id !== sessionId ||
+          normalizedProjectId(chat.config.projectId) !== startingProjectId ||
+          normalizedWorkspacePath(chat.config.workspacePath) !== startingWorkspacePath
+        ) {
+          return chat;
+        }
+        applied = true;
+        return {
+          ...chat,
+          config: {
+            ...chat.config,
+            projectId: confirmedProjectId,
+            workspacePath: confirmedWorkspacePath ?? undefined,
+          },
+        };
+      });
+      return applied ? { ...state, chats } : state;
+    });
+
+    if (!applied) {
+      await refreshServerTruth();
+    } else {
+      get().setActiveProjectId(confirmedProjectId);
+    }
+    return confirmed;
+  },
+
+  persistSessionTitle: async (sessionId, title) => {
+    // Capture previous title lifecycle for rollback.
+    const previousChat = get().chats.find((c) => c.id === sessionId);
+    const previousTitle = previousChat?.title;
+    const previousTitleGenerated = previousChat?.titleGenerated;
+
+    // Optimistic local update.
+    set((state) => ({
+      ...state,
+      chats: state.chats.map((chat) =>
+        chat.id === sessionId
+          ? { ...chat, title, titleGenerated: true, updatedAt: new Date().toISOString() }
+          : chat,
+      ),
+    }));
+
+    try {
+      await agentClient.patchSession(sessionId, { title });
+      // NOTE: `patchSession` returns void, so we cannot read the new
+      // `title_version` from the PATCH response. The backend emits a
+      // `session_title_updated` SSE event after the PATCH bumps the version,
+      // and `applyServerTitle` will reconcile `titleVersion` locally there.
+    } catch (e) {
+      // Roll back to previous title on failure.
+      if (typeof previousTitle === "string") {
+        set((state) => ({
+          ...state,
+          chats: state.chats.map((chat) =>
+            chat.id === sessionId
+              ? { ...chat, title: previousTitle, titleGenerated: previousTitleGenerated }
+              : chat,
+          ),
+        }));
+      }
+      console.warn(`[ChatSlice] persistSessionTitle failed for ${sessionId}:`, e);
+      throw e;
+    }
+  },
+
+  applyServerTitle: (sessionId, title, titleVersion, titleGenerated) =>
+    set((state) => {
+      const existing = state.chats.find((c) => c.id === sessionId);
+      if (!existing) return state;
+      const existingVersion = existing.titleVersion ?? 0;
+      if (titleVersion < existingVersion) return state;
+      if (titleVersion === existingVersion) {
+        if (existing.titleGenerated !== false || !titleGenerated) return state;
+        return {
+          ...state,
+          chats: state.chats.map((chat) =>
+            chat.id === sessionId ? { ...chat, titleGenerated: true } : chat,
+          ),
+        };
+      }
+      return {
+        ...state,
+        chats: state.chats.map((chat) =>
+          chat.id === sessionId
+            ? {
+                ...chat,
+                title,
+                titleVersion,
+                titleGenerated: existing.titleGenerated === true || titleGenerated,
+                updatedAt: new Date().toISOString(),
+              }
+            : chat,
+        ),
+      };
+    }),
+
+  applyServerPinned: (sessionId, pinned, updatedAt) =>
+    set((state) => {
+      const existing = state.chats.find((c) => c.id === sessionId);
+      if (!existing) return state;
+      // Suppress stale replays: if the local copy is newer than the incoming
+      // event, ignore. (`pinned` has no version field; we use `updatedAt`.)
+      const incoming = Date.parse(updatedAt);
+      const local = existing.updatedAt ? Date.parse(existing.updatedAt) : NaN;
+      if (Number.isFinite(incoming) && Number.isFinite(local) && incoming < local) {
+        return state;
+      }
+      // Idempotent — skip the re-render if nothing actually changed.
+      if (existing.pinned === pinned) return state;
+      return {
+        ...state,
+        chats: state.chats.map((chat) =>
+          chat.id === sessionId ? { ...chat, pinned, updatedAt } : chat,
+        ),
+      };
+    }),
+
+  pinSession: (sessionId) => {
+    get().updateSession(sessionId, { pinned: true });
+  },
+
+  unpinSession: (sessionId) => {
+    get().updateSession(sessionId, { pinned: false });
+  },
+
+  setMessages: (sessionId, messages) => {
+    const chat = get().chats.find((c) => c.id === sessionId);
+    if (chat) {
+      get().updateSession(sessionId, { messages });
+    }
+  },
+
+  addMessage: async (sessionId, message) => {
+    const chat = get().chats.find((c) => c.id === sessionId);
+    if (!chat) return;
+    const updatedMessages = [...chat.messages, message];
+    get().updateSession(sessionId, { messages: updatedMessages });
+  },
+
+  updateMessage: (sessionId, messageId, updates) => {
+    const chat = get().chats.find((c) => c.id === sessionId);
+    if (!chat) return;
+
+    const updatedMessages = chat.messages.map((msg) => {
+      if (msg.id !== messageId) return msg;
+      const updatedMsg = { ...msg } as Record<string, unknown>;
+      Object.keys(updates).forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(updatedMsg, key)) {
+          updatedMsg[key] = (updates as Record<string, unknown>)[key];
+        }
+      });
+      return updatedMsg as unknown as Message;
+    });
+
+    get().updateSession(sessionId, { messages: updatedMessages });
+  },
+
+  deleteMessage: async (sessionId, messageId) => {
+    const chat = get().chats.find((c) => c.id === sessionId);
+    if (!chat) {
+      return {
+        success: false,
+        sessionId,
+        messageId,
+        reason: "session_not_found",
+      };
+    }
+    if (!chat.messages.some((msg) => msg.id === messageId)) {
+      return {
+        success: false,
+        sessionId,
+        messageId,
+        reason: "message_not_found",
+      };
+    }
+
+    try {
+      await agentClient.deleteSessionMessage(sessionId, messageId);
+    } catch (e) {
+      console.warn(
+        `[ChatSlice] Failed to delete message ${messageId} from session ${sessionId}:`,
+        e,
+      );
+
+      if (e instanceof ApiError) {
+        if (e.status === 404) {
+          return {
+            success: false,
+            sessionId,
+            messageId,
+            reason: "backend_not_found",
+            statusCode: e.status,
+            errorMessage: e.message,
+          };
+        }
+        if (e.status === 409) {
+          return {
+            success: false,
+            sessionId,
+            messageId,
+            reason: "session_running",
+            statusCode: e.status,
+            errorMessage: e.message,
+          };
+        }
+        return {
+          success: false,
+          sessionId,
+          messageId,
+          reason: "backend_error",
+          statusCode: e.status,
+          errorMessage: e.message,
+        };
+      }
+
+      return {
+        success: false,
+        sessionId,
+        messageId,
+        reason: "backend_error",
+        errorMessage: e instanceof Error ? e.message : undefined,
+      };
+    }
+
+    set((state) => ({
+      ...state,
+      chats: state.chats.map((existingChat) =>
+        existingChat.id === sessionId
+          ? {
+              ...existingChat,
+              messages: existingChat.messages.filter((msg) => msg.id !== messageId),
+            }
+          : existingChat,
+      ),
+    }));
+
+    return {
+      success: true,
+      sessionId,
+      messageId,
+    };
+  },
+
+  refreshChats: async () => {
+    // If a request is already in flight, wait for it
+    if (refreshChatsState.inFlight) {
+      return refreshChatsState.inFlight;
+    }
+
+    // If we're within the throttle window, queue a trailing call
+    if (refreshChatsState.timer) {
+      if (!refreshChatsState.trailingPromise) {
+        refreshChatsState.trailingPromise = new Promise<void>((resolve, reject) => {
+          refreshChatsState.trailingResolve = resolve;
+          refreshChatsState.trailingReject = reject;
+        });
+      }
+      return refreshChatsState.trailingPromise;
+    }
+
+    // Start throttle window. The timer callback is responsible for flushing
+    // any trailing call that arrives while this window is active.
+    refreshChatsState.timer = setTimeout(() => {
+      refreshChatsState.timer = null;
+
+      if (refreshChatsState.trailingPromise) {
+        const callbacks = consumeTrailingRefreshCallbacks();
+        settleTrailingRefreshCallbacks(executeRefreshChats(set), callbacks);
+      }
+    }, REFRESH_CHATS_THROTTLE_MS);
+
+    // Execute immediately
+    return executeRefreshChats(set);
+  },
+
+  refreshChatsNow: async () => {
+    const trailingCallbacks = clearRefreshChatsThrottleWindow();
+    debugLog("[ChatSlice]", "refreshChatsNow.start", {
+      hadTrailingCallbacks: Boolean(trailingCallbacks),
+      hasInflight: Boolean(refreshChatsState.inFlight),
+    });
+    const refreshPromise = refreshChatsState.inFlight
+      ? executeForcedRefreshChats(set)
+      : executeRefreshChats(set);
+    settleTrailingRefreshCallbacks(refreshPromise, trailingCallbacks);
+    const selectedSessionId = get().currentSessionId;
+    const [, detailResult] = await Promise.all([
+      refreshPromise,
+      selectedSessionId
+        ? get().refreshSessionDetail(selectedSessionId, { force: true })
+        : Promise.resolve(false),
+    ]);
+    debugLog("[ChatSlice]", "refreshChatsNow.detail", {
+      sessionId: selectedSessionId,
+      refreshed: detailResult,
+    });
+  },
+
+  loadChats: async () => {
+    debugLog("[ChatSlice]", "loadChats.start", {});
+    let list = await agentClient.listSessions();
+    let initialCreateRecoveryError: unknown;
+    const persistedInitialOperation = getInitialSessionCreateOperation();
+    if (persistedInitialOperation) {
+      // A session created elsewhere is not evidence about this exact logical
+      // operation. Always resolve its durable key before clearing it.
+      try {
+        const created = await agentClient.createSession(persistedInitialOperation.request, {
+          idempotencyKey: persistedInitialOperation.idempotencyKey,
+          operationCreatedAtMs: persistedInitialOperation.createdAtMs,
+          resumeExistingOperation: true,
+        });
+        clearInitialSessionCreateOperation();
+        list = {
+          sessions: [
+            created.session,
+            ...(list.sessions ?? []).filter((session) => session.id !== created.session.id),
+          ],
+        };
+      } catch (error) {
+        if (isSessionCreateRecoveryError(error)) {
+          initialCreateRecoveryError = error;
+        } else {
+          clearInitialSessionCreateOperation();
+          if (!list.sessions?.length) {
+            throw error;
+          }
+        }
+      }
+    } else if (!list.sessions || list.sessions.length === 0) {
+      // Use provider defaults when creating the initial session on startup
+      const defaultModel = useProviderStore.getState().getActiveModel()?.trim();
+      const defaultModelRef = useProviderStore.getState().providerConfig.defaults?.chat;
+      debugLog("[ChatSlice]", "loadChats.createInitialSession", {
+        defaultModel: defaultModel ?? null,
+        defaultModelRef: defaultModelRef ?? null,
+      });
+      const initialRequest = {
+        title: i18n.t("chat.sidebar.newSession"),
+        title_generated: false,
+        model: defaultModel,
+        model_ref: defaultModelRef,
+        provider: defaultModelRef?.provider,
+      };
+      const { operation, isNew } = acquireInitialSessionCreateOperation(initialRequest);
+
+      try {
+        const created = await agentClient.createSession(operation.request, {
+          idempotencyKey: operation.idempotencyKey,
+          operationCreatedAtMs: operation.createdAtMs,
+          // The operation record is stored before the first POST. Later
+          // startup attempts query status before any same-key replay.
+          resumeExistingOperation: !isNew,
+        });
+        clearInitialSessionCreateOperation();
+        list = { sessions: [created.session] };
+      } catch (error) {
+        // An ambiguous create must retain its exact key/request across another
+        // loadChats call or same-tab reload. Definitive failures are safe to
+        // clear so a later explicit startup attempt can begin a new action.
+        if (isSessionCreateRecoveryError(error)) {
+          initialCreateRecoveryError = error;
+        } else {
+          clearInitialSessionCreateOperation();
+          throw error;
+        }
+      }
+    }
+
+    const chats = list.sessions.map(sessionSummaryToChatItem);
+    const currentSessionId = chats[0]?.id ?? null;
+    debugLog("[ChatSlice]", "loadChats.listResolved", {
+      count: list.sessions.length,
+      currentSessionId,
+    });
+
+    // Reconcile executionBySession against every summary.
+    let executionBySession = get().executionBySession;
+    for (const summary of list.sessions) {
+      executionBySession = applyExecutionEvent(executionBySession, {
+        type: "applySessionSummary",
+        sessionId: summary.id,
+        summary,
+      });
+    }
+
+    // Replay active running sessions so the UI reflects live state immediately
+    // after boot (removes the need for OPTIMISTIC_RACE_WINDOW_MS).
+    try {
+      const running = await agentClient.getRunningSessions();
+      debugLog("[ChatSlice]", "loadChats.runningSnapshot", {
+        count: running.sessions.length,
+      });
+      if (running.sessions.length > 0) {
+        // Partition criticalEvents into metadata vs execution before replay.
+        // Metadata events (title/pinned) flow through `applyReplayableSessionEvent`
+        // so live SSE and boot replay share the same precedence rules; the
+        // execution reducer never sees them.
+        const partitioned = running.sessions.map((s) => {
+          const executionOnly = [];
+          for (const event of s.last_critical_events) {
+            if (isSessionMetadataEvent(event)) {
+              // Bake replay metadata into the local `chats` snapshot before
+              // the single trailing `set`. Applying against the store here
+              // would be overwritten by that `set` because `chats` was built
+              // from the baseline before replay events arrived.
+              applyReplayableSessionEventToList(event, chats);
+              continue;
+            }
+            executionOnly.push(event);
+          }
+          return {
+            sessionId: s.session_id,
+            runId: s.run_id,
+            criticalEvents: executionOnly,
+          };
+        });
+
+        executionBySession = applyExecutionEvent(
+          executionBySession,
+          {
+            type: "applyRunningSnapshot",
+            sessions: partitioned,
+          },
+          () => new Date().toISOString(),
+        );
+      }
+    } catch (error) {
+      debugLog("[ChatSlice]", "loadChats.runningSnapshot.error", { error });
+      // Non-fatal: if the backend doesn't support /runs/active yet,
+      // fall back to the summary-based reconciliation above.
+    }
+
+    set({
+      chats,
+      latestActiveSessionId: currentSessionId,
+      currentSessionId,
+      executionBySession,
+    });
+
+    // Baseline the first authoritative index immediately after it enters the
+    // store. Startup-create recovery or initial-history loading may still
+    // throw below; delaying initialization until the outer app bootstrap
+    // resolves would make all historical sessions flash unread on that path.
+    useSessionReadStateStore.getState().initialize(chats);
+
+    debugLog("[ChatSlice]", "loadChats.applied", {
+      currentSessionId,
+      chatCount: chats.length,
+      executionSessionCount: Object.keys(executionBySession || {}).length,
+    });
+
+    if (currentSessionId) {
+      // History and the detail-only active-Workflow receipt are independent
+      // server state. Start both together to avoid a boot-time waterfall.
+      debugLog("[ChatSlice]", "loadChats.loadInitialSession", { currentSessionId });
+      await Promise.all([
+        get().loadChatHistory(currentSessionId),
+        get().refreshSessionDetail(currentSessionId, { force: true }),
+      ]);
+    }
+
+    if (initialCreateRecoveryError) {
+      throw initialCreateRecoveryError;
+    }
+  },
+
+  loadChatHistory: async (sessionId, options) => {
+    const mode = options?.mode ?? "replace";
+    const retries = Math.max(0, options?.retries ?? 0);
+    const retryDelayMs = Math.max(0, options?.retryDelayMs ?? 0);
+
+    debugLog("[ChatSlice]", "loadChatHistory.start", {
+      sessionId,
+      mode,
+      retries,
+      retryDelayMs,
+      waitForAssistant: options?.waitForAssistant ?? false,
+    });
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        // Avoid spurious backend calls when the UI layout references a stale session id.
+        // (e.g. after backend reset or manual data cleanup)
+        const chat = get().chats.find((c) => c.id === sessionId);
+        if (!chat) {
+          debugLog("[ChatSlice]", "loadChatHistory.skipMissingChat", { sessionId, attempt });
+          return false;
+        }
+        // Marker for the history staleness guards (#164, #178): captured
+        // BEFORE the fetch so an in-flight advance (optimistic send,
+        // streaming append) is detected once the snapshot arrives.
+        const preFetchLength = chat.messages.length;
+        const preFetchLastId = chat.messages[chat.messages.length - 1]?.id ?? null;
+
+        const history = await agentClient.getHistory(sessionId);
+        // Authoritative full-session message count (#152): a cold fetch
+        // capped at the history limit returns `truncated: true` plus the
+        // pre-cap count. Writing the capped `messages.length` into
+        // messageCount/syncCursor would downgrade the client's sync
+        // position and wedge long sessions into a permanent need_sync loop.
+        const serverMessageCount = history.total_message_count ?? history.messages.length;
+        debugLog("[ChatSlice]", "loadChatHistory.response", {
+          sessionId,
+          attempt,
+          historyMessageCount: history.messages.length,
+          serverMessageCount,
+          truncated: history.truncated ?? false,
+          localMessageCount: chat.messages.length,
+          localStoredMessageCount: chat.messageCount ?? null,
+          lastMessageId: history.messages[history.messages.length - 1]?.id ?? null,
+          lastRole: history.messages[history.messages.length - 1]?.role ?? null,
+        });
+
+        const lastRole = history.messages[history.messages.length - 1]?.role;
+        if (options?.waitForAssistant && lastRole === "user" && attempt < retries) {
+          // Backoff to give the backend time to persist the assistant reply.
+          const delay = retryDelayMs > 0 ? retryDelayMs * (attempt + 1) : 200 * (attempt + 1);
+          debugLog("[ChatSlice]", "loadChatHistory.waitForAssistant.retry", {
+            sessionId,
+            attempt,
+            delay,
+          });
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
+
+        const nextMessages = mapHistoryMessagesToUi(sessionId, history.messages);
+        const latestChat = get().chats.find((c) => c.id === sessionId);
+        const latestMessages = latestChat?.messages ?? [];
+        const latestLastId = latestMessages[latestMessages.length - 1]?.id ?? null;
+        const advancedInFlight =
+          !latestChat ||
+          latestMessages.length !== preFetchLength ||
+          latestLastId !== preFetchLastId;
+
+        if (mode === "monotonic") {
+          const prevMessages = latestMessages;
+          const prevLen = prevMessages.length;
+          const nextLen = nextMessages.length;
+          const nextLastRole = nextMessages[nextMessages.length - 1]?.role;
+          const prevLastRole = prevMessages[prevMessages.length - 1]?.role;
+          const prevLastMessage = prevMessages[prevMessages.length - 1] as Message | undefined;
+          const nextLastMessage = nextMessages[nextMessages.length - 1] as Message | undefined;
+          const prevLastId = prevLastMessage?.id;
+          const nextLastId = nextLastMessage?.id;
+
+          // Avoid wiping newer in-memory UI state with shorter backend snapshots.
+          // Only replace when backend is strictly longer, or when lengths are equal
+          // but backend clearly progressed from a user tail / changed terminal item.
+          let shouldReplace = false;
+          if (!advancedInFlight && nextLen > prevLen) {
+            shouldReplace = true;
+          } else if (!advancedInFlight && nextLen === prevLen) {
+            const resolvedUserTail = prevLastRole === "user" && nextLastRole !== "user";
+            const terminalChanged =
+              typeof prevLastId === "string" &&
+              typeof nextLastId === "string" &&
+              prevLastId !== nextLastId;
+            shouldReplace = resolvedUserTail || terminalChanged;
+          }
+
+          debugLog("[ChatSlice]", "loadChatHistory.monotonicDecision", {
+            sessionId,
+            attempt,
+            prevLen,
+            nextLen,
+            prevLastRole: prevLastRole ?? null,
+            nextLastRole: nextLastRole ?? null,
+            prevLastId: prevLastId ?? null,
+            nextLastId: nextLastId ?? null,
+            preFetchLength,
+            preFetchLastId,
+            advancedInFlight,
+            shouldReplace,
+          });
+
+          if (!shouldReplace) {
+            if (latestChat) {
+              get().updateSession(sessionId, {
+                messageCount: Math.max(latestChat.messageCount ?? 0, serverMessageCount),
+              });
+            }
+            debugLog("[ChatSlice]", "loadChatHistory.monotonicSkip", {
+              sessionId,
+              attempt,
+              localMessageCount: latestMessages.length,
+              serverMessageCount,
+              advancedInFlight,
+            });
+            // Equal snapshots already describe the rendered transcript, but a
+            // shorter monotonic snapshot was deliberately NOT applied. Never
+            // report that shrink as authoritative to read-acknowledgement
+            // callers or they can clear unread while stale messages remain.
+            return !advancedInFlight && nextLen === prevLen;
+          }
+        } else {
+          // replace-mode staleness guard (#164): if the session advanced
+          // while the history fetch was in flight (optimistic send,
+          // streaming append, or the session was deleted), the fetched
+          // snapshot is OLDER than local state — applying it would wipe
+          // newer messages. Legitimate intentional shrinks (retry truncate,
+          // /goal resync) do not advance local state between the marker and
+          // the apply, so they still pass through.
+          debugLog("[ChatSlice]", "loadChatHistory.replaceDecision", {
+            sessionId,
+            attempt,
+            preFetchLength,
+            preFetchLastId,
+            latestLength: latestMessages.length,
+            latestLastId,
+            advancedInFlight,
+          });
+
+          if (advancedInFlight) {
+            return false;
+          }
+        }
+
+        get().updateSession(sessionId, {
+          messages: nextMessages,
+          messageCount: serverMessageCount,
+          config: {
+            ...(chat.config || {}),
+            ...(history.gold_config != null ? { goldConfig: history.gold_config } : {}),
+            ...(history.goal_state != null ? { goalState: history.goal_state } : {}),
+            compressionEvents: (history.compression_events || []).map((event) => ({
+              id: event.id,
+              createdAt: event.created_at,
+              messagesCompressed: event.messages_compressed,
+              segmentsRemoved: event.segments_removed,
+            })),
+            syncCursor: {
+              messageCount: serverMessageCount,
+              lastMessageId: history.messages[history.messages.length - 1]?.id ?? null,
+              hasPendingQuestion: Boolean(
+                get().executionBySession?.[sessionId]?.interaction.pendingQuestion,
+              ),
+              pendingQuestionToolCallId:
+                get().executionBySession?.[sessionId]?.interaction.pendingQuestion?.toolCallId ??
+                null,
+            },
+          },
+        });
+        debugLog("[ChatSlice]", "loadChatHistory.applied", {
+          sessionId,
+          attempt,
+          mode,
+          messageCount: serverMessageCount,
+          lastMessageId: history.messages[history.messages.length - 1]?.id ?? null,
+        });
+        return true;
+      } catch (error) {
+        if (attempt >= retries) {
+          console.warn(`[ChatSlice] Failed to load history for ${sessionId}:`, error);
+          debugLog("[ChatSlice]", "loadChatHistory.error.final", {
+            sessionId,
+            attempt,
+            retries,
+            error,
+          });
+          return false;
+        }
+        const delay = retryDelayMs > 0 ? retryDelayMs * (attempt + 1) : 200 * (attempt + 1);
+        debugLog("[ChatSlice]", "loadChatHistory.error.retry", {
+          sessionId,
+          attempt,
+          delay,
+          error,
+        });
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+    return false;
+  },
+
+  reconcileOpenSession: (sessionId, reason) => {
+    // Only the open session is reconciled from the feed — other sessions are
+    // handled by the (debounced) list-level refresh.
+    if (!sessionId || get().currentSessionId !== sessionId) {
+      return;
+    }
+    if (reason === "session_cleared") {
+      reconcileReplaceSessions.add(sessionId);
+    }
+    const existing = reconcileTimers.get(sessionId);
+    if (existing) {
+      clearTimeout(existing);
+    }
+    reconcileTimers.set(
+      sessionId,
+      setTimeout(() => {
+        reconcileTimers.delete(sessionId);
+        const forceReplace = reconcileReplaceSessions.delete(sessionId);
+        // Bail if the user switched away while the timer was pending.
+        if (get().currentSessionId !== sessionId) {
+          return;
+        }
+        void (async () => {
+          debugLog("[ChatSlice]", "reconcileOpenSession.start", {
+            sessionId,
+            reason: reason ?? null,
+          });
+          // Most feed events reconcile monotonically: this catches a behind
+          // passive viewer up while preserving a locally-ahead live stream.
+          // `session_cleared` is different: its authoritative transcript may
+          // be shorter, so only guarded replace mode can apply it.
+          const historyMode = forceReplace ? "replace" : "monotonic";
+          const readStateAtRequest = useSessionReadStateStore.getState();
+          const markerAtRequest = readStateAtRequest.markers[sessionId];
+          const readObservation = {
+            content: markerAtRequest?.dirtyContentThrough,
+            reset: readStateAtRequest.feedResetThrough,
+          };
+          const detailRefresh = get().refreshSessionDetail(sessionId, { force: true });
+          const loaded = await get().loadChatHistory(sessionId, {
+            mode: historyMode,
+            waitForAssistant: true,
+            retries: 3,
+            retryDelayMs: 250,
+          });
+          await detailRefresh;
+          // History loading and read acknowledgement are deliberately
+          // separate. Only acknowledge the coordinate captured before the
+          // request, and only if this session is still the visible selection
+          // when the authoritative snapshot has actually been applied.
+          if (
+            loaded &&
+            get().currentSessionId === sessionId &&
+            (typeof document === "undefined" || document.visibilityState !== "hidden")
+          ) {
+            const rendered = get().chats.find((candidate) => candidate.id === sessionId);
+            if (rendered) {
+              useSessionReadStateStore
+                .getState()
+                .markRead([rendered], { [sessionId]: readObservation });
+            }
+          }
+          // Reconcile the child-approval FIFO queue (#25) so a
+          // `child_approval_requested`/`sub_agent_completed` lost to a
+          // broadcast-ring overrun (bamboo#543, the #91 gap-control trigger
+          // for this whole function) is recovered from the same `runs/active`
+          // authoritative snapshot boot already uses (`loadChats`). Uses the
+          // narrow `reconcilePendingChildApprovals` action rather than
+          // `applyRunningSnapshot` — the latter bumps `generation` and forces
+          // `phase: "running"`, which would desync this ALREADY-live SSE
+          // subscription's stale-event guard if applied mid-stream.
+          try {
+            const running = await agentClient.getRunningSessions();
+            if (get().currentSessionId !== sessionId) {
+              return;
+            }
+            const match = running.sessions.find((s) => s.session_id === sessionId);
+            if (match) {
+              get().reconcilePendingChildApprovals(sessionId, match.last_critical_events);
+            }
+          } catch (e) {
+            debugLog("[ChatSlice]", "reconcileOpenSession.runningSnapshotError", {
+              sessionId,
+              error: e,
+            });
+          }
+          // Reconcile the pending clarification so one answered/raised on another
+          // device clears/appears here too.
+          try {
+            const pending = await agentClient.getPendingQuestion(sessionId);
+            if (get().currentSessionId !== sessionId) {
+              return;
+            }
+            if (pending === null) {
+              // Transport failure (already retried internally by the API
+              // client) — this is NOT the same as the backend authoritatively
+              // saying "no pending question". Leave any existing
+              // pending-question UI state untouched; the next reconcile
+              // trigger (stream gap / visibility regain / feed event) will
+              // retry and refresh it (#37).
+              debugLog("[ChatSlice]", "reconcileOpenSession.pendingUnavailable", { sessionId });
+              return;
+            }
+            if (pending.has_pending_question) {
+              get().setPendingQuestion(sessionId, {
+                question: pending.question ?? "",
+                options: pending.options ?? [],
+                allowCustom: pending.allow_custom ?? true,
+                toolCallId: pending.tool_call_id ?? null,
+              });
+            } else {
+              get().clearPendingQuestion(sessionId);
+            }
+          } catch (e) {
+            debugLog("[ChatSlice]", "reconcileOpenSession.pendingError", { sessionId, error: e });
+          }
+        })();
+      }, RECONCILE_DEBOUNCE_MS),
+    );
+  },
+});

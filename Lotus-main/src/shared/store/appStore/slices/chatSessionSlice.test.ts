@@ -1,0 +1,1268 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createStore, type StoreApi } from "zustand/vanilla";
+
+import type { ChatItem } from "@shared/types/chat";
+import { useSessionReadStateStore } from "@shared/store/sessionReadStateStore";
+import { createChatSlice, type ChatSlice } from "./chatSessionSlice";
+import { useProviderStore } from "./providerSlice";
+
+const {
+  deleteSessionMock,
+  deleteSessionMessageMock,
+  getHistoryMock,
+  listSessionsMock,
+  createSessionMock,
+  patchSessionMock,
+  getPendingQuestionMock,
+  getRunningSessionsMock,
+} = vi.hoisted(() => ({
+  getPendingQuestionMock: vi.fn(async () => ({ has_pending_question: false })),
+  getRunningSessionsMock: vi.fn(async () => ({ sessions: [] })),
+  deleteSessionMock: vi.fn(),
+  deleteSessionMessageMock: vi.fn(async () => undefined),
+  getHistoryMock: vi.fn(async () => ({
+    session_id: "session-1",
+    compression_events: [],
+    messages: [],
+  })),
+  listSessionsMock: vi.fn(async () => ({ sessions: [] })),
+  createSessionMock: vi.fn(async () => ({
+    session: {
+      id: "session-1",
+      kind: "root",
+      title: "New Session",
+      title_generated: false,
+      pinned: false,
+      root_session_id: "session-1",
+      spawn_depth: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      last_activity_at: new Date().toISOString(),
+      message_count: 0,
+      has_attachments: false,
+      is_running: false,
+    },
+  })),
+  patchSessionMock: vi.fn(async () => undefined),
+}));
+
+vi.mock("@services/chat/AgentService", () => ({
+  AgentClient: {
+    getInstance: vi.fn(() => ({
+      deleteSession: deleteSessionMock,
+      listSessions: listSessionsMock,
+      createSession: createSessionMock,
+      patchSession: patchSessionMock,
+      getHistory: getHistoryMock,
+      deleteSessionMessage: deleteSessionMessageMock,
+      getPendingQuestion: getPendingQuestionMock,
+      getRunningSessions: getRunningSessionsMock,
+    })),
+  },
+}));
+
+const createChat = (id: string): ChatItem => ({
+  id,
+  title: `Chat ${id}`,
+  createdAt: Date.now(),
+  pinned: false,
+  messages: [],
+  config: {
+    systemPromptId: "general_assistant",
+    baseSystemPrompt: "Base prompt",
+    lastUsedEnhancedPrompt: null,
+  },
+});
+
+const createUserMessage = (id: string) =>
+  ({
+    id,
+    role: "user",
+    createdAt: new Date().toISOString(),
+    content: "hello",
+    images: [],
+  }) as any;
+
+const createTestStore = (): StoreApi<ChatSlice> => {
+  const sliceCreator = createChatSlice as unknown as (
+    set: StoreApi<ChatSlice>["setState"],
+    get: StoreApi<ChatSlice>["getState"],
+    api: StoreApi<ChatSlice>,
+  ) => ChatSlice;
+
+  return createStore<ChatSlice>()((set, get, api) => sliceCreator(set, get, api));
+};
+
+const resetProviderStore = () => {
+  useProviderStore.setState({
+    currentProvider: "copilot",
+    providerConfig: {
+      provider: "copilot",
+      providers: {},
+    },
+    isLoading: false,
+    error: null,
+  });
+};
+
+describe("chatSessionSlice deletion", () => {
+  beforeEach(() => {
+    deleteSessionMock.mockReset();
+    deleteSessionMock.mockResolvedValue(undefined);
+    deleteSessionMessageMock.mockReset();
+    deleteSessionMessageMock.mockResolvedValue(undefined);
+    getHistoryMock.mockReset();
+    getHistoryMock.mockResolvedValue({
+      session_id: "session-1",
+      compression_events: [],
+      messages: [],
+    });
+  });
+
+  it("deletes the linked backend session before removing a chat", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    await store.getState().deleteSession(chat.id);
+
+    expect(deleteSessionMock).toHaveBeenCalledWith("session-1");
+    expect(store.getState().chats).toHaveLength(0);
+  });
+
+  it("keeps the chat locally and rejects when backend deletion fails (#163)", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+    deleteSessionMock.mockRejectedValueOnce(new Error("delete failed"));
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    await expect(store.getState().deleteSession(chat.id)).rejects.toThrow("delete failed");
+
+    expect(deleteSessionMock).toHaveBeenCalledWith("session-1");
+    // The local session is left untouched so UI and backend stay consistent.
+    expect(store.getState().chats).toHaveLength(1);
+    expect(store.getState().currentSessionId).toBe(chat.id);
+  });
+
+  it("deletes all linked backend sessions when removing multiple chats", async () => {
+    const store = createTestStore();
+    const chats = [createChat("session-1"), createChat("session-2"), createChat("session-3")];
+
+    store.setState((state) => ({
+      ...state,
+      chats,
+      currentSessionId: chats[0].id,
+      latestActiveSessionId: chats[0].id,
+    }));
+
+    await store.getState().deleteSessions(chats.map((chat) => chat.id));
+
+    expect(deleteSessionMock).toHaveBeenCalledTimes(3);
+    expect(deleteSessionMock).toHaveBeenNthCalledWith(1, "session-1");
+    expect(deleteSessionMock).toHaveBeenNthCalledWith(2, "session-2");
+    expect(deleteSessionMock).toHaveBeenNthCalledWith(3, "session-3");
+    expect(store.getState().chats).toHaveLength(0);
+  });
+
+  it("deletes a message only after backend deletion succeeds", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+    chat.messages = [createUserMessage("msg-1")];
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    const result = await store.getState().deleteMessage("session-1", "msg-1");
+
+    expect(deleteSessionMessageMock).toHaveBeenCalledWith("session-1", "msg-1");
+    expect(result).toMatchObject({ success: true, messageId: "msg-1" });
+    expect(store.getState().chats[0]?.messages).toHaveLength(0);
+  });
+
+  it("keeps local message when backend deletion fails", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+    chat.messages = [createUserMessage("msg-1")];
+    deleteSessionMessageMock.mockRejectedValueOnce(new Error("delete failed"));
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    const result = await store.getState().deleteMessage("session-1", "msg-1");
+
+    expect(deleteSessionMessageMock).toHaveBeenCalledWith("session-1", "msg-1");
+    expect(result).toMatchObject({
+      success: false,
+      reason: "backend_error",
+      messageId: "msg-1",
+    });
+    expect(store.getState().chats[0]?.messages).toHaveLength(1);
+  });
+});
+
+describe("chatSessionSlice history mapping", () => {
+  beforeEach(() => {
+    getHistoryMock.mockReset();
+  });
+
+  it("keeps assistant text when message also contains tool calls", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    getHistoryMock.mockResolvedValueOnce({
+      session_id: "session-1",
+      compression_events: [],
+      messages: [
+        {
+          id: "assistant-1",
+          role: "assistant",
+          content: "Detailed report body",
+          tool_calls: [
+            {
+              id: "tool-call-1",
+              type: "function",
+              function: {
+                name: "Task",
+                arguments: '{"tasks":[]}',
+              },
+            },
+          ],
+          created_at: "2026-03-15T00:00:00Z",
+        },
+        {
+          id: "tool-1",
+          role: "tool",
+          content: "Task list updated",
+          tool_call_id: "tool-call-1",
+          created_at: "2026-03-15T00:00:01Z",
+        },
+      ],
+    } as any);
+
+    await store.getState().loadChatHistory("session-1", { mode: "replace" });
+
+    const updated = store.getState().chats.find((c) => c.id === "session-1");
+    expect(updated?.messages).toHaveLength(3);
+    expect(updated?.messages[0]).toMatchObject({
+      role: "assistant",
+      type: "text",
+      content: "Detailed report body",
+    });
+    expect(updated?.messages[1]).toMatchObject({
+      role: "assistant",
+      type: "tool_call",
+    });
+    expect(updated?.messages[2]).toMatchObject({
+      role: "assistant",
+      type: "tool_result",
+      toolCallId: "tool-call-1",
+      isError: false,
+    });
+  });
+
+  it("keeps assistant reasoning when tool-call message has empty text", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    getHistoryMock.mockResolvedValueOnce({
+      session_id: "session-1",
+      compression_events: [],
+      messages: [
+        {
+          id: "assistant-1",
+          role: "assistant",
+          content: "",
+          reasoning: "I should inspect project files before editing.",
+          tool_calls: [
+            {
+              id: "tool-call-1",
+              type: "function",
+              function: {
+                name: "read_file",
+                arguments: '{"path":"README.md"}',
+              },
+            },
+          ],
+          created_at: "2026-03-15T00:00:00Z",
+        },
+      ],
+    } as any);
+
+    await store.getState().loadChatHistory("session-1", { mode: "replace" });
+
+    const updated = store.getState().chats.find((c) => c.id === "session-1");
+    expect(updated?.messages).toHaveLength(2);
+    expect(updated?.messages[0]).toMatchObject({
+      role: "assistant",
+      type: "text",
+      content: "",
+      metadata: {
+        reasoning: "I should inspect project files before editing.",
+      },
+    });
+    expect(updated?.messages[1]).toMatchObject({
+      role: "assistant",
+      type: "tool_call",
+    });
+  });
+
+  it("preserves failed tool status from history", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    getHistoryMock.mockResolvedValueOnce({
+      session_id: "session-1",
+      compression_events: [],
+      messages: [
+        {
+          id: "assistant-1",
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "tool-call-err",
+              type: "function",
+              function: {
+                name: "Edit",
+                arguments: '{"file_path":"/tmp/demo.ts","patch":"..."}',
+              },
+            },
+          ],
+          created_at: "2026-03-15T00:00:00Z",
+        },
+        {
+          id: "tool-err",
+          role: "tool",
+          content: "Error: Invalid arguments",
+          tool_call_id: "tool-call-err",
+          tool_success: false,
+          created_at: "2026-03-15T00:00:01Z",
+        },
+      ],
+    } as any);
+
+    await store.getState().loadChatHistory("session-1", { mode: "replace" });
+
+    const updated = store.getState().chats.find((c) => c.id === "session-1");
+    expect(updated?.messages[0]).toMatchObject({
+      role: "assistant",
+      type: "tool_call",
+    });
+    expect(updated?.messages[1]).toMatchObject({
+      role: "assistant",
+      type: "tool_result",
+      toolCallId: "tool-call-err",
+      isError: true,
+    });
+  });
+
+  it("infers tool name from policy-blocked tool content when call mapping is missing", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    getHistoryMock.mockResolvedValueOnce({
+      session_id: "session-1",
+      compression_events: [],
+      messages: [
+        {
+          id: "tool-policy",
+          role: "tool",
+          content:
+            "Tool policy blocked 'conclusion': when copilot conclusion-with-options enhancement is enabled, pair conclusion with an `conclusion_with_options` tool call in the same assistant response.",
+          tool_success: false,
+          created_at: "2026-03-15T00:00:01Z",
+        },
+      ],
+    } as any);
+
+    await store.getState().loadChatHistory("session-1", { mode: "replace" });
+
+    const updated = store.getState().chats.find((c) => c.id === "session-1");
+    expect(updated?.messages[0]).toMatchObject({
+      role: "assistant",
+      type: "tool_result",
+      toolName: "conclusion",
+      isError: true,
+    });
+  });
+
+  it("uses 'tool' fallback instead of 'unknown' for orphan tool history records", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    getHistoryMock.mockResolvedValueOnce({
+      session_id: "session-1",
+      compression_events: [],
+      messages: [
+        {
+          id: "tool-orphan",
+          role: "tool",
+          content: "Execution failed",
+          tool_success: false,
+          created_at: "2026-03-15T00:00:01Z",
+        },
+      ],
+    } as any);
+
+    await store.getState().loadChatHistory("session-1", { mode: "replace" });
+
+    const updated = store.getState().chats.find((c) => c.id === "session-1");
+    expect(updated?.messages[0]).toMatchObject({
+      role: "assistant",
+      type: "tool_result",
+      toolName: "tool",
+      isError: true,
+    });
+  });
+
+  it("maps compressed flags and compression events from history", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    getHistoryMock.mockResolvedValueOnce({
+      session_id: "session-1",
+      compression_events: [
+        {
+          id: "cevt-1",
+          created_at: "2026-03-15T10:00:00Z",
+          messages_compressed: 2,
+          segments_removed: 1,
+        },
+      ],
+      messages: [
+        {
+          id: "old-user",
+          role: "user",
+          content: "old context",
+          compressed: true,
+          compressed_by_event_id: "cevt-1",
+          created_at: "2026-03-15T09:59:00Z",
+        },
+        {
+          id: "new-user",
+          role: "user",
+          content: "active context",
+          created_at: "2026-03-15T10:01:00Z",
+        },
+      ],
+    } as any);
+
+    await store.getState().loadChatHistory("session-1", { mode: "replace" });
+
+    const updated = store.getState().chats.find((c) => c.id === "session-1");
+    expect(updated?.messages[0]).toMatchObject({
+      id: "old-user",
+      role: "user",
+      isCompressed: true,
+      compressedEventId: "cevt-1",
+    });
+    expect(updated?.config.compressionEvents).toEqual([
+      {
+        id: "cevt-1",
+        createdAt: "2026-03-15T10:00:00Z",
+        messagesCompressed: 2,
+        segmentsRemoved: 1,
+      },
+    ]);
+  });
+
+  it("monotonic mode does not replace local messages with a shorter backend snapshot", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+    chat.messages = [
+      {
+        id: "local-user-1",
+        role: "user",
+        content: "continue",
+        createdAt: "2026-03-15T10:00:00Z",
+      } as any,
+      {
+        id: "local-assistant-1",
+        role: "assistant",
+        type: "text",
+        content: "streaming draft",
+        createdAt: "2026-03-15T10:00:01Z",
+      } as any,
+    ];
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    // Backend lags and returns fewer messages ending with assistant (previously could overwrite).
+    getHistoryMock.mockResolvedValueOnce({
+      session_id: "session-1",
+      compression_events: [],
+      messages: [
+        {
+          id: "backend-assistant-1",
+          role: "assistant",
+          content: "older snapshot",
+          created_at: "2026-03-15T10:00:01Z",
+        },
+      ],
+    } as any);
+
+    await store.getState().loadChatHistory("session-1", { mode: "monotonic" });
+
+    const updated = store.getState().chats.find((c) => c.id === "session-1");
+    expect(updated?.messages).toHaveLength(2);
+    expect(updated?.messages[0]).toMatchObject({ id: "local-user-1" });
+    expect(updated?.messages[1]).toMatchObject({ id: "local-assistant-1" });
+  });
+
+  it("monotonic mode replaces equal-length local placeholders when backend terminal id changes", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+    chat.messages = [
+      {
+        id: "local-user-1",
+        role: "user",
+        content: "continue",
+        createdAt: "2026-03-15T10:00:00Z",
+      } as any,
+      {
+        id: "local-assistant-temp",
+        role: "assistant",
+        type: "text",
+        content: "draft",
+        createdAt: "2026-03-15T10:00:01Z",
+      } as any,
+    ];
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    getHistoryMock.mockResolvedValueOnce({
+      session_id: "session-1",
+      compression_events: [],
+      messages: [
+        {
+          id: "backend-user-1",
+          role: "user",
+          content: "continue",
+          created_at: "2026-03-15T10:00:00Z",
+        },
+        {
+          id: "backend-assistant-1",
+          role: "assistant",
+          content: "finalized",
+          created_at: "2026-03-15T10:00:01Z",
+        },
+      ],
+    } as any);
+
+    await store.getState().loadChatHistory("session-1", { mode: "monotonic" });
+
+    const updated = store.getState().chats.find((c) => c.id === "session-1");
+    expect(updated?.messages).toHaveLength(2);
+    expect(updated?.messages[0]).toMatchObject({ id: "backend-user-1" });
+    expect(updated?.messages[1]).toMatchObject({ id: "backend-assistant-1" });
+  });
+});
+
+describe("chatSessionSlice session model propagation", () => {
+  beforeEach(() => {
+    createSessionMock.mockReset();
+    createSessionMock.mockResolvedValue({
+      session: {
+        id: "session-1",
+        kind: "root",
+        title: "New Session",
+        title_generated: false,
+        pinned: false,
+        root_session_id: "session-1",
+        spawn_depth: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        last_activity_at: new Date().toISOString(),
+        message_count: 0,
+        has_attachments: false,
+        is_running: false,
+      },
+    });
+    resetProviderStore();
+  });
+
+  it("passes active provider model into createSession", async () => {
+    const store = createTestStore();
+    useProviderStore.setState({
+      currentProvider: "copilot",
+      providerConfig: {
+        provider: "copilot",
+        defaults: {
+          chat: { provider: "copilot", model: "gpt-5.2" },
+        },
+        providers: {
+          copilot: {},
+        },
+      },
+    });
+
+    const { id: _id, ...chatData } = createChat("temp-chat");
+    await store.getState().addChat(chatData);
+
+    expect(createSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: "gpt-5.2",
+        title_generated: false,
+      }),
+    );
+  });
+
+  it("keeps model undefined when provider model is unavailable", async () => {
+    const store = createTestStore();
+    const { id: _id, ...chatData } = createChat("temp-chat");
+    await store.getState().addChat(chatData);
+
+    expect(createSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: undefined,
+      }),
+    );
+  });
+
+  it("forwards an explicitly finalized title lifecycle without inspecting its text", async () => {
+    const store = createTestStore();
+    const { id: _id, ...chatData } = createChat("temp-chat");
+    chatData.title = "Any Curated Launcher Title";
+    chatData.titleGenerated = true;
+
+    await store.getState().addChat(chatData);
+
+    expect(createSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Any Curated Launcher Title",
+        title_generated: true,
+      }),
+    );
+  });
+
+  it("uses provider defaults for model_ref even when selectedModelRef is set", async () => {
+    const store = createTestStore();
+    useProviderStore.setState({
+      currentProvider: "copilot",
+      providerConfig: {
+        provider: "copilot",
+        defaults: {
+          chat: { provider: "copilot", model: "gpt-5.2" },
+        },
+        providers: {
+          copilot: {},
+        },
+      },
+      selectedModelRef: { provider: "anthropic", model: "claude-3-sonnet" },
+    });
+
+    const { id: _id, ...chatData } = createChat("temp-chat");
+    await store.getState().addChat(chatData);
+
+    expect(createSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: "gpt-5.2",
+        model_ref: { provider: "copilot", model: "gpt-5.2" },
+        provider: "copilot",
+      }),
+    );
+  });
+
+  it("uses caller-provided model_ref when explicitly passed", async () => {
+    const store = createTestStore();
+    useProviderStore.setState({
+      currentProvider: "copilot",
+      providerConfig: {
+        provider: "copilot",
+        defaults: {
+          chat: { provider: "copilot", model: "gpt-5.2" },
+        },
+        providers: {
+          copilot: {},
+        },
+      },
+    });
+
+    const { id: _id, ...chatData } = createChat("temp-chat");
+    chatData.config = {
+      ...chatData.config,
+      model_ref: { provider: "openai", model: "gpt-4o" },
+    };
+    await store.getState().addChat(chatData);
+
+    expect(createSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: "gpt-5.2",
+        model_ref: { provider: "openai", model: "gpt-4o" },
+        provider: "openai",
+      }),
+    );
+  });
+
+  it("falls back to getActiveModel when provider defaults are incomplete", async () => {
+    const store = createTestStore();
+    useProviderStore.setState({
+      currentProvider: "copilot",
+      providerConfig: {
+        provider: "copilot",
+        defaults: {
+          chat: { provider: "", model: "" },
+        },
+        providers: {
+          copilot: {},
+        },
+      },
+      selectedModelRef: { provider: "anthropic", model: "claude-3-sonnet" },
+    });
+
+    const { id: _id, ...chatData } = createChat("temp-chat");
+    await store.getState().addChat(chatData);
+
+    expect(createSessionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        model: undefined,
+        model_ref: undefined,
+        provider: undefined,
+      }),
+    );
+  });
+
+  it("updateSession patches model_ref to backend before updating local state", async () => {
+    const store = createTestStore();
+    const chat = createChat("session-1");
+    chat.config = {
+      ...chat.config,
+      model: "gpt-4o",
+      model_ref: { provider: "openai", model: "gpt-4o" },
+    };
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    patchSessionMock.mockReset();
+    patchSessionMock.mockResolvedValue(undefined);
+
+    // Simulate user switching model in InputContainer.
+    const newModelRef = { provider: "anthropic", model: "claude-3-sonnet" };
+    await store.getState().updateSession("session-1", {
+      config: {
+        ...chat.config,
+        model: newModelRef.model,
+        model_ref: newModelRef,
+      },
+    });
+
+    // Backend patch must include the new model_ref.
+    expect(patchSessionMock).toHaveBeenCalledWith(
+      "session-1",
+      expect.objectContaining({
+        model: "claude-3-sonnet",
+        model_ref: { provider: "anthropic", model: "claude-3-sonnet" },
+        provider: "anthropic",
+      }),
+    );
+
+    // Local state must reflect the new model.
+    const updatedChat = store.getState().chats.find((c) => c.id === "session-1");
+    expect(updatedChat?.config?.model).toBe("claude-3-sonnet");
+    expect(updatedChat?.config?.model_ref).toEqual(newModelRef);
+  });
+
+  describe("chatSessionSlice persistSessionTitle", () => {
+    beforeEach(() => {
+      patchSessionMock.mockReset();
+      patchSessionMock.mockResolvedValue(undefined);
+    });
+
+    it("optimistically updates title and awaits PATCH call", async () => {
+      const store = createTestStore();
+      const chat = createChat("session-1");
+
+      store.setState((state) => ({
+        ...state,
+        chats: [chat],
+        currentSessionId: chat.id,
+        latestActiveSessionId: chat.id,
+      }));
+
+      await store.getState().persistSessionTitle("session-1", "My New Title");
+
+      // Local state must be updated immediately.
+      expect(store.getState().chats[0]?.title).toBe("My New Title");
+      expect(store.getState().chats[0]?.titleGenerated).toBe(true);
+
+      // Backend must be called with the new title.
+      expect(patchSessionMock).toHaveBeenCalledWith("session-1", { title: "My New Title" });
+    });
+
+    it("rolls back title when PATCH fails", async () => {
+      const store = createTestStore();
+      const chat = { ...createChat("session-1"), titleGenerated: false };
+
+      store.setState((state) => ({
+        ...state,
+        chats: [chat],
+        currentSessionId: chat.id,
+        latestActiveSessionId: chat.id,
+      }));
+
+      patchSessionMock.mockRejectedValueOnce(new Error("network error"));
+
+      await expect(
+        store.getState().persistSessionTitle("session-1", "Broken Title"),
+      ).rejects.toThrow("network error");
+
+      // Title must be rolled back to the original.
+      expect(store.getState().chats[0]?.title).toBe("Chat session-1");
+      expect(store.getState().chats[0]?.titleGenerated).toBe(false);
+      expect(patchSessionMock).toHaveBeenCalledWith("session-1", { title: "Broken Title" });
+    });
+
+    it("re-throws the error when PATCH fails", async () => {
+      const store = createTestStore();
+      const chat = createChat("session-1");
+
+      store.setState((state) => ({
+        ...state,
+        chats: [chat],
+        currentSessionId: chat.id,
+        latestActiveSessionId: chat.id,
+      }));
+
+      patchSessionMock.mockRejectedValueOnce(new Error("server unreachable"));
+
+      await expect(store.getState().persistSessionTitle("session-1", "Test")).rejects.toThrow(
+        "server unreachable",
+      );
+    });
+  });
+
+  it("updateSession does not patch model_ref when feature flag is off", async () => {
+    const store = createTestStore();
+    useProviderStore.setState({
+      currentProvider: "copilot",
+      providerConfig: {
+        provider: "copilot",
+        providers: {},
+      },
+      // Simulate feature flag off by overriding isProviderModelRefEnabled.
+    });
+
+    const chat = createChat("session-1");
+    chat.config = {
+      ...chat.config,
+      model: "gpt-4o",
+    };
+
+    store.setState((state) => ({
+      ...state,
+      chats: [chat],
+      currentSessionId: chat.id,
+      latestActiveSessionId: chat.id,
+    }));
+
+    patchSessionMock.mockReset();
+    patchSessionMock.mockResolvedValue(undefined);
+
+    // When feature flag is off, updateSession should still patch model but not model_ref.
+    await store.getState().updateSession("session-1", {
+      config: {
+        ...chat.config,
+        model: "gpt-3.5-turbo",
+      },
+    });
+
+    expect(patchSessionMock).toHaveBeenCalledWith(
+      "session-1",
+      expect.objectContaining({
+        model: "gpt-3.5-turbo",
+      }),
+    );
+  });
+});
+
+describe("chatSessionSlice.reconcileOpenSession (multi-device)", () => {
+  const setPendingQuestionMock = vi.fn();
+  const clearPendingQuestionMock = vi.fn();
+  const reconcilePendingChildApprovalsMock = vi.fn();
+
+  const buildStore = (currentSessionId: string | null) => {
+    const store = createTestStore();
+    // Inject the cross-slice actions reconcileOpenSession depends on.
+    store.setState({
+      chats: [createChat("s1")],
+      currentSessionId,
+      setPendingQuestion: setPendingQuestionMock,
+      clearPendingQuestion: clearPendingQuestionMock,
+      reconcilePendingChildApprovals: reconcilePendingChildApprovalsMock,
+    } as never);
+    return store;
+  };
+
+  beforeEach(() => {
+    getHistoryMock.mockReset();
+    getHistoryMock.mockResolvedValue({
+      session_id: "s1",
+      compression_events: [],
+      // assistant tail (2 > local 0) so monotonic applies and waitForAssistant does not retry
+      messages: [
+        { id: "m1", role: "user", content: "hi", created_at: new Date().toISOString() },
+        { id: "m2", role: "assistant", content: "yo", created_at: new Date().toISOString() },
+      ],
+    } as never);
+    getPendingQuestionMock.mockReset();
+    getPendingQuestionMock.mockResolvedValue({ has_pending_question: false });
+    setPendingQuestionMock.mockReset();
+    clearPendingQuestionMock.mockReset();
+    getRunningSessionsMock.mockReset();
+    getRunningSessionsMock.mockResolvedValue({ sessions: [] });
+    reconcilePendingChildApprovalsMock.mockReset();
+    localStorage.clear();
+    useSessionReadStateStore.setState({
+      v: 2,
+      initialized: true,
+      feedResetThrough: 0,
+      pendingFeedReset: false,
+      markers: {},
+    });
+    resetProviderStore();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("is a no-op when the session is not the open one", async () => {
+    vi.useFakeTimers();
+    const store = buildStore("s1");
+    store.getState().reconcileOpenSession("s2", "message_appended");
+    await vi.advanceTimersByTimeAsync(400);
+    expect(getHistoryMock).not.toHaveBeenCalled();
+    expect(getPendingQuestionMock).not.toHaveBeenCalled();
+  });
+
+  it("debounces and reconciles history + pending for the open session", async () => {
+    vi.useFakeTimers();
+    const store = buildStore("s1");
+
+    // A burst of feed events for the open session coalesces into one reconcile.
+    store.getState().reconcileOpenSession("s1", "message_appended");
+    store.getState().reconcileOpenSession("s1", "complete");
+    expect(getHistoryMock).not.toHaveBeenCalled(); // still debounced
+
+    await vi.advanceTimersByTimeAsync(300);
+    expect(getHistoryMock).toHaveBeenCalledTimes(1);
+    expect(getHistoryMock).toHaveBeenCalledWith("s1");
+    expect(getPendingQuestionMock).toHaveBeenCalledWith("s1");
+    // No pending question on the server -> clear any stale local one.
+    expect(clearPendingQuestionMock).toHaveBeenCalledWith("s1");
+    expect(setPendingQuestionMock).not.toHaveBeenCalled();
+  });
+
+  it("applies a shorter session_cleared history before acknowledging unread", async () => {
+    vi.useFakeTimers();
+    const store = buildStore("s1");
+    const chat = store.getState().chats[0];
+    store.setState({
+      chats: [
+        {
+          ...chat,
+          messages: [createUserMessage("old-user"), createUserMessage("old-assistant")],
+          messageCount: 2,
+        },
+      ],
+    });
+    useSessionReadStateStore.getState().markUnreadFromFeed("s1", 17);
+    getHistoryMock.mockResolvedValue({
+      session_id: "s1",
+      compression_events: [],
+      messages: [
+        {
+          id: "kept-assistant",
+          role: "assistant",
+          content: "kept",
+          created_at: new Date().toISOString(),
+        },
+      ],
+    } as never);
+
+    store.getState().reconcileOpenSession("s1", "session_cleared");
+    // A later event in the same feed burst must not weaken the clear's
+    // guarded replace requirement when it resets the debounce timer.
+    store.getState().reconcileOpenSession("s1", "complete");
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(store.getState().chats[0].messages.map((message) => message.id)).toEqual([
+      "kept-assistant",
+    ]);
+    expect(useSessionReadStateStore.getState().markers.s1).toMatchObject({
+      dirtyContentThrough: 17,
+      readContentThrough: 17,
+    });
+  });
+
+  it("sets the pending question when the server has one (raised on another device)", async () => {
+    vi.useFakeTimers();
+    getPendingQuestionMock.mockResolvedValue({
+      has_pending_question: true,
+      question: "Which file?",
+      options: ["a", "b"],
+      allow_custom: true,
+      tool_call_id: "tc-1",
+    });
+    const store = buildStore("s1");
+
+    store.getState().reconcileOpenSession("s1", "need_clarification");
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(setPendingQuestionMock).toHaveBeenCalledWith("s1", {
+      question: "Which file?",
+      options: ["a", "b"],
+      allowCustom: true,
+      toolCallId: "tc-1",
+    });
+    expect(clearPendingQuestionMock).not.toHaveBeenCalled();
+  });
+
+  // #37: getPendingQuestion returns `null` on a transport failure (after the
+  // API client's own retries are exhausted) instead of masquerading as
+  // `{has_pending_question:false}`. reconcileOpenSession must treat `null`
+  // as "unknown" and leave any existing pending-question UI state alone —
+  // a transient blip must never silently dismiss a real clarification.
+  it("does NOT dismiss an existing pending question when getPendingQuestion returns null (transport failure)", async () => {
+    vi.useFakeTimers();
+    getPendingQuestionMock.mockResolvedValue(null);
+    const store = buildStore("s1");
+
+    store.getState().reconcileOpenSession("s1", "stream_gap");
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(getPendingQuestionMock).toHaveBeenCalledWith("s1");
+    expect(clearPendingQuestionMock).not.toHaveBeenCalled();
+    expect(setPendingQuestionMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT dismiss an existing pending question when getPendingQuestion rejects", async () => {
+    vi.useFakeTimers();
+    getPendingQuestionMock.mockRejectedValue(new Error("network blip"));
+    const store = buildStore("s1");
+
+    store.getState().reconcileOpenSession("s1", "visibility_regain");
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(getPendingQuestionMock).toHaveBeenCalledWith("s1");
+    expect(clearPendingQuestionMock).not.toHaveBeenCalled();
+    expect(setPendingQuestionMock).not.toHaveBeenCalled();
+  });
+
+  it("refreshes pending-question state on the next reconcile once the transport recovers", async () => {
+    vi.useFakeTimers();
+    // First reconcile hits a transient failure — nothing should be touched.
+    getPendingQuestionMock.mockResolvedValueOnce(null);
+    const store = buildStore("s1");
+
+    store.getState().reconcileOpenSession("s1", "stream_gap");
+    await vi.advanceTimersByTimeAsync(300);
+    expect(clearPendingQuestionMock).not.toHaveBeenCalled();
+    expect(setPendingQuestionMock).not.toHaveBeenCalled();
+
+    // A subsequent trigger (e.g. the next stream gap / feed event) succeeds
+    // and reports a genuine, authoritative pending question — it must be
+    // applied normally.
+    getPendingQuestionMock.mockResolvedValueOnce({
+      has_pending_question: true,
+      question: "Which file?",
+      options: ["a", "b"],
+      allow_custom: true,
+      tool_call_id: "tc-2",
+    });
+    store.getState().reconcileOpenSession("s1", "stream_gap");
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(setPendingQuestionMock).toHaveBeenCalledWith("s1", {
+      question: "Which file?",
+      options: ["a", "b"],
+      allowCustom: true,
+      toolCallId: "tc-2",
+    });
+    expect(clearPendingQuestionMock).not.toHaveBeenCalled();
+  });
+
+  // #25: the child-approval FIFO queue must also be recovered by the #91
+  // gap-control reconcile (a broadcast-ring overrun can drop a
+  // `child_approval_requested`/`sub_agent_completed` just like it can drop a
+  // `tool_complete`), not just the pending-question slot.
+  describe("child-approval queue resync (#25)", () => {
+    it("reconciles the queue from the matching running-session snapshot", async () => {
+      vi.useFakeTimers();
+      const criticalEvents = [
+        { type: "child_approval_requested", child_session_id: "child-1", request_id: "req-1" },
+      ];
+      getRunningSessionsMock.mockResolvedValue({
+        sessions: [
+          {
+            session_id: "s1",
+            run_id: "run-1",
+            started_at: new Date().toISOString(),
+            round_count: 1,
+            last_critical_events: criticalEvents,
+            running_child_session_ids: ["child-1"],
+          },
+        ],
+      });
+      const store = buildStore("s1");
+
+      store.getState().reconcileOpenSession("s1", "stream_gap");
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(getRunningSessionsMock).toHaveBeenCalledTimes(1);
+      expect(reconcilePendingChildApprovalsMock).toHaveBeenCalledWith("s1", criticalEvents);
+    });
+
+    it("does nothing when the open session is not in the running-session snapshot (already finished)", async () => {
+      vi.useFakeTimers();
+      getRunningSessionsMock.mockResolvedValue({
+        sessions: [
+          {
+            session_id: "some-other-session",
+            run_id: "run-2",
+            started_at: new Date().toISOString(),
+            round_count: 1,
+            last_critical_events: [],
+            running_child_session_ids: [],
+          },
+        ],
+      });
+      const store = buildStore("s1");
+
+      store.getState().reconcileOpenSession("s1", "stream_gap");
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(getRunningSessionsMock).toHaveBeenCalledTimes(1);
+      expect(reconcilePendingChildApprovalsMock).not.toHaveBeenCalled();
+    });
+
+    it("does not crash the reconcile (pending-question sync still runs) when getRunningSessions rejects", async () => {
+      vi.useFakeTimers();
+      getRunningSessionsMock.mockRejectedValue(new Error("network blip"));
+      const store = buildStore("s1");
+
+      store.getState().reconcileOpenSession("s1", "stream_gap");
+      await vi.advanceTimersByTimeAsync(300);
+
+      expect(reconcilePendingChildApprovalsMock).not.toHaveBeenCalled();
+      // The independent pending-question reconcile still completed normally.
+      expect(getPendingQuestionMock).toHaveBeenCalledWith("s1");
+      expect(clearPendingQuestionMock).toHaveBeenCalledWith("s1");
+    });
+
+    it("bails without reconciling when the user switched sessions while the fetch was in flight", async () => {
+      vi.useFakeTimers();
+      let resolveRunning: (value: unknown) => void = () => {};
+      getRunningSessionsMock.mockReturnValue(
+        new Promise((resolve) => {
+          resolveRunning = resolve;
+        }),
+      );
+      const store = buildStore("s1");
+
+      store.getState().reconcileOpenSession("s1", "stream_gap");
+      await vi.advanceTimersByTimeAsync(300);
+
+      // User navigates away before the in-flight fetch resolves.
+      store.setState({ currentSessionId: "s2" } as never);
+      resolveRunning({
+        sessions: [
+          {
+            session_id: "s1",
+            run_id: "run-1",
+            started_at: new Date().toISOString(),
+            round_count: 1,
+            last_critical_events: [
+              {
+                type: "child_approval_requested",
+                child_session_id: "child-1",
+                request_id: "req-1",
+              },
+            ],
+            running_child_session_ids: ["child-1"],
+          },
+        ],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(reconcilePendingChildApprovalsMock).not.toHaveBeenCalled();
+    });
+  });
+});

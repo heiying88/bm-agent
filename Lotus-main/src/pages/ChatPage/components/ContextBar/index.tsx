@@ -1,0 +1,203 @@
+import React, { useMemo, useState } from "react";
+import { Flex, Tag, Tooltip, theme } from "antd";
+import {
+  CodeOutlined,
+  FileOutlined,
+  FolderOutlined,
+  InboxOutlined,
+  ThunderboltOutlined,
+  AppstoreOutlined,
+} from "@ant-design/icons";
+import { useTranslation } from "react-i18next";
+
+import { formatCompactTokenCount, formatTokenCount } from "@shared/types/tokenBudget";
+import { selectSessionById, useAppStore } from "@shared/store/appStore";
+import { MachineTag } from "@shared/components/MachineTag";
+import SessionProjectModal from "../SessionProjectModal";
+
+import "./index.css";
+
+const { useToken } = theme;
+
+/** Shorten a file system path for display: keep basename or last two segments. */
+const shortenPath = (path: string): string => {
+  const segments = path.replace(/\/$/, "").split("/").filter(Boolean);
+  if (segments.length <= 2) return path;
+  return `~/${segments.slice(-2).join("/")}`;
+};
+
+export type ContextBarProps = {
+  sessionId: string;
+};
+
+export const ContextBar: React.FC<ContextBarProps> = ({ sessionId }) => {
+  const { t } = useTranslation();
+  const { token } = useToken();
+  const currentChat = useAppStore(selectSessionById(sessionId));
+  const systemPrompts = useAppStore((state) => state.systemPrompts);
+  const projectId = currentChat?.config.projectId?.trim() || null;
+  const project = useAppStore((state) => (projectId ? state.projects[projectId] : undefined));
+  const [projectModalOpen, setProjectModalOpen] = useState(false);
+
+  const workspacePath = currentChat?.config.workspacePath;
+  const systemPromptId = currentChat?.config.systemPromptId;
+  const tokenUsage = currentChat?.config.tokenUsage;
+  const compressionEvents = currentChat?.config.compressionEvents ?? [];
+  const placement = currentChat?.placement ?? null;
+
+  const systemPromptName = useMemo(() => {
+    if (!systemPromptId) return null;
+    const prompt = systemPrompts.find((p) => p.id === systemPromptId);
+    return prompt?.name || systemPromptId;
+  }, [systemPromptId, systemPrompts]);
+
+  const fileRefCount = useMemo(() => {
+    if (!currentChat?.messages) return 0;
+    return currentChat.messages.filter(
+      (msg) => msg.role === "user" && "type" in msg && msg.type === "file_reference",
+    ).length;
+  }, [currentChat?.messages]);
+
+  if (!currentChat) return null;
+
+  const summaryTokens = tokenUsage?.summaryTokens ?? 0;
+  const compressionCount = compressionEvents.length;
+  const promptCachedToolOutputs = tokenUsage?.promptCachedToolOutputs ?? 0;
+  const promptCachedToolTokensSaved = tokenUsage?.promptCachedToolTokensSaved ?? 0;
+  const hasSummaryContext = summaryTokens > 0 || compressionCount > 0;
+  const hasPromptCache = promptCachedToolOutputs > 0 || promptCachedToolTokensSaved > 0;
+
+  return (
+    <div
+      className="lotus-context-bar"
+      style={{
+        borderBottomColor: token.colorBorderSecondary,
+        backgroundColor: token.colorBgContainer,
+      }}
+    >
+      <Flex align="center" gap={6} wrap="wrap" className="lotus-context-bar__content">
+        <MachineTag placement={placement} />
+
+        <Tooltip
+          title={
+            project
+              ? t("chat.contextBar.projectTooltip", {
+                  name: project.name,
+                })
+              : t("chat.project.sessionModalDescription")
+          }
+        >
+          <Tag
+            className="lotus-context-bar__tag"
+            icon={<AppstoreOutlined />}
+            bordered={false}
+            color={project ? "cyan" : "default"}
+            role="button"
+            tabIndex={0}
+            onClick={() => setProjectModalOpen(true)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                setProjectModalOpen(true);
+              }
+            }}
+            style={{ cursor: "pointer" }}
+          >
+            <span className="lotus-context-bar__tag-label">{t("chat.contextBar.project")}</span>
+            {project?.name ?? t("chat.project.selectForSession")}
+          </Tag>
+        </Tooltip>
+
+        {workspacePath && (
+          <Tooltip
+            title={t("chat.contextBar.workspaceTooltip", {
+              path: workspacePath,
+            })}
+          >
+            <Tag className="lotus-context-bar__tag" icon={<FolderOutlined />} bordered={false}>
+              <span className="lotus-context-bar__tag-label">{t("chat.contextBar.workspace")}</span>
+              {shortenPath(workspacePath)}
+            </Tag>
+          </Tooltip>
+        )}
+
+        {fileRefCount > 0 && (
+          <Tooltip
+            title={t("chat.contextBar.fileRefsTooltip", {
+              count: fileRefCount,
+            })}
+          >
+            <Tag className="lotus-context-bar__tag" icon={<FileOutlined />} bordered={false}>
+              <span className="lotus-context-bar__tag-label">{t("chat.contextBar.files")}</span>
+              {fileRefCount}
+            </Tag>
+          </Tooltip>
+        )}
+
+        {systemPromptName && (
+          <Tooltip
+            title={t("chat.contextBar.promptTooltip", {
+              name: systemPromptName,
+            })}
+          >
+            <Tag className="lotus-context-bar__tag" icon={<CodeOutlined />} bordered={false}>
+              <span className="lotus-context-bar__tag-label">{t("chat.contextBar.prompt")}</span>
+              {systemPromptName}
+            </Tag>
+          </Tooltip>
+        )}
+
+        {hasSummaryContext && (
+          <Tooltip
+            title={t("chat.contextBar.summaryTooltip", {
+              tokens: formatTokenCount(summaryTokens),
+              count: compressionCount,
+            })}
+          >
+            <Tag
+              className="lotus-context-bar__tag lotus-context-bar__tag--signal"
+              icon={<InboxOutlined />}
+              bordered={false}
+              color="gold"
+            >
+              {t("chat.contextBar.summary")}
+            </Tag>
+          </Tooltip>
+        )}
+
+        {hasPromptCache && (
+          <Tooltip
+            title={t("chat.contextBar.promptCacheTooltip", {
+              count: promptCachedToolOutputs,
+              tokens: formatTokenCount(promptCachedToolTokensSaved),
+            })}
+          >
+            <Tag
+              className="lotus-context-bar__tag lotus-context-bar__tag--signal"
+              icon={<ThunderboltOutlined />}
+              bordered={false}
+              color="green"
+            >
+              <span className="lotus-context-bar__tag-label">
+                {t("chat.contextBar.promptCache")}
+              </span>
+              {promptCachedToolTokensSaved > 0
+                ? formatCompactTokenCount(promptCachedToolTokensSaved)
+                : promptCachedToolOutputs}
+            </Tag>
+          </Tooltip>
+        )}
+      </Flex>
+      <SessionProjectModal
+        open={projectModalOpen}
+        sessionId={sessionId}
+        currentProjectId={projectId}
+        currentWorkspacePath={workspacePath}
+        isChildSession={currentChat.kind === "child"}
+        onCancel={() => setProjectModalOpen(false)}
+      />
+    </div>
+  );
+};
+
+export default ContextBar;

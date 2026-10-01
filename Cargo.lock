@@ -1379,6 +1379,7 @@ dependencies = [
  "actix-service",
  "actix-web",
  "actix-ws",
+ "aes-gcm",
  "anyhow",
  "async-stream",
  "async-trait",

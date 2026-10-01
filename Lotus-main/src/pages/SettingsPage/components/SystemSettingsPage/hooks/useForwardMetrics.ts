@@ -1,0 +1,177 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { metricsService } from "@services/metrics";
+import type {
+  ForwardEndpointMetrics,
+  ForwardMetricsQuery,
+  ForwardMetricsSummary,
+  ForwardRequestMetrics,
+} from "@services/metrics";
+import { resolveMetricsRange } from "./resolveMetricsRange";
+
+export interface ForwardMetricsFilters {
+  startDate?: string;
+  endDate?: string;
+  days?: number;
+  endpoint?: string;
+  model?: string;
+  limit?: number;
+}
+
+interface UseForwardMetricsOptions {
+  filters?: ForwardMetricsFilters;
+  autoRefreshMs?: number;
+  /** When false, no initial load and no polling. Defaults to true. */
+  enabled?: boolean;
+}
+
+const DEFAULT_AUTO_REFRESH_MS = 30_000;
+
+const toErrorMessage = (error: unknown, fallback: string): string => {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  return fallback;
+};
+
+export const useForwardMetrics = (options: UseForwardMetricsOptions = {}) => {
+  const { filters, autoRefreshMs = DEFAULT_AUTO_REFRESH_MS, enabled = true } = options;
+
+  const normalizedFilters = useMemo(
+    () => ({
+      startDate: filters?.startDate,
+      endDate: filters?.endDate,
+      days: filters?.days ?? 30,
+      endpoint: filters?.endpoint,
+      model: filters?.model,
+      limit: filters?.limit ?? 100,
+    }),
+    [
+      filters?.startDate,
+      filters?.endDate,
+      filters?.days,
+      filters?.endpoint,
+      filters?.model,
+      filters?.limit,
+    ],
+  );
+
+  const resolvedRange = useMemo(
+    () =>
+      resolveMetricsRange({
+        startDate: normalizedFilters.startDate,
+        endDate: normalizedFilters.endDate,
+        days: normalizedFilters.days,
+      }),
+    [normalizedFilters.days, normalizedFilters.endDate, normalizedFilters.startDate],
+  );
+
+  const [summary, setSummary] = useState<ForwardMetricsSummary | null>(null);
+  const [endpointMetrics, setEndpointMetrics] = useState<ForwardEndpointMetrics[]>([]);
+  const [requests, setRequests] = useState<ForwardRequestMetrics[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const requestGenerationRef = useRef(0);
+
+  const loadAllMetrics = useCallback(
+    async (showLoading: boolean) => {
+      const requestGeneration = ++requestGenerationRef.current;
+
+      setIsLoading(showLoading);
+      setIsRefreshing(!showLoading);
+      setError(null);
+
+      if (showLoading) {
+        setSummary(null);
+        setEndpointMetrics([]);
+        setRequests([]);
+      }
+
+      try {
+        const baseQuery: ForwardMetricsQuery = {
+          startDate: resolvedRange.startDate,
+          endDate: resolvedRange.endDate,
+          endpoint: normalizedFilters.endpoint,
+          model: normalizedFilters.model,
+        };
+
+        const [summaryResponse, endpointResponse, requestsResponse] = await Promise.all([
+          // Summary and by-endpoint are aggregates; `limit` only bounds the raw
+          // request list, so it is sent to getForwardRequests alone.
+          metricsService.getForwardSummary(baseQuery),
+          metricsService.getForwardByEndpoint(baseQuery),
+          metricsService.getForwardRequests({ ...baseQuery, limit: normalizedFilters.limit }),
+        ]);
+
+        if (requestGeneration !== requestGenerationRef.current) {
+          return;
+        }
+
+        setSummary(summaryResponse);
+        setEndpointMetrics(endpointResponse);
+        setRequests(requestsResponse);
+        setError(null);
+      } catch (loadError) {
+        if (requestGeneration !== requestGenerationRef.current) {
+          return;
+        }
+        setError(toErrorMessage(loadError, "Failed to load forward metrics"));
+      } finally {
+        if (requestGeneration === requestGenerationRef.current) {
+          setIsLoading(false);
+          setIsRefreshing(false);
+        }
+      }
+    },
+    [
+      normalizedFilters.endpoint,
+      normalizedFilters.model,
+      normalizedFilters.limit,
+      resolvedRange.endDate,
+      resolvedRange.startDate,
+    ],
+  );
+
+  const refresh = useCallback(async () => {
+    await loadAllMetrics(false);
+  }, [loadAllMetrics]);
+
+  useEffect(() => {
+    if (!enabled) {
+      requestGenerationRef.current += 1;
+      setIsLoading(false);
+      setIsRefreshing(false);
+      return;
+    }
+    void loadAllMetrics(true);
+
+    return () => {
+      requestGenerationRef.current += 1;
+    };
+  }, [enabled, loadAllMetrics]);
+
+  useEffect(() => {
+    if (!enabled || autoRefreshMs <= 0) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      void loadAllMetrics(false);
+    }, autoRefreshMs);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [enabled, autoRefreshMs, loadAllMetrics]);
+
+  return {
+    summary,
+    endpointMetrics,
+    requests,
+    isLoading,
+    isRefreshing,
+    error,
+    refresh,
+  };
+};

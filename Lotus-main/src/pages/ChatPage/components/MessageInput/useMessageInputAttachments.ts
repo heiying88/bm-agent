@@ -1,0 +1,125 @@
+import { useCallback, useState, type Dispatch, type SetStateAction } from "react";
+import i18n from "i18next";
+import { useDragAndDrop } from "../../hooks/useDragAndDrop";
+import { useImageHandler } from "../../hooks/useImageHandler";
+import { usePasteHandler } from "../../hooks/usePasteHandler";
+import { processFiles, separateImageFiles, type ProcessedFile } from "../../utils/fileUtils";
+import type { ImageFile } from "../../utils/imageUtils";
+
+interface UseMessageInputAttachmentsProps {
+  allowImages: boolean;
+  disabled?: boolean;
+  images?: ImageFile[];
+  setImages?: Dispatch<SetStateAction<ImageFile[]>>;
+  clearImages?: (imageIds?: readonly string[]) => void;
+  onAttachmentsAdded?: (files: ProcessedFile[]) => void;
+  messageApi: {
+    success: (content: string) => void;
+    error: (content: string) => void;
+  };
+}
+
+export const useMessageInputAttachments = ({
+  allowImages,
+  disabled = false,
+  images: controlledImages,
+  setImages: controlledSetImages,
+  clearImages: controlledClearImages,
+  onAttachmentsAdded,
+  messageApi,
+}: UseMessageInputAttachmentsProps) => {
+  const [isProcessingAttachments, setIsProcessingAttachments] = useState(false);
+
+  const {
+    images,
+    setImages,
+    previewModalVisible,
+    setPreviewModalVisible,
+    previewImageIndex,
+    handleImageFiles,
+    handleImagePreview,
+    clearImages,
+  } = useImageHandler(
+    allowImages,
+    controlledImages !== undefined && controlledSetImages && controlledClearImages
+      ? {
+          images: controlledImages,
+          setImages: controlledSetImages,
+          clearImages: controlledClearImages,
+        }
+      : undefined,
+  );
+
+  const handleDroppedFiles = useCallback(
+    async (files: File[]) => {
+      if (disabled || !files || files.length === 0) return;
+      const { images: imageFiles, others } = separateImageFiles(files);
+      if (imageFiles.length > 0) {
+        await handleImageFiles(imageFiles);
+      }
+      if (others.length > 0 && onAttachmentsAdded) {
+        setIsProcessingAttachments(true);
+        const { processed, errors } = await processFiles(others);
+        if (processed.length > 0) {
+          onAttachmentsAdded(processed);
+          messageApi.success(i18n.t("chat.input.filesAdded", { count: processed.length }));
+        }
+        errors.forEach((err) => messageApi.error(err));
+        setIsProcessingAttachments(false);
+      }
+    },
+    [disabled, handleImageFiles, messageApi, onAttachmentsAdded],
+  );
+
+  const { isDragOver, handleDragOver, handleDragLeave, handleDrop } = useDragAndDrop({
+    onFiles: handleDroppedFiles,
+    mode: "any",
+  });
+
+  const { handlePaste } = usePasteHandler({
+    onImages: disabled ? undefined : handleImageFiles,
+    onAttachments:
+      !disabled && onAttachmentsAdded
+        ? async (files) => {
+            setIsProcessingAttachments(true);
+            const { processed, errors } = await processFiles(files);
+            if (processed.length > 0) {
+              onAttachmentsAdded(processed);
+              messageApi.success(i18n.t("chat.input.filesAttached", { count: processed.length }));
+            }
+            errors.forEach((err) => messageApi.error(err));
+            setIsProcessingAttachments(false);
+          }
+        : undefined,
+    allowImages: allowImages && !disabled,
+  });
+
+  const handleFileInputChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files;
+      if (!disabled && files && files.length > 0) {
+        handleImageFiles(files);
+      }
+      e.target.value = "";
+    },
+    [disabled, handleImageFiles],
+  );
+
+  return {
+    images,
+    setImages,
+    previewModalVisible,
+    setPreviewModalVisible,
+    previewImageIndex,
+    handleImageFiles,
+    handleImagePreview,
+    clearImages,
+    isProcessingAttachments,
+    isDragOver,
+    handleDragOver,
+    handleDragLeave,
+    handleDrop,
+    handlePaste,
+    handleFileInputChange,
+  };
+};
