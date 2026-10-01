@@ -9,3 +9,9 @@ debug = "line-tables-only"
 # members, so bamboo_* crates keep their line tables).
 [profile.dev.package."*"]
 debug = false
+
+# Windows: the debug binary's startup needs more main-thread stack than the
+# MSVC default 1 MiB reserve (bamboo.exe overflowed its stack before even
+# `--version` printed). Raise the reserve to 32 MiB — other hosts unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-args=/STACK:33554432"]

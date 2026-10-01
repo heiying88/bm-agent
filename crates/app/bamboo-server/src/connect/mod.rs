@@ -61,7 +61,9 @@ impl ConnectManager {
         config_snapshot: &Config,
         data_dir: Option<PathBuf>,
     ) -> Self {
-        let map_path = data_dir.map(|dir| dir.join("connect_sessions.json"));
+        let map_path = data_dir
+            .as_ref()
+            .map(|dir| dir.join("connect_sessions.json"));
         let bridge = Arc::new(ConnectBridge::new(ctx, map_path));
         bridge.load_session_map().await;
 
@@ -167,6 +169,64 @@ impl ConnectManager {
                         platform_cfg.allow_from.clone(),
                     );
                 }
+                "wechat" => {
+                    let token = platform_cfg.token.clone().unwrap_or_default();
+                    if token.trim().is_empty() {
+                        tracing::warn!(
+                            "connect: wechat platform configured without a bot_token; skipping. \
+                             Obtain one via an iLink QR login (WeChat ClawBot / openclaw-weixin / \
+                             cc-connect) and set platforms[type=wechat].token"
+                        );
+                        continue;
+                    }
+                    // Same session-key collision as telegram's guard above:
+                    // `SessionKey` hardcodes "wechat", and two bots would also
+                    // dedup-collide on synthesized message ids. At most one
+                    // live wechat entry.
+                    if !start_ok[index] {
+                        tracing::warn!(
+                            "connect: multiple wechat platform entries are configured; only the \
+                             FIRST is started. A second wechat bot on this instance would collide \
+                             with the first on the same session-routing key \
+                             (`wechat:<chat_id>:<user_id>`), silently mixing sessions for any user \
+                             who messages both bots. Remove the extra entry, or track issue #454 \
+                             for per-bot session keys."
+                        );
+                        continue;
+                    }
+                    let Some(base_url) = resolve_wechat_base_url(platform_cfg.domain.as_deref())
+                    else {
+                        tracing::warn!(
+                            domain = platform_cfg.domain.as_deref().unwrap_or_default(),
+                            "connect: wechat platform has an invalid domain (expected empty, or \
+                             an https:// base URL); skipping"
+                        );
+                        continue;
+                    };
+                    if platform_cfg.allow_from.is_empty() {
+                        tracing::warn!(
+                            "connect: wechat platform has an EMPTY allow_from list — every \
+                             inbound message will be denied until you add allowed wechat user ids \
+                             (e.g. \"wxid_xxx@im.wechat\") to connect.platforms[].allow_from"
+                        );
+                    }
+
+                    // 轮询游标与扫码重登二维码的落盘目录（非秘密）。
+                    let state_dir = data_dir
+                        .as_ref()
+                        .map(|dir| dir.join("connect_wechat"));
+                    let platform: Arc<dyn Platform> = Arc::new(platforms::wechat::WechatPlatform::new(
+                        token,
+                        base_url,
+                        state_dir,
+                    ));
+                    spawn_platform_tasks(
+                        &mut tasks,
+                        &bridge,
+                        platform,
+                        platform_cfg.allow_from.clone(),
+                    );
+                }
                 other => {
                     tracing::warn!("connect: unknown platform type '{other}'; skipping");
                 }
@@ -224,6 +284,20 @@ fn resolve_feishu_base_url(domain: Option<&str>) -> Option<String> {
     }
 }
 
+/// Resolves the `domain` config field of a wechat (iLink) platform entry to
+/// the API base URL: absent → the official Tencent iLink gateway, any
+/// `https://` value → a custom gateway base used as-is (trailing slash
+/// trimmed). Anything else is invalid — the caller warns and skips the entry.
+fn resolve_wechat_base_url(domain: Option<&str>) -> Option<String> {
+    match domain.map(str::trim).filter(|d| !d.is_empty()) {
+        None => Some("https://ilinkai.weixin.qq.com".to_string()),
+        Some(custom) if custom.starts_with("https://") => {
+            Some(custom.trim_end_matches('/').to_string())
+        }
+        Some(_) => None,
+    }
+}
+
 impl Drop for ConnectManager {
     fn drop(&mut self) {
         for task in &self.tasks {
@@ -266,6 +340,7 @@ pub(crate) fn multi_bot_guard(platforms: &[ConnectPlatformConfig]) -> Vec<bool> 
             let valid = match platform_cfg.platform_type.as_str() {
                 "telegram" => non_empty(&platform_cfg.token),
                 "feishu" => non_empty(&platform_cfg.app_id) && non_empty(&platform_cfg.app_secret),
+                "wechat" => non_empty(&platform_cfg.token),
                 _ => return true,
             };
             if !valid {
@@ -297,6 +372,11 @@ pub(crate) fn platform_config_will_start(
                 && non_empty(&platform.app_id)
                 && non_empty(&platform.app_secret)
                 && resolve_feishu_base_url(platform.domain.as_deref()).is_some()
+        }
+        "wechat" => {
+            guard_allows
+                && non_empty(&platform.token)
+                && resolve_wechat_base_url(platform.domain.as_deref()).is_some()
         }
         _ => false,
     }
@@ -460,5 +540,51 @@ mod tests {
             None
         );
         assert_eq!(resolve_feishu_base_url(Some("dingtalk")), None);
+    }
+
+    #[test]
+    fn resolve_wechat_base_url_covers_the_supported_domain_forms() {
+        assert_eq!(
+            resolve_wechat_base_url(None).as_deref(),
+            Some("https://ilinkai.weixin.qq.com")
+        );
+        assert_eq!(
+            resolve_wechat_base_url(Some("")).as_deref(),
+            Some("https://ilinkai.weixin.qq.com")
+        );
+        assert_eq!(
+            resolve_wechat_base_url(Some("https://ilink-proxy.example.corp/")).as_deref(),
+            Some("https://ilink-proxy.example.corp")
+        );
+        assert_eq!(resolve_wechat_base_url(Some("http://insecure.example")), None);
+        assert_eq!(resolve_wechat_base_url(Some("telegram")), None);
+    }
+
+    /// wechat 与 telegram 使用同一凭据字段（token），guard 语义一致：
+    /// 仅第一个有效条目可启动。
+    #[test]
+    fn multi_bot_guard_allows_a_single_wechat_entry() {
+        let platforms = vec![
+            platform("wechat", Some("ilink-tok-1")),
+            platform("wechat", Some("ilink-tok-2")),
+        ];
+        assert_eq!(multi_bot_guard(&platforms), vec![true, false]);
+    }
+
+    #[test]
+    fn platform_config_will_start_requires_token_and_valid_domain_for_wechat() {
+        let mut entry = platform("wechat", Some("ilink-tok-1"));
+        assert!(platform_config_will_start(&entry, true));
+        assert!(!platform_config_will_start(&entry, false));
+
+        entry.token = None;
+        assert!(!platform_config_will_start(&entry, true));
+
+        entry.token = Some("ilink-tok-1".to_string());
+        entry.domain = Some("http://insecure.example".to_string());
+        assert!(!platform_config_will_start(&entry, true));
+
+        entry.domain = Some("https://ilink-proxy.example.corp".to_string());
+        assert!(platform_config_will_start(&entry, true));
     }
 }

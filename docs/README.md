@@ -11,7 +11,7 @@
 | [`guides/GETTING_STARTED.md`](guides/GETTING_STARTED.md) | 安装、配置 provider，以三种方式（CLI/HTTP/SDK）运行你的第一轮对话。 |
 | [`config-reference.md`](config-reference.md) | 全部 `config.json` 键、同级配置文件（`connect.json`、`schedules.json`、`model_limits.json`）、所有 `BAMBOO_*` 环境变量、机密掩码契约、静态加密以及损坏配置恢复。 |
 | [`lifecycle-hooks.md`](lifecycle-hooks.md) | 配置命令或外部多语言脚本生命周期处理器、事件负载、决策、运行时选择以及实用示例。 |
-| [`guides/CONNECT.md`](guides/CONNECT.md) | 通过 Telegram 或飞书/Lark 操控 Bamboo。 |
+| [`guides/CONNECT.md`](guides/CONNECT.md) | 通过 Telegram、飞书/Lark 或微信个人号（iLink）操控 Bamboo。 |
 | [`guides/PLUGINS.md`](guides/PLUGINS.md) | 安装/更新/移除 plugin，以及三层 URL 信任模型。 |
 | [`guides/DEPLOY.md`](guides/DEPLOY.md) | 长期运行 `bamboo serve`：裸二进制、systemd、Docker、反向代理、备份。 |
 | [`guides/API.md`](guides/API.md) | HTTP/SSE API 参考。 |
@@ -55,6 +55,9 @@ RFC——它们提出的大部分内容如今已经发布。保留它们是为�
 - [`design/remote-mailbox-broker-design.md`](design/remote-mailbox-broker-design.md) — 独立 `bamboo broker` 网络 mailbox 设计。
 - [`design/subagent-actor-runtime-design.md`](design/subagent-actor-runtime-design.md) — 子代理如今运行所依赖的虚拟 actor 模型。
 - [`design/subagent-store-mailbox-interface.md`](design/subagent-store-mailbox-interface.md) — `bamboo-subagent` 的 `store/`/`mailbox/` 接口规范。
+- [`design/wecom-adapter-plan.md`](design/wecom-adapter-plan.md) — 企业微信智能机器人（长连接）渠道适配器方案（后续渠道，未实施）。
+- [`design/wechat-ilink-adapter-plan.md`](design/wechat-ilink-adapter-plan.md) — 微信个人号 iLink 协议适配器（首个微信通道，已实施）。
+- [`design/wechat-ilink-architecture.md`](design/wechat-ilink-architecture.md) — 微信渠道架构讲解：网关、适配器、bridge 与智能体的关系及数据流。
 - [`design/reviews/actor-runtime-self-review-2026-06-12.md`](design/reviews/actor-runtime-self-review-2026-06-12.md) — actor 运行时的一份自审快照。
 
 </details>
