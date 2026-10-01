@@ -1,6 +1,6 @@
-# 操作指南：从 IM 平台（Telegram / 飞书）驱动 Bamboo
+# 操作指南：从 IM 平台（Telegram / 飞书 / 微信）驱动 Bamboo
 
-`bamboo-connect` 让你可以从 Telegram 或飞书/Lark 与一个正在运行的 `bamboo serve` 实例对话，以此替代（或配合）HTTP API/UI——在聊天里发一条消息，它会运行一个正常的 agent 会话，回复（以及在支持可编辑消息的平台上的工具调用进度）会流式返回到同一个聊天里。
+`bamboo-connect` 让你可以从 Telegram、飞书/Lark 或**微信个人号**与一个正在运行的 `bamboo serve` 实例对话，以此替代（或配合）HTTP API/UI——在聊天里发一条消息，它会运行一个正常的 agent 会话，回复（以及在支持可编辑消息的平台上的工具调用进度）会流式返回到同一个聊天里。
 
 它**默认完全不启用**：没有 `connect.json`（且 `config.json` 中没有旧版 `connect` 键）时，不会启动任何后台任务。在配置至少一个平台之前，不会有任何东西监听 IM 流量。
 
@@ -71,19 +71,72 @@ bot token：
 飞书会话将审批/澄清提示渲染为带按钮的交互卡片，与 Telegram 的内联键盘
 体验一致。
 
-## 4. 多平台 / 多 bot
+## 4. 微信个人号设置（iLink 协议）
+
+微信使用腾讯官方的 iLink Bot 协议（微信 8.0.70+ 内置支持）：纯 HTTP/JSON
+长轮询，**无需公网 IP、无需回调 URL、无需逆向协议**——和 Telegram 一样是
+Bamboo 主动外连网关（`ilinkai.weixin.qq.com`），在 NAT/防火墙后面也能正常
+工作。
+
+```json
+{
+  “platforms”: [
+    {
+      “type”: “wechat”,
+      “token”: “你的 ilink bot_token”,
+      “allow_from”: [“wxid_xxxxxxxx@im.wechat”]
+    }
+  ]
+}
+```
+
+### 4.1 获取 bot_token（首次设置）
+
+iLink 的 token 通过**扫码授权**取得，Bamboo v1 本身不提供独立的扫码命令，
+用任一现成 iLink 工具完成扫码后把 token 抄进 `connect.json`：
+
+1. 用微信官方 ClawBot 插件（`@tencent-weixin/openclaw-weixin`）或
+   `cc-connect weixin setup` 等工具发起扫码登录；
+2. 手机微信确认后，从该工具的配置/状态目录里复制 `bot_token`；
+3. 填入上面的 `token` 字段并重启 `bamboo serve`。
+
+### 4.2 会话过期与自动重登
+
+iLink 的 token 有效期未公开，实测错误码 `ret=-14` 表示会话过期。适配器
+遇到它会自动进入**扫码重登**：把登录二维码保存到
+`~/.bamboo/connect_wechat/login_qr.png` 并在日志输出路径，你用手机扫码确认后
+它会自动恢复收发。**重登拿到的新 token 只存在于进程内存中**——重启即失效，
+建议扫码成功后顺手把它抄进 `connect.json` 持久化。
+
+### 4.3 行为与已知限制
+
+- `allow_from` 填微信用户 id（形如 `wxid_xxx@im.wechat`，可从启动后的日志
+  里找到被拒绝的发送者 id）；为空时与其他平台一样**默认全部拒绝**。
+- 机器人**只能回复你先发起的会话**（协议约束：回复必须携带对方消息的
+  `context_token`），无法主动发消息。
+- v1 仅支持**私聊文本**：图片/语音/文件收发、群聊（`@chatroom`）、”输入中”
+  指示均未实现；审批/澄清提示以编号文本列表呈现（回复”1”或”允许”即可）。
+- 单条回复超过 2000 字符会自动分条发送；每个会话限流 1 条/秒（协议未公开
+  上限，保守值）。
+- 首条消息关联：启动后需要先由允许的微信账号给机器人发一条消息，会话路由
+  建立后 `/new`、`/stop`、`/status` 等通道命令才可用。
+
+## 5. 多平台 / 多 bot
 
 `platforms` 是一个数组——想加几条就加几条，可以混用平台类型。每一条都有自己的 `id`（不设置的话会在首次保存时自动分配），并各自运行一个独立的长轮询/WebSocket 任务。
 
-## 5. 机密
+## 6. 机密
 
-`token`（Telegram）和 `app_secret`（飞书）的静态加密方式与 Bamboo 中其他
-所有机密相同——参见[配置参考](../config-reference.md#secrets-and-masking)：加载之后，对已解析配置做 `GET`/查看时，真实值会显示为 `****...****`；（通过设置 UI）原样重新提交该占位符会被视为“保留现有机密”，而不是一个新值。
+`token`（Telegram / 微信）和 `app_secret`（飞书）的静态加密方式与 Bamboo 中其他
+所有机密相同——参见[配置参考](../config-reference.md#secrets-and-masking)：加载之后，对已解析配置做 `GET`/查看时，真实值会显示为 `****...****`；（通过设置 UI）原样重新提交该占位符会被视为”保留现有机密”，而不是一个新值。
 
 ## 故障排查
 
 - **bot 完全没有响应：** 检查 `allow_from` 是否确实包含发送者的 id——空
   列表会静默丢弃所有消息（这是设计行为，不是 bug）。
+- **微信 bot 突然停摆、日志出现 `ret=-14`：** iLink 会话过期。适配器会自动
+  挂出扫码重登（二维码在 `~/.bamboo/connect_wechat/login_qr.png`），扫码后
+  即恢复；长期方案是把新 token 写进 `connect.json`。
 - **`connect.json` 似乎被忽略：** 它只在 `bamboo serve` 启动时读取；编辑
   完请重启。格式错误的 `connect.json` 会被隔离为 `connect.json.bak` 并当作
   空文件处理，而不会让服务器崩溃——在启动日志里找解析警告。
