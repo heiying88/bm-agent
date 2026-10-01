@@ -1,0 +1,1454 @@
+//! Provenance registry: `~/.bamboo/plugins/installed.json`.
+//!
+//! Records, for each installed plugin, EXACTLY what it registered (which
+//! `mcpServers`, services, and event-sink ids; which skill dir names; which
+//! prompt preset ids; and any legacy workflow-copy filenames) so
+//! uninstall/upgrade can precisely undo only what a given plugin added — never
+//! touching a user's own hand-added entries that happen to share a capability
+//! store with plugin-registered ones.
+//!
+//! This module only defines the schema + load/save/add/remove helpers. Wiring
+//! *when* to call `add`/`remove` relative to actually registering/
+//! deregistering capabilities (MCP servers, prompt presets, workflow files)
+//! is the installer's job (see [`crate::installer`] and `PLUGIN_PLAN.md`).
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::fs;
+
+use crate::error::{PluginError, PluginResult};
+use crate::manifest::{
+    EventSinkCapabilityState, EventSinkManifestEntry, ObservationPermissionId, Platform,
+    PluginManifest,
+};
+
+/// Where a plugin's installed bundle came from. Recorded verbatim so
+/// `update`/reinstall can re-fetch from the same place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginSource {
+    /// Installed from a local directory (copied or referenced in place — the
+    /// installer decides which; either way this records the ORIGINAL path the
+    /// user pointed at, not necessarily `plugin_dir`).
+    LocalDir { path: PathBuf },
+    /// Installed by unpacking a local `.tar.gz` archive.
+    LocalArchive { path: PathBuf },
+    /// Installed by fetching a URL. Three trust layers, all enforced by
+    /// `bamboo-server`'s `plugin_source.rs` before this record is written:
+    ///
+    /// 1. **Host allowlist** (source authorization) — was the URL's host
+    ///    fetched from an operator-trusted host (`allow_untrusted_host` opts
+    ///    out).
+    /// 2. **Signature** (publisher authenticity) — did the bundle's `.sig`
+    ///    verify against a trusted ed25519 key (`signed_by`; `allow_unsigned`
+    ///    opts out of requiring one).
+    /// 3. **Checksum** (integrity) — `sha256` is the user-verified hash of
+    ///    the downloaded BUNDLE (the `plugin.json`, or the archive containing
+    ///    it) — `Some` in the normal case, confirmed against a
+    ///    caller-supplied expected hash BEFORE anything was
+    ///    extracted/trusted.
+    ///
+    /// `sha256` is `None` either when the install explicitly opted out of
+    /// checksum verification (`allow_unverified: true`, no hash supplied), OR
+    /// when a verified signature (`signed_by: Some(_)`) already established
+    /// integrity+authenticity more strongly than a pasted checksum could —
+    /// see `plugin_source.rs`'s module docs for why a valid signature
+    /// supersedes the checksum requirement. An install refuses outright
+    /// rather than silently trusting an unpinned/unsigned download from an
+    /// untrusted host, so every `None`/`false` combination here always means
+    /// a deliberate, recorded risk acceptance, never an oversight.
+    ///
+    /// `insecure` is the convenience AGGREGATE over the three per-layer
+    /// opt-outs above: `true` when this install waived all three at once,
+    /// either via a per-install `--insecure` flag / `"insecure": true` on the
+    /// request, or because `plugin_trust.enforcement` was `off` at install
+    /// time (see `bamboo-server`'s `plugin_source.rs` module docs). Recorded
+    /// separately from the three individual `allow_*` fields so `plugin
+    /// list`/audit can tell "an operator deliberately accepted ALL risk for
+    /// this source" apart from "these three flags happened to all be set
+    /// individually" — functionally identical, but a meaningfully different
+    /// signal for review. `#[serde(default)]` so a pre-existing
+    /// `installed.json` row (written before this field existed) loads as
+    /// `false` rather than failing to deserialize.
+    Url {
+        url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+        /// Recorded for audit: true when this install ran with
+        /// `allow_unverified` and no `sha256`. `#[serde(default)]` so a
+        /// pre-existing `installed.json` row (written before this field
+        /// existed, back when only the per-platform binary artifact was
+        /// pinned) loads as `false` rather than failing to deserialize.
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_unverified: bool,
+        /// Recorded for audit: true when this install ran with
+        /// `allow_untrusted_host` against a host outside
+        /// `plugin_trust.trusted_hosts`. `#[serde(default)]` for backward
+        /// compat with rows written before this field existed.
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_untrusted_host: bool,
+        /// Recorded for audit: true when this install ran with
+        /// `allow_unsigned` (no valid signature from a trusted key).
+        /// `#[serde(default)]` for backward compat.
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_unsigned: bool,
+        /// The label of the `plugin_trust.trusted_keys` entry the bundle's
+        /// `.sig` verified against, or `None` if the install proceeded
+        /// unsigned (`allow_unsigned: true`). `#[serde(default)]` for
+        /// backward compat with rows written before signing existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_by: Option<String>,
+        /// True when this install ran with ALL THREE trust layers waived at
+        /// once via the `--insecure` / `"insecure": true` aggregate opt-out,
+        /// or because `plugin_trust.enforcement` was `off` — see this
+        /// variant's doc comment above. `#[serde(default)]` for backward
+        /// compat with rows written before this field existed.
+        #[serde(default, skip_serializing_if = "is_false")]
+        insecure: bool,
+    },
+}
+
+/// `skip_serializing_if` helper for a `bool` field that should be omitted
+/// from the JSON when `false` (serde has no built-in equivalent of
+/// `std::ops::Not::not` that takes a reference).
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Exact host-authorized observation permissions keyed by declared sink id.
+/// This is provenance/policy state, never inferred from manifest requests.
+pub type EventSinkPermissionGrants = BTreeMap<String, Vec<ObservationPermissionId>>;
+
+/// Exactly what an installed plugin registered into Bamboo's shared capability
+/// stores. Every id/name here MUST have actually been written by the
+/// installer for THIS plugin — never a superset (that would risk clobbering
+/// or removing a user's own entries on uninstall) and never a subset
+/// (uninstall would leak orphaned registrations).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredCapabilities {
+    /// Ids registered into `config.json`'s `mcpServers` map.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_server_ids: Vec<String>,
+    /// Directory names under `<plugin_dir>/skills/` that are valid skill
+    /// dirs (contain `SKILL.md`) and are therefore discoverable in place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_dirs: Vec<String>,
+    /// Ids appended into `prompt-presets.json`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preset_ids: Vec<String>,
+    /// Files copied into the global workflow directory by pre-#561 installers.
+    /// New plugin workflows remain in place, so new installs leave this empty;
+    /// the field remains for backward-compatible cleanup during upgrade/remove.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflow_filenames: Vec<String>,
+    /// Ids started via bamboo-server's `ServiceManager` (issue #479, prereq
+    /// for epic #477). `#[serde(default)]` so an `installed.json` written
+    /// before services existed loads with an empty set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_ids: Vec<String>,
+    /// Manifest event-sink ids owned by this plugin, including validated
+    /// inactive/degraded sinks. There is no live sink registry in #903; this
+    /// is exact manifest/lifecycle provenance for the later router.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_sink_ids: Vec<String>,
+    /// Host grants persisted in both Installing and Installed journal rows.
+    /// A legacy absent field is interpreted as metadata-only per v1 sink.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub event_sink_grants: EventSinkPermissionGrants,
+}
+
+impl RegisteredCapabilities {
+    pub fn is_empty(&self) -> bool {
+        self.mcp_server_ids.is_empty()
+            && self.skill_dirs.is_empty()
+            && self.preset_ids.is_empty()
+            && self.workflow_filenames.is_empty()
+            && self.service_ids.is_empty()
+            && self.event_sink_ids.is_empty()
+    }
+
+    /// The capabilities present in `old` (a prior install's registered set)
+    /// but ABSENT from `self` (the set the new/upgraded install will register).
+    ///
+    /// These are exactly the entries an in-place upgrade must DE-register:
+    /// their ids/filenames vanish from provenance across the upgrade, so if
+    /// they are not actively removed here they leak — orphaned forever,
+    /// un-removable because no future uninstall knows they were ours. See the
+    /// upgrade sequence in [`crate::installer`] / `PLUGIN_PLAN.md`.
+    ///
+    /// Order-preserving relative to `old` (stable output for diffing/logging).
+    pub fn removed_since(&self, old: &RegisteredCapabilities) -> RegisteredCapabilities {
+        RegisteredCapabilities {
+            mcp_server_ids: subtract(&old.mcp_server_ids, &self.mcp_server_ids),
+            skill_dirs: subtract(&old.skill_dirs, &self.skill_dirs),
+            preset_ids: subtract(&old.preset_ids, &self.preset_ids),
+            workflow_filenames: subtract(&old.workflow_filenames, &self.workflow_filenames),
+            service_ids: subtract(&old.service_ids, &self.service_ids),
+            event_sink_ids: subtract(&old.event_sink_ids, &self.event_sink_ids),
+            // Grants are policy provenance for retained/replaced declarations,
+            // not independently deregistered capabilities.
+            event_sink_grants: BTreeMap::new(),
+        }
+    }
+
+    /// Pure uninstall/rollback ordering seam: later runtime code must
+    /// deactivate sinks in the first phase before stopping their services in
+    /// the second. #903 records the plan but performs no runtime mutation.
+    pub fn removal_order(&self) -> EventSinkRemovalOrder {
+        EventSinkRemovalOrder {
+            event_sink_ids_before_services: self.event_sink_ids.clone(),
+            service_ids_after_sinks: self.service_ids.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventSinkRemovalOrder {
+    pub event_sink_ids_before_services: Vec<String>,
+    pub service_ids_after_sinks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciledEventSink {
+    pub id: String,
+    pub service_id: String,
+    pub state: EventSinkCapabilityState,
+}
+
+/// Pure install/boot reconciliation plan. It never consults global service
+/// manager state: a sink is eligible only when both its own id and the
+/// referenced same-plugin service id are present in this plugin's provenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventSinkReconciliation {
+    /// Stale/unowned sink ids to deactivate before any service is stopped.
+    pub deactivate_before_services: Vec<String>,
+    /// Same-plugin service dependencies that must be live before the
+    /// corresponding sink can be activated by #905.
+    pub service_dependencies_before_sinks: Vec<String>,
+    /// Owned, cross-validated capabilities in manifest declaration order.
+    pub sinks_after_services: Vec<ReconciledEventSink>,
+}
+
+/// One installed row plus the manifest read from that row's `plugin_dir`.
+/// `None` is explicit corruption/unavailability, not an empty manifest.
+#[derive(Debug, Clone)]
+pub struct PluginBootCandidate {
+    pub installed: InstalledPlugin,
+    pub manifest: Option<PluginManifest>,
+}
+
+/// Fail-closed diagnostics emitted by the global boot provenance audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginBootIssue {
+    DuplicatePluginId { id: String },
+    ManifestUnavailable,
+    ManifestIdMismatch { manifest_id: String },
+    InvalidManifest { detail: String },
+    InstallIncomplete,
+    UnknownPlatform,
+    PlatformIneligible,
+    DuplicateEventSinkOwner { id: String },
+    DuplicateServiceOwner { id: String },
+}
+
+/// Pure boot plan consumed by bamboo-server before it starts plugin services.
+/// It audits all rows together so duplicate ownership cannot degrade into
+/// first-wins activation. #903 still performs no event delivery mutation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginBootReconciliation {
+    pub plugin_id: String,
+    pub service_ids_to_start: Vec<String>,
+    pub event_sinks: EventSinkReconciliation,
+    pub issues: Vec<PluginBootIssue>,
+}
+
+/// Audit the complete installed registry before boot recovery. A row is only
+/// eligible to start services when its identity, status, platform, manifest,
+/// and global service/sink ownership all agree. A duplicated sink also blocks
+/// its backing service for that row, leaving no process available for a later
+/// router to attach to accidentally.
+pub fn reconcile_plugin_boot(
+    candidates: &[PluginBootCandidate],
+    platform: Option<Platform>,
+) -> Vec<PluginBootReconciliation> {
+    let mut plugin_id_counts: HashMap<&str, usize> = HashMap::new();
+    let mut sink_owner_counts: HashMap<&str, usize> = HashMap::new();
+    let mut service_owner_counts: HashMap<&str, usize> = HashMap::new();
+    for candidate in candidates {
+        *plugin_id_counts
+            .entry(candidate.installed.id.as_str())
+            .or_default() += 1;
+        for id in &candidate.installed.registered.event_sink_ids {
+            *sink_owner_counts.entry(id.as_str()).or_default() += 1;
+        }
+        for id in &candidate.installed.registered.service_ids {
+            *service_owner_counts.entry(id.as_str()).or_default() += 1;
+        }
+    }
+
+    candidates
+        .iter()
+        .map(|candidate| {
+            let installed = &candidate.installed;
+            let mut plan = PluginBootReconciliation {
+                plugin_id: installed.id.clone(),
+                event_sinks: EventSinkReconciliation {
+                    deactivate_before_services: unique_strings(
+                        &installed.registered.event_sink_ids,
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            if plugin_id_counts
+                .get(installed.id.as_str())
+                .copied()
+                .unwrap_or_default()
+                > 1
+            {
+                plan.issues.push(PluginBootIssue::DuplicatePluginId {
+                    id: installed.id.clone(),
+                });
+                return plan;
+            }
+            if installed.status == PluginInstallStatus::Installing {
+                plan.issues.push(PluginBootIssue::InstallIncomplete);
+                return plan;
+            }
+            let Some(platform) = platform else {
+                plan.issues.push(PluginBootIssue::UnknownPlatform);
+                return plan;
+            };
+            let Some(manifest) = candidate.manifest.as_ref() else {
+                plan.issues.push(PluginBootIssue::ManifestUnavailable);
+                return plan;
+            };
+            if manifest.id != installed.id {
+                plan.issues.push(PluginBootIssue::ManifestIdMismatch {
+                    manifest_id: manifest.id.clone(),
+                });
+                return plan;
+            }
+            if let Err(error) = manifest.validate() {
+                plan.issues.push(PluginBootIssue::InvalidManifest {
+                    detail: error.to_string(),
+                });
+                return plan;
+            }
+            if !manifest.supports_platform(platform) {
+                plan.issues.push(PluginBootIssue::PlatformIneligible);
+                return plan;
+            }
+
+            let mut sink_plan = reconcile_event_sinks(
+                manifest,
+                &installed.registered,
+                installed.status,
+                Some(platform),
+            )
+            .expect("manifest was validated above");
+            let mut unsafe_sink_ids = HashSet::new();
+            let mut unsafe_backing_services = HashSet::new();
+
+            for sink_id in &installed.registered.event_sink_ids {
+                if sink_owner_counts
+                    .get(sink_id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    > 1
+                {
+                    push_issue_once(
+                        &mut plan.issues,
+                        PluginBootIssue::DuplicateEventSinkOwner {
+                            id: sink_id.clone(),
+                        },
+                    );
+                    unsafe_sink_ids.insert(sink_id.as_str());
+                    if let Some(sink) = manifest
+                        .provides
+                        .event_sinks
+                        .iter()
+                        .find(|sink| sink.id == *sink_id)
+                    {
+                        unsafe_backing_services.insert(sink.service_id.as_str());
+                    }
+                }
+            }
+
+            for service_id in &installed.registered.service_ids {
+                if service_owner_counts
+                    .get(service_id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    > 1
+                {
+                    push_issue_once(
+                        &mut plan.issues,
+                        PluginBootIssue::DuplicateServiceOwner {
+                            id: service_id.clone(),
+                        },
+                    );
+                    unsafe_backing_services.insert(service_id.as_str());
+                }
+            }
+            for sink in &manifest.provides.event_sinks {
+                if installed
+                    .registered
+                    .event_sink_ids
+                    .iter()
+                    .any(|id| id == &sink.id)
+                    && service_owner_counts
+                        .get(sink.service_id.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                        != 1
+                {
+                    unsafe_sink_ids.insert(sink.id.as_str());
+                    unsafe_backing_services.insert(sink.service_id.as_str());
+                }
+            }
+
+            sink_plan.sinks_after_services.retain(|sink| {
+                !unsafe_sink_ids.contains(sink.id.as_str())
+                    && !unsafe_backing_services.contains(sink.service_id.as_str())
+            });
+            sink_plan
+                .service_dependencies_before_sinks
+                .retain(|service_id| !unsafe_backing_services.contains(service_id.as_str()));
+            for sink_id in unsafe_sink_ids {
+                if !sink_plan
+                    .deactivate_before_services
+                    .iter()
+                    .any(|id| id == sink_id)
+                {
+                    sink_plan
+                        .deactivate_before_services
+                        .push(sink_id.to_string());
+                }
+            }
+
+            let owned_services: HashSet<&str> = installed
+                .registered
+                .service_ids
+                .iter()
+                .map(String::as_str)
+                .collect();
+            plan.service_ids_to_start = manifest
+                .provides
+                .services
+                .iter()
+                .filter(|service| {
+                    service.enabled
+                        && owned_services.contains(service.id.as_str())
+                        && service_owner_counts
+                            .get(service.id.as_str())
+                            .copied()
+                            .unwrap_or_default()
+                            == 1
+                        && !unsafe_backing_services.contains(service.id.as_str())
+                })
+                .map(|service| service.id.clone())
+                .collect();
+            plan.event_sinks = sink_plan;
+            plan
+        })
+        .collect()
+}
+
+fn unique_strings(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .filter(|value| seen.insert(value.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn push_issue_once(issues: &mut Vec<PluginBootIssue>, issue: PluginBootIssue) {
+    if !issues.contains(&issue) {
+        issues.push(issue);
+    }
+}
+
+/// Cross-check event-sink manifest declarations against exact plugin
+/// provenance for install/boot recovery. Validation is repeated here so a
+/// boot caller cannot accidentally activate a malformed on-disk manifest by
+/// forgetting the install-time preflight.
+pub fn reconcile_event_sinks(
+    manifest: &PluginManifest,
+    registered: &RegisteredCapabilities,
+    install_status: PluginInstallStatus,
+    platform: Option<Platform>,
+) -> PluginResult<EventSinkReconciliation> {
+    manifest.validate()?;
+    let plugin_platform_eligible =
+        platform.is_some_and(|platform| manifest.supports_platform(platform));
+    let owned_sink_ids: HashSet<&str> = registered
+        .event_sink_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let owned_service_ids: HashSet<&str> =
+        registered.service_ids.iter().map(String::as_str).collect();
+
+    let mut plan = EventSinkReconciliation::default();
+    let mut reconciled_ids = HashSet::new();
+    let mut service_dependencies = HashSet::new();
+    for sink in &manifest.provides.event_sinks {
+        if !owned_sink_ids.contains(sink.id.as_str()) {
+            continue;
+        }
+        let Some(service) =
+            same_plugin_owned_service(sink, &manifest.provides.services, &owned_service_ids)
+        else {
+            if reconciled_ids.insert(sink.id.as_str()) {
+                plan.deactivate_before_services.push(sink.id.clone());
+            }
+            continue;
+        };
+        if !reconciled_ids.insert(sink.id.as_str()) {
+            continue;
+        }
+        let state = if install_status == PluginInstallStatus::Installing {
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::InstallIncomplete,
+            }
+        } else if !plugin_platform_eligible {
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::PlatformIneligible,
+            }
+        } else {
+            sink.capability_state(service, platform)
+        };
+        if matches!(state, EventSinkCapabilityState::Eligible)
+            && service_dependencies.insert(service.id.as_str())
+        {
+            plan.service_dependencies_before_sinks
+                .push(service.id.clone());
+        }
+        plan.sinks_after_services.push(ReconciledEventSink {
+            id: sink.id.clone(),
+            service_id: service.id.clone(),
+            state,
+        });
+    }
+
+    for owned_id in &registered.event_sink_ids {
+        if !reconciled_ids.contains(owned_id.as_str())
+            && !plan.deactivate_before_services.contains(owned_id)
+        {
+            plan.deactivate_before_services.push(owned_id.clone());
+        }
+    }
+    Ok(plan)
+}
+
+fn same_plugin_owned_service<'a>(
+    sink: &EventSinkManifestEntry,
+    services: &'a [crate::manifest::ServiceManifestEntry],
+    owned_service_ids: &HashSet<&str>,
+) -> Option<&'a crate::manifest::ServiceManifestEntry> {
+    if !owned_service_ids.contains(sink.service_id.as_str()) {
+        return None;
+    }
+    services
+        .iter()
+        .find(|service| service.id == sink.service_id)
+}
+
+/// Elements of `from` not present in `remove`, preserving `from`'s order.
+fn subtract(from: &[String], remove: &[String]) -> Vec<String> {
+    let drop: HashSet<&str> = remove.iter().map(String::as_str).collect();
+    from.iter()
+        .filter(|value| !drop.contains(value.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Ownership classification of one declared capability id/filename against a
+/// shared store, for the REFUSE-on-conflict capability kinds (MCP servers,
+/// workflow files). Prompt presets do NOT use this — they rename on collision
+/// via bamboo-server's `ensure_unique_preset_id` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ownership {
+    /// Not present in the shared store — safe to create AND record as
+    /// plugin-owned/removable.
+    New,
+    /// Present, and registered by THIS plugin's prior install — an upgrade
+    /// re-registering its own entry. Safe; stays recorded as plugin-owned.
+    OwnedReinstall,
+    /// Present and NOT owned by this plugin (a user's own entry, or another
+    /// plugin's). Must block the install — never recorded as removable.
+    ForeignConflict,
+}
+
+/// Classify one id against the shared store's current `existing` ids and the
+/// `owned_previously` ids that THIS plugin's prior install registered.
+pub fn classify_ownership(
+    id: &str,
+    existing: &HashSet<&str>,
+    owned_previously: &HashSet<&str>,
+) -> Ownership {
+    if !existing.contains(id) {
+        Ownership::New
+    } else if owned_previously.contains(id) {
+        Ownership::OwnedReinstall
+    } else {
+        Ownership::ForeignConflict
+    }
+}
+
+/// Result of reconciling a plugin's declared ids/filenames against a shared
+/// store for a REFUSE-on-conflict capability (MCP servers, workflow files).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExclusiveReconciliation {
+    /// Genuinely-new plus this-plugin's-own-from-a-prior-install: register
+    /// these and record them as plugin-owned/removable in provenance.
+    pub to_register: Vec<String>,
+    /// Foreign collisions (exist, not owned by this plugin). If this is
+    /// non-empty the caller MUST refuse the install (return
+    /// [`PluginError::Conflict`]) — do not register or record any of these.
+    pub foreign_conflicts: Vec<String>,
+}
+
+/// Reconcile `declared` ids against the shared store for a REFUSE-on-conflict
+/// capability. `existing` = every id currently in the shared store;
+/// `owned_previously` = the ids THIS plugin's prior install recorded (empty
+/// for a fresh install). Pure — the caller supplies the store state (which,
+/// for MCP/workflows, only the app layer can read).
+///
+/// This is the pre-check that closes BLOCKER 1: a pre-existing collision with
+/// a non-plugin entry lands in `foreign_conflicts`, so it is NEVER registered
+/// and NEVER recorded as removable — uninstall can therefore only ever delete
+/// entries this plugin genuinely created.
+pub fn reconcile_exclusive(
+    declared: &[String],
+    existing: &[String],
+    owned_previously: &[String],
+) -> ExclusiveReconciliation {
+    let existing_set: HashSet<&str> = existing.iter().map(String::as_str).collect();
+    let owned_set: HashSet<&str> = owned_previously.iter().map(String::as_str).collect();
+
+    let mut result = ExclusiveReconciliation::default();
+    for id in declared {
+        match classify_ownership(id, &existing_set, &owned_set) {
+            Ownership::New | Ownership::OwnedReinstall => result.to_register.push(id.clone()),
+            Ownership::ForeignConflict => result.foreign_conflicts.push(id.clone()),
+        }
+    }
+    result
+}
+
+/// Lifecycle status of a provenance row — the crash-safety journal marker.
+///
+/// The installer writes a row as [`Self::Installing`] BEFORE it begins
+/// registering capabilities (MCP into `config.json`, prompts, workflow files),
+/// and flips it to [`Self::Installed`] only after the whole sequence succeeds.
+/// A row left [`Self::Installing`] therefore marks an install that was
+/// interrupted (a hard process kill mid-install): its `registered` set names
+/// what the install INTENDED to own, so on the next install/upgrade of that id
+/// the installer can (a) treat the leftover as this-plugin-owned — so the
+/// ownership pre-check doesn't false-`Conflict` on the plugin's own
+/// half-written entries — and (b) clean it up as an upgrade-over-incomplete.
+/// `uninstall` works on an `Installing` row too, so a user is never stranded
+/// having to hand-edit `config.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginInstallStatus {
+    /// A crash-safety journal marker: capability registration has begun but
+    /// not yet completed. `registered` records the INTENDED ownership set.
+    Installing,
+    /// The steady state: registration completed and provenance is authoritative.
+    /// The [`Default`] so a pre-journal `installed.json` (no `status` field)
+    /// deserializes as a completed install (backward compat).
+    #[default]
+    Installed,
+}
+
+/// A single installed plugin's provenance record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstalledPlugin {
+    pub id: String,
+    /// The manifest `version` at the time of this install/upgrade.
+    pub version: String,
+    pub source: PluginSource,
+    /// `~/.bamboo/plugins/<id>` — where the plugin's own files live.
+    pub plugin_dir: PathBuf,
+    /// Caller-supplied timestamp (NOT computed internally — see module docs
+    /// on why: keeps this crate free of a hidden `Utc::now()` call so tests
+    /// and callers stay in full control of "when").
+    pub installed_at: DateTime<Utc>,
+    /// Crash-safety journal marker (see [`PluginInstallStatus`]). Defaults to
+    /// [`PluginInstallStatus::Installed`] so an `installed.json` written before
+    /// this field existed loads as a completed install.
+    #[serde(default)]
+    pub status: PluginInstallStatus,
+    #[serde(default)]
+    pub registered: RegisteredCapabilities,
+}
+
+/// The full `installed.json` document: `{ "plugins": [ ... ] }`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstalledPlugins {
+    #[serde(default)]
+    pub plugins: Vec<InstalledPlugin>,
+}
+
+impl InstalledPlugins {
+    /// Load from `path`. A missing file is treated as an empty registry (this
+    /// is the state before any plugin has ever been installed) rather than an
+    /// error.
+    pub async fn load(path: &Path) -> PluginResult<Self> {
+        match fs::try_exists(path).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(Self::default()),
+            Err(error) => return Err(PluginError::Io(error)),
+        }
+
+        let raw = fs::read_to_string(path).await?;
+        if raw.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        let store: Self = serde_json::from_str(&raw)?;
+        Ok(store)
+    }
+
+    /// Persist to `path`, creating parent directories as needed.
+    ///
+    /// Writes to a sibling `<path>.tmp` first, then `rename`s it over `path`
+    /// — `rename` is atomic on the same filesystem (and `<path>.tmp` sits
+    /// right next to `path`, guaranteeing that), so a hard kill mid-write can
+    /// only ever leave a stray, harmless `.tmp` file behind, never a
+    /// truncated/corrupt `installed.json` a later `load` would choke on.
+    pub async fn save(&self, path: &Path) -> PluginResult<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let serialized = serde_json::to_string_pretty(self)?;
+        let tmp_path = tmp_path_for(path);
+        fs::write(&tmp_path, serialized).await?;
+        fs::rename(&tmp_path, path).await?;
+        Ok(())
+    }
+
+    /// Look up a plugin by id.
+    pub fn get(&self, id: &str) -> Option<&InstalledPlugin> {
+        self.plugins.iter().find(|plugin| plugin.id == id)
+    }
+
+    /// Look up one unambiguous plugin row. Duplicate ids are corrupt
+    /// provenance: callers must fail before touching capabilities or bundle
+    /// bytes rather than guessing which row owns the shared identity.
+    pub fn get_unique(&self, id: &str) -> PluginResult<Option<&InstalledPlugin>> {
+        let mut matches = self.plugins.iter().filter(|plugin| plugin.id == id);
+        let first = matches.next();
+        if matches.next().is_some() {
+            return Err(PluginError::Registration(format!(
+                "installed plugin registry contains duplicate rows for id '{id}'"
+            )));
+        }
+        Ok(first)
+    }
+
+    /// Insert or replace (by id) — an upgrade re-adds the same id with a new
+    /// version/registered set, so this is an upsert rather than an append.
+    pub fn add(&mut self, plugin: InstalledPlugin) {
+        self.remove(&plugin.id);
+        self.plugins.push(plugin);
+    }
+
+    /// Remove and return the entry for `id`, if any.
+    pub fn remove(&mut self, id: &str) -> Option<InstalledPlugin> {
+        let index = self.plugins.iter().position(|plugin| plugin.id == id)?;
+        Some(self.plugins.remove(index))
+    }
+
+    /// All installed plugins, in insertion order.
+    pub fn list(&self) -> &[InstalledPlugin] {
+        &self.plugins
+    }
+}
+
+/// `<path>` with `.tmp` appended to its file name (e.g. `installed.json` ->
+/// `installed.json.tmp`) — a sibling in the SAME directory as `path`, so the
+/// `rename` in [`InstalledPlugins::save`] is guaranteed same-filesystem and
+/// therefore atomic.
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    path.with_file_name(tmp_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_plugin(id: &str) -> InstalledPlugin {
+        InstalledPlugin {
+            id: id.to_string(),
+            version: "0.1.0".to_string(),
+            source: PluginSource::LocalDir {
+                path: PathBuf::from("/tmp/source"),
+            },
+            plugin_dir: PathBuf::from(format!("/home/user/.bamboo/plugins/{id}")),
+            installed_at: DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            status: PluginInstallStatus::Installed,
+            registered: RegisteredCapabilities {
+                mcp_server_ids: vec![],
+                skill_dirs: vec!["hello-world".to_string()],
+                preset_ids: vec!["hello_preset".to_string()],
+                workflow_filenames: vec![],
+                service_ids: vec![],
+                event_sink_ids: vec![],
+                event_sink_grants: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn event_sink_manifest(service_enabled: bool, protocol_version: u16) -> PluginManifest {
+        let json = serde_json::json!({
+            "id": "event-plugin",
+            "name": "Event Plugin",
+            "version": "1.0.0",
+            "provides": {
+                "services": [{
+                    "id": "audit-service",
+                    "enabled": service_enabled,
+                    "command": "${platform_bin}",
+                    "input_protocol": "ndjson_v1"
+                }],
+                "event_sinks": [{
+                    "id": "audit-events",
+                    "service_id": "audit-service",
+                    "protocol": {"name": "tool_event", "version": protocol_version},
+                    "subscriptions": [{"id": "tool.file_changed.v1"}],
+                    "requested_permissions": ["metadata"]
+                }]
+            }
+        });
+        let manifest = PluginManifest::parse_str(&json.to_string()).expect("parse sink manifest");
+        manifest.validate().expect("validate sink manifest");
+        manifest
+    }
+
+    #[tokio::test]
+    async fn load_missing_file_returns_empty_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins").join("installed.json");
+        let loaded = InstalledPlugins::load(&path).await.expect("load");
+        assert!(loaded.plugins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_is_atomic_via_tmp_file_rename() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("installed.json");
+        let tmp_path = tmp_path_for(&path);
+
+        let mut store = InstalledPlugins::default();
+        store.add(sample_plugin("hello-plugin"));
+        store.save(&path).await.expect("save");
+
+        assert!(path.exists(), "installed.json should exist after save");
+        assert!(
+            !tmp_path.exists(),
+            "the .tmp staging file must be renamed over the target, never left behind"
+        );
+
+        // A second save (e.g. an upgrade re-persisting the store) must go
+        // through the same write-tmp-then-rename path and leave no trace
+        // either.
+        let mut reloaded = InstalledPlugins::load(&path).await.expect("load");
+        reloaded.add(sample_plugin("other-plugin"));
+        reloaded.save(&path).await.expect("save again");
+        assert!(!tmp_path.exists());
+
+        let loaded = InstalledPlugins::load(&path).await.expect("load");
+        assert_eq!(loaded.plugins.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn save_then_load_round_trips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugins").join("installed.json");
+
+        let mut store = InstalledPlugins::default();
+        store.add(sample_plugin("hello-plugin"));
+        store.add(sample_plugin("other-plugin"));
+        store.save(&path).await.expect("save");
+
+        let loaded = InstalledPlugins::load(&path).await.expect("load");
+        assert_eq!(loaded.plugins.len(), 2);
+        let hello = loaded.get("hello-plugin").expect("hello-plugin present");
+        assert_eq!(hello.version, "0.1.0");
+        assert_eq!(hello.registered.skill_dirs, vec!["hello-world".to_string()]);
+        assert_eq!(
+            hello.registered.preset_ids,
+            vec!["hello_preset".to_string()]
+        );
+        assert_eq!(
+            hello.source,
+            PluginSource::LocalDir {
+                path: PathBuf::from("/tmp/source")
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_provenance_defaults_and_omits_event_sink_ids() {
+        let raw = r#"{
+            "plugins": [{
+                "id": "legacy-plugin",
+                "version": "1.0.0",
+                "source": {"type": "local_dir", "path": "/tmp/legacy"},
+                "plugin_dir": "/tmp/legacy",
+                "installed_at": "2026-07-12T00:00:00Z",
+                "registered": {"service_ids": ["legacy-service"]}
+            }]
+        }"#;
+        let store: InstalledPlugins = serde_json::from_str(raw).expect("load legacy provenance");
+        assert!(store.plugins[0].registered.event_sink_ids.is_empty());
+
+        let serialized = serde_json::to_value(&store).expect("serialize provenance");
+        assert!(serialized["plugins"][0]["registered"]
+            .get("event_sink_ids")
+            .is_none());
+        assert!(!serde_json::to_string(&store)
+            .expect("serialize legacy provenance bytes")
+            .contains("event_sink_ids"));
+    }
+
+    #[tokio::test]
+    async fn add_upserts_by_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("installed.json");
+
+        let mut store = InstalledPlugins::default();
+        store.add(sample_plugin("hello-plugin"));
+
+        let mut upgraded = sample_plugin("hello-plugin");
+        upgraded.version = "0.2.0".to_string();
+        store.add(upgraded);
+
+        assert_eq!(store.plugins.len(), 1);
+        assert_eq!(store.get("hello-plugin").unwrap().version, "0.2.0");
+
+        store.save(&path).await.expect("save");
+        let loaded = InstalledPlugins::load(&path).await.expect("load");
+        assert_eq!(loaded.plugins.len(), 1);
+        assert_eq!(loaded.get("hello-plugin").unwrap().version, "0.2.0");
+    }
+
+    #[test]
+    fn unique_lookup_rejects_duplicate_plugin_rows() {
+        let mut store = InstalledPlugins::default();
+        store.plugins.push(sample_plugin("hello-plugin"));
+        let mut duplicate = sample_plugin("hello-plugin");
+        duplicate.plugin_dir = PathBuf::from("/tmp/duplicate-plugin-dir");
+        store.plugins.push(duplicate);
+
+        let error = store
+            .get_unique("hello-plugin")
+            .expect_err("duplicate identity must be ambiguous");
+        assert!(matches!(error, PluginError::Registration(_)));
+        assert!(error.to_string().contains("duplicate rows"));
+        assert!(store.get_unique("missing-plugin").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_and_returns_entry() {
+        let mut store = InstalledPlugins::default();
+        store.add(sample_plugin("hello-plugin"));
+
+        let removed = store.remove("hello-plugin").expect("present before remove");
+        assert_eq!(removed.id, "hello-plugin");
+        assert!(store.get("hello-plugin").is_none());
+        assert!(store.remove("hello-plugin").is_none());
+    }
+
+    #[test]
+    fn reconcile_exclusive_fresh_install_splits_new_from_foreign() {
+        // Fresh install (no prior ownership): "a" is new, "b" collides with a
+        // user's own entry.
+        let declared = vec!["a".to_string(), "b".to_string()];
+        let existing = vec!["b".to_string(), "user-thing".to_string()];
+        let owned_previously: Vec<String> = vec![];
+
+        let reconciliation = reconcile_exclusive(&declared, &existing, &owned_previously);
+        assert_eq!(reconciliation.to_register, vec!["a".to_string()]);
+        assert_eq!(reconciliation.foreign_conflicts, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn reconcile_exclusive_upgrade_reregisters_own_but_refuses_new_foreign() {
+        // Upgrade: "a" was ours last time (owned reinstall, fine); "c" is new;
+        // "d" newly collides with a user entry that appeared since → foreign.
+        let declared = vec!["a".to_string(), "c".to_string(), "d".to_string()];
+        let existing = vec!["a".to_string(), "d".to_string()];
+        let owned_previously = vec!["a".to_string()];
+
+        let reconciliation = reconcile_exclusive(&declared, &existing, &owned_previously);
+        assert_eq!(
+            reconciliation.to_register,
+            vec!["a".to_string(), "c".to_string()]
+        );
+        assert_eq!(reconciliation.foreign_conflicts, vec!["d".to_string()]);
+    }
+
+    #[test]
+    fn classify_ownership_three_way() {
+        let existing: HashSet<&str> = ["x", "y"].into_iter().collect();
+        let owned: HashSet<&str> = ["y"].into_iter().collect();
+        assert_eq!(classify_ownership("z", &existing, &owned), Ownership::New);
+        assert_eq!(
+            classify_ownership("y", &existing, &owned),
+            Ownership::OwnedReinstall
+        );
+        assert_eq!(
+            classify_ownership("x", &existing, &owned),
+            Ownership::ForeignConflict
+        );
+    }
+
+    #[test]
+    fn removed_since_computes_dropped_capabilities_per_kind() {
+        let old = RegisteredCapabilities {
+            mcp_server_ids: vec!["srv-a".to_string(), "srv-b".to_string()],
+            skill_dirs: vec!["skill-a".to_string()],
+            preset_ids: vec!["preset-a".to_string(), "preset-b".to_string()],
+            workflow_filenames: vec!["wf-a.md".to_string()],
+            service_ids: vec!["svc-a".to_string(), "svc-b".to_string()],
+            event_sink_ids: vec!["sink-a".to_string(), "sink-b".to_string()],
+            event_sink_grants: BTreeMap::from([(
+                "sink-a".to_string(),
+                vec![ObservationPermissionId::new("metadata")],
+            )]),
+        };
+        // New version drops srv-b, preset-a, and svc-b; keeps the rest; adds srv-c.
+        let new = RegisteredCapabilities {
+            mcp_server_ids: vec!["srv-a".to_string(), "srv-c".to_string()],
+            skill_dirs: vec!["skill-a".to_string()],
+            preset_ids: vec!["preset-b".to_string()],
+            workflow_filenames: vec!["wf-a.md".to_string()],
+            service_ids: vec!["svc-a".to_string()],
+            event_sink_ids: vec!["sink-a".to_string()],
+            event_sink_grants: BTreeMap::from([(
+                "sink-a".to_string(),
+                vec![
+                    ObservationPermissionId::new("metadata"),
+                    ObservationPermissionId::new("paths"),
+                ],
+            )]),
+        };
+
+        let removed = new.removed_since(&old);
+        assert_eq!(removed.mcp_server_ids, vec!["srv-b".to_string()]);
+        assert!(removed.skill_dirs.is_empty());
+        assert_eq!(removed.preset_ids, vec!["preset-a".to_string()]);
+        assert!(removed.workflow_filenames.is_empty());
+        assert_eq!(removed.service_ids, vec!["svc-b".to_string()]);
+        assert_eq!(removed.event_sink_ids, vec!["sink-b".to_string()]);
+        assert!(removed.event_sink_grants.is_empty());
+        assert!(RegisteredCapabilities {
+            event_sink_grants: BTreeMap::from([(
+                "sink-a".to_string(),
+                vec![ObservationPermissionId::new("metadata")],
+            )]),
+            ..Default::default()
+        }
+        .is_empty());
+    }
+
+    #[test]
+    fn event_sink_grants_round_trip_and_legacy_absence_defaults_empty() {
+        let legacy: RegisteredCapabilities = serde_json::from_value(serde_json::json!({
+            "event_sink_ids": ["audit-events"]
+        }))
+        .unwrap();
+        assert!(legacy.event_sink_grants.is_empty());
+
+        let exact = RegisteredCapabilities {
+            event_sink_ids: vec!["audit-events".to_string()],
+            event_sink_grants: BTreeMap::from([(
+                "audit-events".to_string(),
+                vec![
+                    ObservationPermissionId::new("metadata"),
+                    ObservationPermissionId::new("paths"),
+                ],
+            )]),
+            ..Default::default()
+        };
+        let round_trip: RegisteredCapabilities =
+            serde_json::from_value(serde_json::to_value(&exact).unwrap()).unwrap();
+        assert_eq!(round_trip, exact);
+    }
+
+    #[test]
+    fn event_sink_reconciliation_preserves_order_and_same_plugin_ownership() {
+        let manifest = event_sink_manifest(true, 1);
+        let registered = RegisteredCapabilities {
+            service_ids: vec!["audit-service".to_string()],
+            event_sink_ids: vec!["audit-events".to_string(), "orphaned".to_string()],
+            ..Default::default()
+        };
+
+        let plan = reconcile_event_sinks(
+            &manifest,
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .expect("reconcile owned sink");
+        assert_eq!(plan.deactivate_before_services, vec!["orphaned"]);
+        assert_eq!(
+            plan.service_dependencies_before_sinks,
+            vec!["audit-service"]
+        );
+        assert_eq!(plan.sinks_after_services.len(), 1);
+        assert_eq!(plan.sinks_after_services[0].id, "audit-events");
+        assert_eq!(
+            plan.sinks_after_services[0].state,
+            EventSinkCapabilityState::Eligible
+        );
+
+        let removal = registered.removal_order();
+        assert_eq!(
+            removal.event_sink_ids_before_services,
+            vec!["audit-events", "orphaned"]
+        );
+        assert_eq!(removal.service_ids_after_sinks, vec!["audit-service"]);
+    }
+
+    #[test]
+    fn event_sink_reconciliation_fails_closed_on_service_ownership_mismatch() {
+        let manifest = event_sink_manifest(true, 1);
+        let registered = RegisteredCapabilities {
+            event_sink_ids: vec!["audit-events".to_string()],
+            ..Default::default()
+        };
+
+        let plan = reconcile_event_sinks(
+            &manifest,
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .expect("reconcile ownership mismatch");
+        assert_eq!(plan.deactivate_before_services, vec!["audit-events"]);
+        assert!(plan.service_dependencies_before_sinks.is_empty());
+        assert!(plan.sinks_after_services.is_empty());
+
+        let mut malformed = manifest;
+        malformed.provides.event_sinks[0].protocol.name = "tool_evnet".to_string();
+        assert!(reconcile_event_sinks(
+            &malformed,
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn installing_and_disabled_sinks_never_request_live_service_dependencies() {
+        let registered = RegisteredCapabilities {
+            service_ids: vec!["audit-service".to_string()],
+            event_sink_ids: vec!["audit-events".to_string()],
+            ..Default::default()
+        };
+
+        let installing = reconcile_event_sinks(
+            &event_sink_manifest(true, 1),
+            &registered,
+            PluginInstallStatus::Installing,
+            Some(Platform::Linux),
+        )
+        .expect("reconcile installing sink");
+        assert!(installing.service_dependencies_before_sinks.is_empty());
+        assert_eq!(
+            installing.sinks_after_services[0].state,
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::InstallIncomplete,
+            }
+        );
+
+        let disabled = reconcile_event_sinks(
+            &event_sink_manifest(false, 1),
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .expect("reconcile disabled sink");
+        assert!(disabled.service_dependencies_before_sinks.is_empty());
+        assert_eq!(
+            disabled.sinks_after_services[0].state,
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::ServiceDisabled,
+            }
+        );
+    }
+
+    #[test]
+    fn reconciliation_applies_the_plugin_level_platform_gate() {
+        let mut manifest = event_sink_manifest(true, 1);
+        manifest.platforms = Some(vec![Platform::Macos]);
+        manifest.validate().expect("macOS-only manifest");
+        let registered = RegisteredCapabilities {
+            service_ids: vec!["audit-service".to_string()],
+            event_sink_ids: vec!["audit-events".to_string()],
+            ..Default::default()
+        };
+
+        let plan = reconcile_event_sinks(
+            &manifest,
+            &registered,
+            PluginInstallStatus::Installed,
+            Some(Platform::Linux),
+        )
+        .expect("platform-ineligible plan");
+        assert!(plan.service_dependencies_before_sinks.is_empty());
+        assert_eq!(
+            plan.sinks_after_services[0].state,
+            EventSinkCapabilityState::Inactive {
+                detail: crate::manifest::EventSinkInactiveReason::PlatformIneligible,
+            }
+        );
+    }
+
+    fn boot_candidate(
+        id: &str,
+        manifest: Option<PluginManifest>,
+        service_ids: &[&str],
+        sink_ids: &[&str],
+        status: PluginInstallStatus,
+    ) -> PluginBootCandidate {
+        let mut installed = sample_plugin(id);
+        installed.status = status;
+        installed.registered.service_ids = service_ids.iter().map(|id| (*id).to_string()).collect();
+        installed.registered.event_sink_ids = sink_ids.iter().map(|id| (*id).to_string()).collect();
+        PluginBootCandidate {
+            installed,
+            manifest,
+        }
+    }
+
+    #[test]
+    fn global_boot_audit_blocks_duplicate_sink_owners_and_their_backing_services() {
+        let first = event_sink_manifest(true, 1);
+        let mut second = event_sink_manifest(true, 1);
+        second.id = "other-plugin".to_string();
+        second.provides.services[0].id = "other-service".to_string();
+        second.provides.event_sinks[0].service_id = "other-service".to_string();
+        second.validate().expect("second manifest");
+        let candidates = vec![
+            boot_candidate(
+                "event-plugin",
+                Some(first),
+                &["audit-service"],
+                &["audit-events"],
+                PluginInstallStatus::Installed,
+            ),
+            boot_candidate(
+                "other-plugin",
+                Some(second),
+                &["other-service"],
+                &["audit-events"],
+                PluginInstallStatus::Installed,
+            ),
+        ];
+
+        let plans = reconcile_plugin_boot(&candidates, Some(Platform::Linux));
+        assert_eq!(plans.len(), 2);
+        for plan in plans {
+            assert!(plan.service_ids_to_start.is_empty());
+            assert_eq!(
+                plan.event_sinks.deactivate_before_services,
+                ["audit-events"]
+            );
+            assert!(plan.event_sinks.sinks_after_services.is_empty());
+            assert!(plan
+                .issues
+                .contains(&PluginBootIssue::DuplicateEventSinkOwner {
+                    id: "audit-events".to_string(),
+                }));
+        }
+    }
+
+    #[test]
+    fn global_boot_audit_blocks_duplicate_service_owners_and_dependent_sinks() {
+        let first = event_sink_manifest(true, 1);
+        let mut second = event_sink_manifest(true, 1);
+        second.id = "other-plugin".to_string();
+        second.provides.event_sinks[0].id = "other-events".to_string();
+        second.validate().expect("second manifest");
+        let candidates = vec![
+            boot_candidate(
+                "event-plugin",
+                Some(first),
+                &["audit-service"],
+                &["audit-events"],
+                PluginInstallStatus::Installed,
+            ),
+            boot_candidate(
+                "other-plugin",
+                Some(second),
+                &["audit-service"],
+                &["other-events"],
+                PluginInstallStatus::Installed,
+            ),
+        ];
+
+        let plans = reconcile_plugin_boot(&candidates, Some(Platform::Linux));
+        assert_eq!(
+            plans[0].event_sinks.deactivate_before_services,
+            ["audit-events"]
+        );
+        assert_eq!(
+            plans[1].event_sinks.deactivate_before_services,
+            ["other-events"]
+        );
+        for plan in plans {
+            assert!(plan.service_ids_to_start.is_empty());
+            assert!(plan.event_sinks.sinks_after_services.is_empty());
+            assert!(plan
+                .issues
+                .contains(&PluginBootIssue::DuplicateServiceOwner {
+                    id: "audit-service".to_string(),
+                }));
+        }
+    }
+
+    #[test]
+    fn global_boot_audit_blocks_duplicate_plugin_rows_but_keeps_safe_plugins() {
+        let first = event_sink_manifest(true, 1);
+        let mut second = event_sink_manifest(true, 1);
+        second.provides.services[0].id = "other-service".to_string();
+        second.provides.event_sinks[0].id = "other-events".to_string();
+        second.provides.event_sinks[0].service_id = "other-service".to_string();
+        second.validate().expect("second same-id manifest");
+        let mut safe = event_sink_manifest(true, 1);
+        safe.id = "safe-plugin".to_string();
+        safe.provides.services[0].id = "safe-service".to_string();
+        safe.provides.event_sinks[0].id = "safe-events".to_string();
+        safe.provides.event_sinks[0].service_id = "safe-service".to_string();
+        safe.validate().expect("safe manifest");
+
+        let plans = reconcile_plugin_boot(
+            &[
+                boot_candidate(
+                    "event-plugin",
+                    Some(first),
+                    &["audit-service"],
+                    &["audit-events"],
+                    PluginInstallStatus::Installed,
+                ),
+                boot_candidate(
+                    "event-plugin",
+                    Some(second),
+                    &["other-service"],
+                    &["other-events"],
+                    PluginInstallStatus::Installed,
+                ),
+                boot_candidate(
+                    "safe-plugin",
+                    Some(safe),
+                    &["safe-service"],
+                    &["safe-events"],
+                    PluginInstallStatus::Installed,
+                ),
+            ],
+            Some(Platform::Linux),
+        );
+
+        for plan in &plans[..2] {
+            assert!(plan.service_ids_to_start.is_empty());
+            assert_eq!(
+                plan.issues,
+                [PluginBootIssue::DuplicatePluginId {
+                    id: "event-plugin".to_string(),
+                }]
+            );
+        }
+        assert_eq!(plans[2].service_ids_to_start, ["safe-service"]);
+        assert!(plans[2].issues.is_empty());
+    }
+
+    #[test]
+    fn global_boot_audit_blocks_incomplete_identity_mismatch_and_unknown_platform() {
+        let manifest = event_sink_manifest(true, 1);
+        let installing = boot_candidate(
+            "event-plugin",
+            Some(manifest.clone()),
+            &["audit-service"],
+            &["audit-events"],
+            PluginInstallStatus::Installing,
+        );
+        let mut mismatch_manifest = manifest.clone();
+        mismatch_manifest.id = "different-plugin".to_string();
+        let mismatch = boot_candidate(
+            "event-plugin",
+            Some(mismatch_manifest),
+            &["audit-service"],
+            &["audit-events"],
+            PluginInstallStatus::Installed,
+        );
+
+        let installing_plan = reconcile_plugin_boot(&[installing], Some(Platform::Linux));
+        assert_eq!(
+            installing_plan[0].issues,
+            [PluginBootIssue::InstallIncomplete]
+        );
+        assert!(installing_plan[0].service_ids_to_start.is_empty());
+
+        let mismatch_plan = reconcile_plugin_boot(&[mismatch], Some(Platform::Linux));
+        assert!(matches!(
+            mismatch_plan[0].issues.as_slice(),
+            [PluginBootIssue::ManifestIdMismatch { .. }]
+        ));
+        assert!(mismatch_plan[0].service_ids_to_start.is_empty());
+
+        let unknown = boot_candidate(
+            "event-plugin",
+            Some(manifest),
+            &["audit-service"],
+            &["audit-events"],
+            PluginInstallStatus::Installed,
+        );
+        let unknown_plan = reconcile_plugin_boot(&[unknown], None);
+        assert_eq!(unknown_plan[0].issues, [PluginBootIssue::UnknownPlatform]);
+        assert!(unknown_plan[0].service_ids_to_start.is_empty());
+    }
+
+    #[test]
+    fn reconcile_exclusive_covers_service_ids_same_as_other_kinds() {
+        // `reconcile_exclusive` is capability-kind-agnostic (plain `Vec<String>`
+        // in/out), but exercise it explicitly against service ids since
+        // that's a new call site (issue #479's install step).
+        let declared = vec!["svc-a".to_string(), "svc-b".to_string()];
+        let existing = vec!["svc-b".to_string(), "other-plugins-svc".to_string()];
+        let owned_previously: Vec<String> = vec![];
+
+        let reconciliation = reconcile_exclusive(&declared, &existing, &owned_previously);
+        assert_eq!(reconciliation.to_register, vec!["svc-a".to_string()]);
+        assert_eq!(reconciliation.foreign_conflicts, vec!["svc-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn load_empty_file_returns_empty_registry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("installed.json");
+        tokio::fs::create_dir_all(path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&path, "").await.unwrap();
+
+        let loaded = InstalledPlugins::load(&path).await.expect("load");
+        assert!(loaded.plugins.is_empty());
+    }
+}

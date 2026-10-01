@@ -1,0 +1,10 @@
+target
+.git
+.github
+/docs
+/tests
+**/*.log
+.DS_Store
+# Host-side npm install is used only to stage bamboo-server's crate-owned
+# frontend package before the build; include_bytes! needs the zip, not node_modules.
+node_modules

@@ -1,0 +1,656 @@
+use actix_web::{dev::HttpServiceFactory, web};
+
+use crate::handlers::{agent, settings};
+
+fn mcp_scope() -> impl HttpServiceFactory {
+    web::scope("/mcp")
+        .route("/servers", web::get().to(agent::mcp::list_servers))
+        .route("/servers", web::post().to(agent::mcp::add_server))
+        .route(
+            "/servers/import",
+            web::post().to(agent::mcp::import_servers),
+        )
+        .route("/servers/{id}", web::get().to(agent::mcp::get_server))
+        .route("/servers/{id}", web::put().to(agent::mcp::update_server))
+        .route("/servers/{id}", web::delete().to(agent::mcp::delete_server))
+        .route(
+            "/servers/{id}/connect",
+            web::post().to(agent::mcp::connect_server),
+        )
+        .route(
+            "/servers/{id}/disconnect",
+            web::post().to(agent::mcp::disconnect_server),
+        )
+        .route(
+            "/servers/{id}/refresh",
+            web::post().to(agent::mcp::refresh_tools),
+        )
+        .route(
+            "/servers/{id}/tools",
+            web::get().to(agent::mcp::get_server_tools),
+        )
+        .route("/tools", web::get().to(agent::mcp::list_tools))
+}
+
+/// `/api/v1/plugins` — install / update / list / remove (Wave 2 § HTTP
+/// agent, `PLUGIN_PLAN.md`). See `handlers::agent::plugin`'s module docs for
+/// the full request/response contract and the auth-gate note (this scope is
+/// registered inside `agent_routes`'s `/api/v1` scope below, so it inherits
+/// the same `enforce_access_password_middleware` wrap as every other
+/// mutating route here — no new auth was added).
+pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
+    web::scope("/plugins")
+        .route("", web::get().to(agent::plugin::list_plugins))
+        .route("/install", web::post().to(agent::plugin::install_plugin))
+        .route("/{id}/update", web::post().to(agent::plugin::update_plugin))
+        .route("/{id}", web::delete().to(agent::plugin::remove_plugin))
+}
+
+/// `/api/v1/ledger` — HTTP surface over the prospective-record ledger
+/// (Phase 7 of `docs/design/personal-assistant-ledger.md`): list/upsert/
+/// patch/cancel records plus the time-bucketed agenda, so a UI can render a
+/// real todo/calendar over the same store the `ledger` agent tool uses.
+/// Registered inside `agent_routes`'s `/api/v1` scope below, so it inherits
+/// the same `enforce_access_password_middleware` wrap as every other route
+/// here. DELETE is a cancel transition — ledger records are never
+/// hard-deleted.
+fn ledger_scope() -> impl HttpServiceFactory {
+    web::scope("/ledger")
+        .route("/records", web::get().to(agent::ledger::list_records))
+        .route("/records", web::post().to(agent::ledger::upsert_record))
+        .route(
+            "/records/{record_id}",
+            web::patch().to(agent::ledger::patch_record),
+        )
+        .route(
+            "/records/{record_id}",
+            web::delete().to(agent::ledger::delete_record),
+        )
+        .route("/agenda", web::get().to(agent::ledger::agenda))
+}
+
+/// Configure agent API routes (core agent functionality)
+///
+/// Routes for chat, execute, events, stop, history, task, respond, delete, health, metrics, mcp.
+///
+/// Per-session actions (execute/events/stop/history/task/respond/child-approval)
+/// are registered TWICE: once under the canonical nested
+/// `/sessions/{session_id}/…` form, and once more under their original flat
+/// `/…/{session_id}` form as a legacy alias to the identical handler — see the
+/// "canonical nested form" / "legacy flat aliases" comment blocks below.
+/// #251 (finding 4).
+pub fn agent_routes(cfg: &mut web::ServiceConfig) {
+    let mut scope = web::scope("/api/v1")
+        .wrap(actix_web::middleware::from_fn(
+            settings::enforce_access_password_middleware,
+        ))
+        .route("/bootstrap", web::get().to(agent::bootstrap::handler))
+        .route(
+            "/browser/sessions/{session_id}",
+            web::put().to(agent::browser::open),
+        )
+        .route(
+            "/browser/sessions/{session_id}",
+            web::get().to(agent::browser::state),
+        )
+        .route(
+            "/browser/sessions/{session_id}",
+            web::delete().to(agent::browser::close),
+        )
+        .route(
+            "/browser/sessions/{session_id}/tabs",
+            web::post().to(agent::browser::tab_create),
+        )
+        .route(
+            "/browser/sessions/{session_id}/tabs/activate",
+            web::post().to(agent::browser::tab_activate),
+        )
+        .route(
+            "/browser/sessions/{session_id}/tabs/close",
+            web::post().to(agent::browser::tab_close),
+        )
+        .route(
+            "/browser/sessions/{session_id}/navigate",
+            web::post().to(agent::browser::navigate),
+        )
+        .route(
+            "/browser/sessions/{session_id}/history",
+            web::post().to(agent::browser::history),
+        )
+        .route(
+            "/browser/sessions/{session_id}/viewport",
+            web::post().to(agent::browser::viewport),
+        )
+        .route(
+            "/browser/sessions/{session_id}/input",
+            web::post().to(agent::browser::input),
+        )
+        .route(
+            "/browser/sessions/{session_id}/dialog",
+            web::post().to(agent::browser::dialog_respond),
+        )
+        .route(
+            "/browser/sessions/{session_id}/dom",
+            web::get().to(agent::browser::dom),
+        )
+        .route(
+            "/browser/sessions/{session_id}/frame",
+            web::get().to(agent::browser::frame),
+        )
+        .route(
+            "/browser/sessions/{session_id}/screenshot",
+            web::get().to(agent::browser::screenshot),
+        )
+        .route("/chat", web::post().to(agent::chat::handler))
+        .route(
+            "/prompt-presets",
+            web::get().to(agent::prompt_presets::list_prompt_presets),
+        )
+        .route(
+            "/prompt-presets",
+            web::post().to(agent::prompt_presets::create_prompt_preset),
+        )
+        .route(
+            "/prompt-presets/{preset_id}",
+            web::patch().to(agent::prompt_presets::patch_prompt_preset),
+        )
+        .route(
+            "/prompt-presets/{preset_id}",
+            web::delete().to(agent::prompt_presets::delete_prompt_preset),
+        )
+        // Session index / management (V2)
+        .route(
+            "/runs/active",
+            web::get().to(agent::sessions::running_sessions_snapshot),
+        )
+        .route(
+            "/subagents/snapshot",
+            web::get().to(agent::subagent_snapshot::handler),
+        )
+        .route(
+            "/actors/{root_id}/snapshot",
+            web::get().to(agent::actor_snapshot::handler),
+        )
+        .route(
+            "/sessions/{session_id}/guidance",
+            web::get().to(agent::guidance::list),
+        )
+        .route(
+            "/sessions/{session_id}/guidance",
+            web::post().to(agent::guidance::send),
+        )
+        .route(
+            "/sessions/{session_id}/guidance/{message_id}",
+            web::delete().to(agent::guidance::cancel),
+        )
+        .route(
+            "/sessions/{session_id}/dead-letters",
+            web::get().to(agent::dead_letters::inspect),
+        )
+        .route(
+            "/sessions/{session_id}/dead-letters/{message_id}/retry",
+            web::post().to(agent::dead_letters::retry),
+        )
+        .route("/sessions", web::get().to(agent::sessions::list_sessions))
+        .route("/sessions", web::post().to(agent::sessions::create_session))
+        .route(
+            "/session-create-operations/{key}",
+            web::get().to(agent::sessions::get_session_create_operation),
+        )
+        // First-class Project registry. Register the literal migration route
+        // before `/{id}` so it cannot be captured as a Project id.
+        .route(
+            "/projects/migrations/legacy/dry-run",
+            web::post().to(agent::projects::legacy_dry_run),
+        )
+        .route("/projects", web::get().to(agent::projects::list_projects))
+        .route("/projects", web::post().to(agent::projects::create_project))
+        .route(
+            "/projects/{project_id}",
+            web::get().to(agent::projects::get_project),
+        )
+        .route(
+            "/projects/{project_id}",
+            web::patch().to(agent::projects::patch_project),
+        )
+        .route(
+            "/projects/{project_id}/workspaces",
+            web::post().to(agent::projects::bind_workspace),
+        )
+        .route(
+            "/projects/{project_id}/workspaces",
+            web::delete().to(agent::projects::unbind_workspace),
+        )
+        .route(
+            "/projects/{project_id}/resources",
+            web::get().to(agent::projects::project_resources),
+        )
+        .route(
+            "/projects/{project_id}/archive",
+            web::post().to(agent::projects::archive_project),
+        )
+        .route(
+            "/projects/{project_id}/unarchive",
+            web::post().to(agent::projects::unarchive_project),
+        )
+        .route(
+            "/sessions/cleanup",
+            web::post().to(agent::sessions::cleanup_sessions),
+        )
+        .route(
+            "/sessions/{session_id}",
+            web::get().to(agent::sessions::get_session),
+        )
+        .route(
+            "/sessions/{session_id}/root-mode-operations/{operation_id}",
+            web::post().to(agent::sessions::select_root_mode),
+        )
+        .route(
+            "/sessions/{session_id}/named-agent-profiles",
+            web::get().to(agent::named_agent_catalog::handler),
+        )
+        .route(
+            "/sessions/{session_id}/root-mode-operations/{operation_id}/recover",
+            web::post().to(agent::sessions::recover_root_mode),
+        )
+        .route(
+            "/sessions/{session_id}/copy",
+            web::post().to(agent::sessions::copy_session),
+        )
+        .route(
+            "/sessions/{session_id}/system-prompt",
+            web::get().to(agent::sessions::get_system_prompt_snapshot),
+        )
+        .route(
+            "/sessions/{session_id}/discoverable-tools",
+            web::get().to(agent::sessions::list_discoverable_tools),
+        )
+        .route(
+            "/sessions/{session_id}/discoverable-tools",
+            web::post().to(agent::sessions::activate_discoverable_tools),
+        )
+        .route(
+            "/sessions/{session_id}/discoverable-tools",
+            web::delete().to(agent::sessions::deactivate_discoverable_tools),
+        )
+        .route(
+            "/sessions/{session_id}",
+            web::patch().to(agent::sessions::patch_session),
+        )
+        .route(
+            "/sessions/{session_id}/regenerate-title",
+            web::post().to(agent::sessions::regenerate_session_title),
+        )
+        .route(
+            "/sessions/{session_id}/clear",
+            web::post().to(agent::sessions::clear_session),
+        )
+        .route(
+            "/sessions/{session_id}/project-dream/run",
+            web::post().to(agent::sessions::run_project_dream),
+        )
+        // Message management
+        .route(
+            "/sessions/{session_id}/messages/truncate",
+            web::post().to(agent::messages::truncate_messages),
+        )
+        .route(
+            "/sessions/{session_id}/restore",
+            web::post().to(agent::messages::restore_session_state),
+        )
+        .route(
+            "/sessions/{session_id}/messages/{message_id}",
+            web::patch().to(agent::messages::patch_message),
+        )
+        .route(
+            "/sessions/{session_id}/messages/{message_id}",
+            web::delete().to(agent::messages::delete_message),
+        )
+        .route(
+            "/sessions/{session_id}/attachments/{attachment_id}",
+            web::get().to(agent::sessions::get_attachment),
+        )
+        // Schedules (timed tasks)
+        .route(
+            "/schedules",
+            web::get().to(agent::schedules::list_schedules),
+        )
+        .route(
+            "/schedules",
+            web::post().to(agent::schedules::create_schedule),
+        )
+        .route(
+            "/schedules/{schedule_id}",
+            web::patch().to(agent::schedules::patch_schedule),
+        )
+        .route(
+            "/schedules/{schedule_id}",
+            web::delete().to(agent::schedules::delete_schedule),
+        )
+        .route(
+            "/schedules/{schedule_id}/run",
+            web::post().to(agent::schedules::run_now),
+        )
+        .route(
+            "/schedules/{schedule_id}/sessions",
+            web::get().to(agent::schedules::list_sessions_for_schedule),
+        )
+        .route(
+            "/schedules/{schedule_id}/runs",
+            web::get().to(agent::schedules::list_runs_for_schedule),
+        )
+        // New separated execute + events endpoints
+        // `/execute/defaults` MUST be registered before the `/execute/{session_id}`
+        // dynamic route below (same precedent as `/sessions/cleanup` vs
+        // `/sessions/{session_id}` above) so a literal `defaults` path segment
+        // isn't swallowed as a session id.
+        .route(
+            "/execute/defaults",
+            web::get().to(agent::execute::defaults_handler),
+        )
+        // ── Session sub-resources — canonical nested form (#251 finding 4) ──
+        // Every per-session action below is nested under `/sessions/{session_id}/…`,
+        // matching the already-nested `messages`/`attachments` sub-resources. The
+        // flat root-level siblings further down (`/execute/{id}`, `/events/{id}`,
+        // `/stop/{id}`, `/history/{id}`, `/task/{id}`, `/respond/{id}`,
+        // `/child-approval/{id}`) are kept registered as LEGACY ALIASES pointing at
+        // the exact same handlers — old clients (Lotus, bamboo CLI/SDK, magpie)
+        // keep working unchanged. New callers should prefer the nested form.
+        .route(
+            "/sessions/{session_id}/execute",
+            web::post().to(agent::execute::handler),
+        )
+        .route(
+            "/sessions/{session_id}/events",
+            web::get().to(agent::events::handler),
+        )
+        .route(
+            "/sessions/{session_id}/stop",
+            web::post().to(agent::stop::handler),
+        )
+        .route(
+            "/sessions/{session_id}/history",
+            web::get().to(agent::history::handler),
+        )
+        .route(
+            "/sessions/{session_id}/task",
+            web::get().to(agent::task::get_task_list),
+        )
+        .route(
+            "/sessions/{session_id}/task/exists",
+            web::get().to(agent::task::has_task_list),
+        )
+        .route(
+            "/sessions/{session_id}/respond",
+            web::post().to(agent::respond::submit_response),
+        )
+        .route(
+            "/sessions/{session_id}/respond/pending",
+            web::get().to(agent::respond::get_pending_question),
+        )
+        .route(
+            "/sessions/{session_id}/permission-decisions",
+            web::post().to(agent::respond::submit_permission_decision),
+        )
+        // Phase 2: deliver a human approval decision to a child sub-agent's
+        // blocked gated tool (surfaced via AgentEvent::ChildApprovalRequested).
+        .route(
+            "/sessions/{child_session_id}/child-approval",
+            web::post().to(agent::child_approval::handler),
+        )
+        // ── Legacy flat aliases (#251 finding 4) — kept byte-identical to their
+        // pre-refactor paths, wired to the SAME handlers as the nested routes
+        // above, so no existing client breaks.
+        .route(
+            "/execute/{session_id}",
+            web::post().to(agent::execute::handler),
+        )
+        .route(
+            "/events/{session_id}",
+            web::get().to(agent::events::handler),
+        )
+        // Account-scoped change feed: one resumable SSE stream across all
+        // sessions (multi-client sync, replaces session-index polling).
+        .route("/stream", web::get().to(agent::stream::handler))
+        .route("/stop/{session_id}", web::post().to(agent::stop::handler))
+        .route(
+            "/child-approval/{child_session_id}",
+            web::post().to(agent::child_approval::handler),
+        )
+        .route(
+            "/history/{session_id}",
+            web::get().to(agent::history::handler),
+        )
+        .route(
+            "/task/{session_id}",
+            web::get().to(agent::task::get_task_list),
+        )
+        .route(
+            "/task/{session_id}/exists",
+            web::get().to(agent::task::has_task_list),
+        )
+        .route(
+            "/respond/{session_id}",
+            web::post().to(agent::respond::submit_response),
+        )
+        .route(
+            "/respond/{session_id}/pending",
+            web::get().to(agent::respond::get_pending_question),
+        )
+        // Notification preferences (backend-owned; replaces frontend localStorage)
+        .route(
+            "/notifications/preferences",
+            web::get().to(agent::notifications::get_preferences),
+        )
+        .route(
+            "/notifications/preferences",
+            web::put().to(agent::notifications::update_preferences),
+        )
+        .route(
+            "/notifications/test",
+            web::post().to(agent::notifications::send_test_notification),
+        )
+        .route(
+            "/sessions/{session_id}",
+            web::delete().to(agent::delete::handler),
+        )
+        .route("/health", web::get().to(agent::health::handler))
+        // Metrics routes (agent metrics)
+        .route("/metrics/summary", web::get().to(agent::metrics::summary))
+        .route("/metrics/by-model", web::get().to(agent::metrics::by_model))
+        .route("/metrics/sessions", web::get().to(agent::metrics::sessions))
+        .route(
+            "/metrics/sessions/{session_id}",
+            web::get().to(agent::metrics::session_detail),
+        )
+        .route("/metrics/daily", web::get().to(agent::metrics::daily))
+        .route(
+            "/metrics/usage-breakdown",
+            web::get().to(agent::metrics::usage_breakdown),
+        )
+        .route(
+            "/metrics/memory/summary",
+            web::get().to(agent::metrics::memory_summary),
+        )
+        .route(
+            "/metrics/memory/timeline",
+            web::get().to(agent::metrics::memory_timeline),
+        )
+        .route(
+            "/metrics/persistence",
+            web::get().to(agent::metrics::persistence),
+        )
+        // Forward metrics routes (API proxy metrics)
+        .route(
+            "/metrics/forward/summary",
+            web::get().to(agent::metrics::forward_summary),
+        )
+        .route(
+            "/metrics/forward/by-endpoint",
+            web::get().to(agent::metrics::forward_by_endpoint),
+        )
+        .route(
+            "/metrics/forward/requests",
+            web::get().to(agent::metrics::forward_requests),
+        )
+        .route(
+            "/metrics/v2/summary",
+            web::get().to(agent::metrics::v2_unified_summary),
+        )
+        .route(
+            "/metrics/v2/timeline",
+            web::get().to(agent::metrics::v2_unified_timeline),
+        )
+        // MCP routes
+        .service(mcp_scope());
+
+    // Plugin routes (Wave 2 § HTTP agent, PLUGIN_PLAN.md): install/update/
+    // list/remove over /api/v1/plugins. Appended after the existing service
+    // registrations above (not folded into the same builder chain) per
+    // PLUGIN_PLAN.md's append-only convention for this file, to minimize
+    // cross-branch conflicts with the other Wave-2 branches touching this
+    // same builder. Sits behind the SAME `enforce_access_password_middleware`
+    // wrap as everything else in this scope — see `plugin_scope`'s doc
+    // comment.
+    scope = scope.service(plugin_scope());
+
+    // Ledger routes (personal-assistant ledger, Phase 7): appended after the
+    // existing registrations per this file's append-only convention. Same
+    // access-password middleware as everything else in this scope — see
+    // `ledger_scope`'s doc comment.
+    scope = scope.service(ledger_scope());
+
+    // Dev-only endpoints are a greenfield wipe of ALL sessions (`dev_reset`) with
+    // no auth. Register them ONLY when explicitly enabled, so a production/Docker
+    // deployment (release build, no env) never exposes an unauthenticated
+    // data-wipe POST. #11.
+    if dev_endpoints_enabled() {
+        scope = scope.route("/dev/reset", web::post().to(agent::dev::reset));
+    }
+
+    // Bamboo internal routes (commands/settings/skills/tools/workspace/
+    // copilot/provider-catalog/provider-instances/cluster-fabric) — nested
+    // into this SAME `/api/v1` scope (not a second competing
+    // `Scope("/api/v1")`) so they become reachable at the canonical prefix
+    // while a separate `/v1` scope (`routes::bamboo_v1::bamboo_v1_routes`)
+    // keeps mounting the identical routes as a legacy alias. #251 (finding 1)
+    // — see `bamboo_v1::bamboo_relative_routes`'s doc comment for why this
+    // must be a nested `.service()` call rather than its own top-level scope.
+    // MUST be registered LAST in this scope: its own path prefix is empty
+    // (`""`), which matches as a prefix of every remaining path — actix hands
+    // a matched scope the whole request and does not fall through to
+    // resources registered after it, so anything registered later here would
+    // be silently shadowed (caught by
+    // `dev_reset_route_registered_when_dev_endpoints_enabled` during
+    // development, when `/dev/reset` 404'd after being registered before
+    // this line).
+    scope = scope.service(super::bamboo_v1::bamboo_relative_routes());
+
+    cfg.service(scope);
+
+    // Unversioned liveness/readiness probes (#251 finding 6). Registered at the
+    // root — OUTSIDE the `/api/v1` scope and its access-password middleware — so
+    // load balancers / Kubernetes can probe a stable, unauthenticated path. Both
+    // are on the public allow-list in `is_public_access_route`; registering them
+    // before the SPA static fallback means the fallback never shadows them.
+    cfg.route("/healthz", web::get().to(agent::health::healthz));
+    cfg.route("/readyz", web::get().to(agent::health::readyz));
+
+    // v2-P1 (#181): the unified WebSocket multiplex. A single `GET /v2/stream`
+    // WS replaces the two v1 SSE streams plus a `stop` control uplink. Behind
+    // the SAME access-password middleware as `/api/v1`, so `local_bypass` keeps
+    // desktop loopback frictionless and public access still requires the
+    // password. The v1 SSE/REST endpoints above stay unchanged (dual-track).
+    // v2-P2 (#181): `/v2/pair` is on the public whitelist (a new device has no
+    // credential yet) and self-gates via the owner root password in its body.
+    // `/v2/stream` stays GATED by the same middleware.
+    // v2-P2 (#181, slice 2): `/v2/pair/code` (request a one-time code) and the
+    // `/v2/devices` management endpoints (list / revoke / rotate) are all GATED
+    // by the same middleware — only `/v2/pair` itself is on the public whitelist,
+    // because a brand-new device redeeming a code has no credential yet.
+    let v2_scope = web::scope("/v2")
+        .wrap(actix_web::middleware::from_fn(
+            settings::enforce_access_password_middleware,
+        ))
+        .route("/pair", web::post().to(settings::pair_device))
+        .route("/pair/code", web::post().to(settings::create_pairing_code))
+        .route("/devices", web::get().to(settings::list_devices))
+        .route(
+            "/devices/{device_id}",
+            web::delete().to(settings::revoke_device),
+        )
+        .route(
+            "/devices/{device_id}/rotate",
+            web::post().to(settings::rotate_device),
+        )
+        .route("/stream", web::get().to(agent::ws_v2::handler));
+    cfg.service(v2_scope);
+
+    // (The `/v1/agents` HTTP control-plane registry was retired in Phase 3 — the
+    // mailbox bus's connection table is the live-actor registry now; schedulable
+    // selection queries it via `ListConnected`.)
+}
+
+/// Whether the dev-only HTTP endpoints (e.g. `POST /api/v1/dev/reset`) should be
+/// registered. OFF by default in release builds; ON in debug builds (the local
+/// dev workflow) or when `BAMBOO_ENABLE_DEV_ENDPOINTS` is explicitly truthy. #11.
+fn dev_endpoints_enabled() -> bool {
+    cfg!(debug_assertions) || dev_endpoints_env_enabled()
+}
+
+/// The env-var half of [`dev_endpoints_enabled`], split out so it's testable
+/// independently of the build profile (`cfg!(debug_assertions)` is always true
+/// under `cargo test`).
+fn dev_endpoints_env_enabled() -> bool {
+    std::env::var("BAMBOO_ENABLE_DEV_ENDPOINTS")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod dev_gate_tests {
+    use super::dev_endpoints_env_enabled;
+
+    const VAR: &str = "BAMBOO_ENABLE_DEV_ENDPOINTS";
+
+    // Single test so the process-global env var is mutated serially (no other test
+    // reads this var). Saves/restores any pre-existing value.
+    #[test]
+    fn dev_endpoints_env_gate_is_off_by_default_and_only_on_for_truthy_values() {
+        let saved = std::env::var(VAR).ok();
+
+        std::env::remove_var(VAR);
+        assert!(
+            !dev_endpoints_env_enabled(),
+            "unset -> dev endpoints OFF (production default)"
+        );
+
+        for off in ["0", "false", "no", "off", "", "  ", "maybe"] {
+            std::env::set_var(VAR, off);
+            assert!(
+                !dev_endpoints_env_enabled(),
+                "{off:?} must NOT enable dev endpoints"
+            );
+        }
+
+        for on in [
+            "1", "true", "TRUE", "True", "yes", "Yes", "on", "ON", " on ",
+        ] {
+            std::env::set_var(VAR, on);
+            assert!(
+                dev_endpoints_env_enabled(),
+                "{on:?} must enable dev endpoints"
+            );
+        }
+
+        match saved {
+            Some(v) => std::env::set_var(VAR, v),
+            None => std::env::remove_var(VAR),
+        }
+    }
+}

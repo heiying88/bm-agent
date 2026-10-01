@@ -1,0 +1,39 @@
+[package]
+name = "bamboo-storage"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Session storage backends for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-skills = { path = "../bamboo-skills" }
+bamboo-subagent = { path = "../bamboo-subagent" }
+serde = { workspace = true }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+chrono = { workspace = true }
+uuid = { workspace = true }
+base64 = "0.23"
+dashmap = "6"
+fs2 = "0.4"
+sha2 = { workspace = true }
+rusqlite = { version = "0.40", features = ["bundled", "chrono", "functions"] }
+tracing = "0.1"
+
+[features]
+# Deterministic persistence pause hooks used by higher-layer integration tests.
+# Production builds keep these hooks compiled out.
+test-utils = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

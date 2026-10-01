@@ -1,0 +1,49 @@
+[package]
+name = "bamboo-sdk"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Ergonomic top-level Agent SDK facade for the Bamboo agent framework"
+license = "MIT"
+repository = "https://github.com/bigduu/Bamboo-agent"
+keywords = ["ai", "agent", "llm", "sdk", "mcp"]
+categories = ["artificial-intelligence", "development-tools", "asynchronous"]
+
+[dependencies]
+# Workspace crates (leaf-only: never depends on bamboo-server)
+bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
+bamboo-llm = { path = "../../infra/bamboo-llm" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-engine = { path = "../../engine/bamboo-engine" }
+bamboo-metrics = { path = "../../infra/bamboo-metrics" }
+bamboo-skills = { path = "../../infra/bamboo-skills" }
+bamboo-storage = { path = "../../infra/bamboo-storage" }
+bamboo-tools = { path = "../../engine/bamboo-tools" }
+bamboo-mcp = { path = "../../infra/bamboo-mcp" }
+bamboo-projects = { path = "../../infra/bamboo-projects" }
+bamboo-plugin-protocol = { path = "../../infra/bamboo-plugin-protocol" }
+bamboo-server-tools = { path = "../bamboo-server-tools" }
+
+# Async runtime (sync: mpsc/RwLock; rt: tokio::spawn)
+tokio = { version = "1", features = ["sync", "rt"] }
+tokio-util = "0.7"
+
+# Serialization (fabricate a minimal provider stanza for `.api_key()`)
+serde_json = "1"
+
+# Typed errors + the `SessionAccess` trait implementation on `Agent`.
+thiserror = "2"
+async-trait = "0.1"
+
+# Logging
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+futures = "0.3"
+# Test-only: asserting the exact `ParentFrame` a `child_approval` delivery
+# sends over the live actor channel (see reexecute_and_child_approval_tests).
+bamboo-subagent = { path = "../../infra/bamboo-subagent" }

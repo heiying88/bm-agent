@@ -1,0 +1,40 @@
+[package]
+name = "bamboo-tui"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license = "MIT"
+authors = ["mugeng.du@gmail.com"]
+description = "Terminal UI client for the Bamboo agent runtime"
+
+[[bin]]
+name = "bamboo-tui"
+path = "src/main.rs"
+
+[dependencies]
+bamboo-client-core = { path = "../../app/bamboo-client-core" }
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# TUI
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+tui-textarea-2 = "0.12"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP (SSE is hand-rolled over reqwest's byte stream — no eventsource crate)
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "native-tls", "charset", "http2", "system-proxy"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.23"
+unicode-width = "0.2"
+unicode-segmentation = "1"

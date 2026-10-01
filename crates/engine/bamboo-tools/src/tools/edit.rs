@@ -1,0 +1,1576 @@
+use async_trait::async_trait;
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
+use serde::Deserialize;
+use serde_json::json;
+use std::collections::HashSet;
+use std::path::Path;
+
+use super::read_tracker::{BaselineAdvance, ReadState};
+use super::{content_diagnostics, file_change, read_tracker};
+
+const MAX_PATCH_BYTES: usize = 256 * 1024;
+const MAX_PATCH_BLOCKS: usize = 128;
+const MAX_PATCH_BLOCK_BYTES: usize = 64 * 1024;
+const MAX_SAFE_EDIT_SCOPE_LINES: usize = 120;
+const MAX_SAFE_REPLACE_ALL_OCCURRENCES: usize = 8;
+const MAX_SAFE_REPLACE_ALL_SCOPE_LINES: usize = 80;
+const MIN_REPLACE_ALL_NON_WHITESPACE_CHARS: usize = 2;
+const MIN_REPLACE_ALL_LINES: usize = 1;
+
+#[derive(Debug, Deserialize)]
+struct EditArgs {
+    file_path: String,
+    #[serde(default)]
+    old_string: Option<String>,
+    #[serde(default)]
+    new_string: Option<String>,
+    #[serde(default)]
+    replace_all: Option<bool>,
+    #[serde(default)]
+    patch: Option<String>,
+    #[serde(default)]
+    line_number: Option<usize>,
+}
+
+pub struct EditTool;
+
+#[derive(Debug, Clone)]
+struct ReplacementCandidate {
+    start: usize,
+    matched_len: usize,
+    replacement: String,
+    start_line: usize,
+    end_line: usize,
+}
+
+#[derive(Debug, Clone)]
+struct AppliedEdit {
+    updated: String,
+    replacements: usize,
+}
+
+impl EditTool {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn to_lf(value: &str) -> String {
+        value.replace("\r\n", "\n")
+    }
+
+    fn to_crlf(value: &str) -> String {
+        Self::to_lf(value).replace('\n', "\r\n")
+    }
+
+    fn has_meaningful_optional_text(value: Option<&str>) -> bool {
+        value.is_some_and(|text| !text.is_empty())
+    }
+
+    fn line_starts(content: &str) -> Vec<usize> {
+        let mut starts = vec![0usize];
+        for (idx, byte) in content.bytes().enumerate() {
+            if byte == b'\n' && idx + 1 < content.len() {
+                starts.push(idx + 1);
+            }
+        }
+        starts
+    }
+
+    fn line_for_offset(line_starts: &[usize], offset: usize) -> usize {
+        line_starts.partition_point(|line_start| *line_start <= offset)
+    }
+
+    fn has_candidate_containing_line(
+        candidates: &[ReplacementCandidate],
+        line_number: usize,
+    ) -> bool {
+        candidates.iter().any(|candidate| {
+            candidate.start_line <= line_number && line_number <= candidate.end_line
+        })
+    }
+
+    fn validate_replace_all_scope(old_string: &str) -> Result<(), ToolError> {
+        let non_whitespace_chars = old_string.chars().filter(|ch| !ch.is_whitespace()).count();
+        if non_whitespace_chars < MIN_REPLACE_ALL_NON_WHITESPACE_CHARS {
+            return Err(ToolError::InvalidArguments(format!(
+                "replace_all requires old_string to contain at least {} non-whitespace characters",
+                MIN_REPLACE_ALL_NON_WHITESPACE_CHARS
+            )));
+        }
+
+        let non_empty_lines = old_string
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if non_empty_lines < MIN_REPLACE_ALL_LINES {
+            return Err(ToolError::InvalidArguments(
+                "replace_all requires old_string to contain at least one non-empty line"
+                    .to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn ensure_safe_scope(
+        replace_all: bool,
+        replacements: usize,
+        touched_lines: usize,
+    ) -> Result<(), ToolError> {
+        if replace_all && replacements > MAX_SAFE_REPLACE_ALL_OCCURRENCES {
+            return Err(ToolError::Execution(format!(
+                "replace_all would modify {} occurrences, exceeding the safe limit of {}; provide a more specific old_string or use patch mode",
+                replacements, MAX_SAFE_REPLACE_ALL_OCCURRENCES
+            )));
+        }
+
+        let max_scope = if replace_all {
+            MAX_SAFE_REPLACE_ALL_SCOPE_LINES
+        } else {
+            MAX_SAFE_EDIT_SCOPE_LINES
+        };
+
+        if touched_lines > max_scope {
+            let guidance = if replace_all {
+                "provide a more specific old_string or use patch mode"
+            } else {
+                "split the change into smaller patches or use Write for intentional full-file rewrites"
+            };
+            return Err(ToolError::Execution(format!(
+                "Edit would touch {} diff lines, exceeding the safe limit of {}; {}",
+                touched_lines, max_scope, guidance
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn replacement_variants(
+        content: &str,
+        old_text: &str,
+        new_text: &str,
+    ) -> Vec<(String, String)> {
+        let mut variants: Vec<(String, String)> = Vec::new();
+        let mut seen_variants: HashSet<(String, String)> = HashSet::new();
+        let mut push_variant = |search: String, replace: String| {
+            if seen_variants.insert((search.clone(), replace.clone())) {
+                variants.push((search, replace));
+            }
+        };
+
+        push_variant(old_text.to_string(), new_text.to_string());
+        push_variant(Self::to_lf(old_text), Self::to_lf(new_text));
+        if content.contains("\r\n") {
+            push_variant(Self::to_crlf(old_text), Self::to_crlf(new_text));
+        }
+
+        variants
+    }
+
+    fn collect_candidates(
+        content: &str,
+        old_text: &str,
+        new_text: &str,
+    ) -> Vec<ReplacementCandidate> {
+        let variants = Self::replacement_variants(content, old_text, new_text);
+        let line_starts = Self::line_starts(content);
+        let mut out: Vec<ReplacementCandidate> = Vec::new();
+        let mut seen_matches: HashSet<(usize, usize, String)> = HashSet::new();
+
+        for (search, replacement) in variants {
+            if search.is_empty() {
+                continue;
+            }
+            for (start, _) in content.match_indices(&search) {
+                let matched_len = search.len();
+                let end = start + matched_len - 1;
+                let candidate = ReplacementCandidate {
+                    start,
+                    matched_len,
+                    replacement: replacement.clone(),
+                    start_line: Self::line_for_offset(&line_starts, start),
+                    end_line: Self::line_for_offset(&line_starts, end),
+                };
+                if seen_matches.insert((start, matched_len, candidate.replacement.clone())) {
+                    out.push(candidate);
+                }
+            }
+        }
+
+        out.sort_by_key(|candidate| candidate.start);
+        out
+    }
+
+    fn candidate_line_summary(candidates: &[ReplacementCandidate]) -> String {
+        let mut lines = candidates
+            .iter()
+            .map(|candidate| candidate.start_line.to_string())
+            .collect::<Vec<_>>();
+        lines.sort();
+        lines.dedup();
+        lines.join(", ")
+    }
+
+    fn choose_candidate_with_line_hint(
+        candidates: &[ReplacementCandidate],
+        line_number: usize,
+    ) -> Option<ReplacementCandidate> {
+        let containing = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.start_line <= line_number && line_number <= candidate.end_line
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if containing.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<ReplacementCandidate> = None;
+        let mut best_distance = usize::MAX;
+        let mut tie = false;
+
+        for candidate in containing {
+            let distance = candidate.start_line.abs_diff(line_number);
+            if distance < best_distance {
+                best_distance = distance;
+                best = Some(candidate);
+                tie = false;
+            } else if distance == best_distance {
+                tie = true;
+            }
+        }
+
+        if tie {
+            None
+        } else {
+            best
+        }
+    }
+
+    fn apply_single_replacement(
+        content: &str,
+        old_string: &str,
+        new_string: &str,
+        replace_all: bool,
+        line_number: Option<usize>,
+    ) -> Result<AppliedEdit, ToolError> {
+        if old_string == new_string {
+            return Err(ToolError::InvalidArguments(
+                "new_string must be different from old_string".to_string(),
+            ));
+        }
+        if old_string.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "old_string must be non-empty".to_string(),
+            ));
+        }
+
+        if let Some(line) = line_number {
+            if line == 0 {
+                return Err(ToolError::InvalidArguments(
+                    "line_number must be >= 1".to_string(),
+                ));
+            }
+            if replace_all {
+                return Err(ToolError::InvalidArguments(
+                    "line_number cannot be combined with replace_all=true".to_string(),
+                ));
+            }
+        }
+
+        let candidates = Self::collect_candidates(content, old_string, new_string);
+
+        if candidates.is_empty() {
+            return Err(ToolError::Execution(
+                "old_string not found in target file".to_string(),
+            ));
+        }
+
+        if !replace_all && candidates.len() != 1 && line_number.is_none() {
+            return Err(ToolError::Execution(format!(
+                "old_string matched {} times; provide a more specific old_string, set line_number, or use patch mode with additional context",
+                candidates.len()
+            )));
+        }
+
+        if replace_all {
+            Self::validate_replace_all_scope(old_string)?;
+            let variants = Self::replacement_variants(content, old_string, new_string);
+            for (search, replacement) in variants {
+                let matches = content.match_indices(&search).count();
+                if matches > 0 {
+                    return Ok(AppliedEdit {
+                        updated: content.replace(&search, &replacement),
+                        replacements: matches,
+                    });
+                }
+            }
+
+            return Ok(AppliedEdit {
+                updated: content.to_string(),
+                replacements: 0,
+            });
+        }
+
+        let chosen = if let Some(line) = line_number {
+            match Self::choose_candidate_with_line_hint(&candidates, line) {
+                Some(candidate) => candidate,
+                None if Self::has_candidate_containing_line(&candidates, line) => {
+                    return Err(ToolError::Execution(format!(
+                        "old_string matched {} times and line_number={} was not unique among candidates containing that line; candidate start lines: {}. Provide a more specific old_string or patch context",
+                        candidates.len(),
+                        line,
+                        Self::candidate_line_summary(&candidates),
+                    )));
+                }
+                None => {
+                    return Err(ToolError::Execution(format!(
+                        "line_number={} did not match any old_string candidate; candidate start lines: {}. Provide a line_number within the target match or use patch context",
+                        line,
+                        Self::candidate_line_summary(&candidates),
+                    )));
+                }
+            }
+        } else {
+            candidates[0].clone()
+        };
+
+        let mut next = String::with_capacity(
+            content.len().saturating_sub(chosen.matched_len) + chosen.replacement.len(),
+        );
+        next.push_str(&content[..chosen.start]);
+        next.push_str(&chosen.replacement);
+        next.push_str(&content[chosen.start + chosen.matched_len..]);
+
+        Ok(AppliedEdit {
+            updated: next,
+            replacements: 1,
+        })
+    }
+
+    fn parse_patch_blocks(patch: &str) -> Result<Vec<(String, String)>, ToolError> {
+        const SEARCH: &str = "<<<<<<< SEARCH\n";
+        const SEP: &str = "\n=======\n";
+        const REPLACE: &str = "\n>>>>>>> REPLACE";
+
+        let normalized = patch.replace("\r\n", "\n");
+        if normalized.trim().is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "patch must be non-empty".to_string(),
+            ));
+        }
+        if normalized.len() > MAX_PATCH_BYTES {
+            return Err(ToolError::InvalidArguments(format!(
+                "patch exceeds max size of {} bytes",
+                MAX_PATCH_BYTES
+            )));
+        }
+
+        let mut cursor = 0usize;
+        let mut blocks = Vec::new();
+        while let Some(start_rel) = normalized[cursor..].find(SEARCH) {
+            if blocks.len() >= MAX_PATCH_BLOCKS {
+                return Err(ToolError::InvalidArguments(format!(
+                    "patch exceeds max block count of {}",
+                    MAX_PATCH_BLOCKS
+                )));
+            }
+            let search_start = cursor + start_rel + SEARCH.len();
+            let sep_rel = normalized[search_start..].find(SEP).ok_or_else(|| {
+                ToolError::InvalidArguments("Malformed patch block: missing =======".to_string())
+            })?;
+            let sep_idx = search_start + sep_rel;
+            let replace_start = sep_idx + SEP.len();
+            let replace_rel = normalized[replace_start..].find(REPLACE).ok_or_else(|| {
+                ToolError::InvalidArguments(
+                    "Malformed patch block: missing >>>>>>> REPLACE".to_string(),
+                )
+            })?;
+            let replace_idx = replace_start + replace_rel;
+
+            let old_block = normalized[search_start..sep_idx].to_string();
+            let new_block = normalized[replace_start..replace_idx].to_string();
+            if old_block.is_empty() {
+                return Err(ToolError::InvalidArguments(
+                    "Patch SEARCH block must be non-empty".to_string(),
+                ));
+            }
+            if old_block.len() > MAX_PATCH_BLOCK_BYTES || new_block.len() > MAX_PATCH_BLOCK_BYTES {
+                return Err(ToolError::InvalidArguments(format!(
+                    "Patch block exceeds max block size of {} bytes",
+                    MAX_PATCH_BLOCK_BYTES
+                )));
+            }
+            blocks.push((old_block, new_block));
+
+            cursor = replace_idx + REPLACE.len();
+            if normalized[cursor..].starts_with('\n') {
+                cursor += 1;
+            }
+        }
+
+        if blocks.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "patch must contain at least one SEARCH/REPLACE block".to_string(),
+            ));
+        }
+
+        Ok(blocks)
+    }
+
+    fn apply_patch_mode(
+        content: &str,
+        patch: &str,
+        line_number: Option<usize>,
+    ) -> Result<AppliedEdit, ToolError> {
+        if let Some(line) = line_number {
+            if line == 0 {
+                return Err(ToolError::InvalidArguments(
+                    "line_number must be >= 1".to_string(),
+                ));
+            }
+        }
+        let blocks = Self::parse_patch_blocks(patch)?;
+        let mut updated = content.to_string();
+        let mut replacements = 0usize;
+
+        for (idx, (old_block, new_block)) in blocks.iter().enumerate() {
+            let candidates = Self::collect_candidates(&updated, old_block, new_block);
+
+            if candidates.is_empty() {
+                return Err(ToolError::Execution(format!(
+                    "Patch block {} SEARCH content not found in target file",
+                    idx + 1
+                )));
+            }
+
+            let chosen = if candidates.len() == 1 {
+                candidates[0].clone()
+            } else if let Some(line) = line_number {
+                match Self::choose_candidate_with_line_hint(&candidates, line) {
+                    Some(candidate) => candidate,
+                    None if Self::has_candidate_containing_line(&candidates, line) => {
+                        return Err(ToolError::Execution(format!(
+                            "Patch block {} SEARCH content matched {} times and line_number={} was not unique among candidates containing that line; candidate start lines: {}. Add more context to make it unique",
+                            idx + 1,
+                            candidates.len(),
+                            line,
+                            Self::candidate_line_summary(&candidates),
+                        )));
+                    }
+                    None => {
+                        return Err(ToolError::Execution(format!(
+                            "Patch block {} line_number={} did not match any SEARCH candidate; candidate start lines: {}. Add more context or use a line within the target block",
+                            idx + 1,
+                            line,
+                            Self::candidate_line_summary(&candidates),
+                        )));
+                    }
+                }
+            } else {
+                return Err(ToolError::Execution(format!(
+                    "Patch block {} SEARCH content matched {} times; set line_number or add more context to make it unique",
+                    idx + 1,
+                    candidates.len()
+                )));
+            };
+
+            let mut next = String::with_capacity(
+                updated.len().saturating_sub(chosen.matched_len) + chosen.replacement.len(),
+            );
+            next.push_str(&updated[..chosen.start]);
+            next.push_str(&chosen.replacement);
+            next.push_str(&updated[chosen.start + chosen.matched_len..]);
+            updated = next;
+            replacements += 1;
+        }
+
+        Ok(AppliedEdit {
+            updated,
+            replacements,
+        })
+    }
+}
+
+impl Default for EditTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Tool for EditTool {
+    fn name(&self) -> &str {
+        "Edit"
+    }
+
+    fn description(&self) -> &str {
+        "Edit existing files via exact replacements or SEARCH/REPLACE patch blocks. IMPORTANT: call Read first in this session or Edit will fail."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to modify"
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Legacy mode only: exact text to replace. Do not send with patch mode."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Legacy mode only: replacement text. Do not send with patch mode."
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Legacy mode only: replace all occurrences. Do not send with patch mode."
+                },
+                "patch": {
+                    "type": "string",
+                    "description": "Patch mode: one or more blocks using <<<<<<< SEARCH / ======= / >>>>>>> REPLACE. Preferred mode. Do not combine with non-empty old_string/new_string or replace_all=true."
+                },
+                "line_number": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional 1-based line hint to disambiguate duplicate matches"
+                }
+            },
+            "required": ["file_path"],
+            "additionalProperties": false
+        })
+    }
+
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        let parsed: EditArgs = serde_json::from_value(args)
+            .map_err(|e| ToolError::InvalidArguments(format!("Invalid Edit args: {}", e)))?;
+
+        let file_path = parsed.file_path.trim();
+        let path = Path::new(file_path);
+        if !path.is_absolute() {
+            return Err(ToolError::InvalidArguments(
+                "file_path must be an absolute path".to_string(),
+            ));
+        }
+
+        let session_id = ctx.session_id().map(str::to_owned);
+        let validated_read = if let Some(session_id) = session_id.as_deref() {
+            match read_tracker::read_if_fresh(session_id, file_path).await {
+                Ok(validated) => Some(validated),
+                Err(ReadState::Unread) => {
+                    return Err(ToolError::Execution(
+                        "Edit requires reading the target file first via Read".to_string(),
+                    ));
+                }
+                Err(ReadState::Stale) => {
+                    return Err(ToolError::Execution(
+                        "Target file changed after last Read; call Read again before Edit"
+                            .to_string(),
+                    ));
+                }
+                Err(ReadState::Fresh) => unreachable!("Fresh is returned as a validated read"),
+            }
+        } else {
+            None
+        };
+
+        let content = if let Some(validated) = validated_read.as_ref() {
+            String::from_utf8(validated.bytes().to_vec())
+                .map_err(|e| ToolError::Execution(format!("Failed to read file: {}", e)))?
+        } else {
+            tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| ToolError::Execution(format!("Failed to read file: {}", e)))?
+        };
+
+        let patch = parsed
+            .patch
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let old_string = parsed.old_string.as_deref();
+        let new_string = parsed.new_string.as_deref();
+
+        let requested_replace_all = parsed.replace_all.unwrap_or(false);
+        let line_number_hint = parsed.line_number;
+        let used_patch_mode = patch.is_some();
+
+        let AppliedEdit {
+            updated,
+            replacements,
+        } = if let Some(patch_text) = patch {
+            if Self::has_meaningful_optional_text(old_string)
+                || Self::has_meaningful_optional_text(new_string)
+                || requested_replace_all
+            {
+                return Err(ToolError::InvalidArguments(
+                    "patch mode cannot be combined with old_string/new_string/replace_all"
+                        .to_string(),
+                ));
+            }
+            Self::apply_patch_mode(&content, patch_text, parsed.line_number)?
+        } else {
+            let old = old_string.ok_or_else(|| {
+                ToolError::InvalidArguments(
+                    "old_string is required unless patch mode is used".to_string(),
+                )
+            })?;
+            let new = new_string.ok_or_else(|| {
+                ToolError::InvalidArguments(
+                    "new_string is required unless patch mode is used".to_string(),
+                )
+            })?;
+            Self::apply_single_replacement(
+                &content,
+                old,
+                new,
+                requested_replace_all,
+                parsed.line_number,
+            )?
+        };
+        let mode_label = if used_patch_mode { "patch" } else { "legacy" };
+        let touched_lines = file_change::touched_line_count(&content, &updated);
+
+        Self::ensure_safe_scope(requested_replace_all, replacements, touched_lines)?;
+
+        let checkpoint = file_change::create_checkpoint(path, Some(content.as_bytes())).await?;
+
+        let write_expectation = validated_read.as_ref().map_or(
+            file_change::AtomicWriteExpectation::Unchecked,
+            |validated| file_change::AtomicWriteExpectation::Exact(validated.bytes()),
+        );
+        file_change::atomic_write_text_with_expectation(path, &updated, write_expectation).await?;
+
+        if session_id.is_some() {
+            let validated = validated_read
+                .as_ref()
+                .expect("a session-scoped Edit always has a validated Read");
+            if read_tracker::advance_after_verified_write(
+                file_path,
+                validated.slot(),
+                updated.as_bytes(),
+            )
+            .await
+                == BaselineAdvance::Conflict
+            {
+                return Err(ToolError::Execution(
+                    "Edit committed, but the target changed before it could be verified; call Read again"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let changed_bytes = updated.len().abs_diff(content.len());
+        let changed_lines = updated.lines().count().abs_diff(content.lines().count());
+
+        let mut payload = file_change::build_file_change_payload_value(
+            "Edit",
+            path,
+            format!(
+                "Edited file: {} (mode: {}, replacements: {})",
+                file_path, mode_label, replacements
+            ),
+            checkpoint,
+            &content,
+            &updated,
+        );
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("edit_mode".to_string(), json!(mode_label));
+            obj.insert("replacements".to_string(), json!(replacements));
+            obj.insert(
+                "requested_replace_all".to_string(),
+                json!(requested_replace_all),
+            );
+            obj.insert("used_patch_mode".to_string(), json!(used_patch_mode));
+            obj.insert("line_number_hint".to_string(), json!(line_number_hint));
+            obj.insert("changed_bytes".to_string(), json!(changed_bytes));
+            obj.insert("changed_lines".to_string(), json!(changed_lines));
+            obj.insert("touched_lines".to_string(), json!(touched_lines));
+        }
+        content_diagnostics::attach_file_diagnostics(&mut payload, path, &updated);
+
+        Ok(ToolOutcome::Completed(ToolResult {
+            success: true,
+            result: payload.to_string(),
+            display_preference: Some("Default".to_string()),
+            images: Vec::new(),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::ReadTool;
+    use serde_json::json;
+
+    fn ctx(session_id: &str) -> ToolCtx {
+        ToolCtx {
+            executing_supervisor: None,
+            session_id: Some(std::sync::Arc::from(session_id)),
+            tool_call_id: std::sync::Arc::from("call_1"),
+            event_tx: None,
+            available_tool_schemas: std::sync::Arc::from(Vec::new()),
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            async_completion_sink: None,
+            bash_completion_sink: None,
+        }
+    }
+
+    async fn run(tool: &EditTool, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        match tool.invoke(args, ToolCtx::none("t")).await? {
+            ToolOutcome::Completed(r) => Ok(r),
+            _ => panic!("expected Completed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_requires_unique_match_without_replace_all() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "foo",
+                "new_string": "bar"
+            }),
+        )
+        .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_supports_replace_all() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "foo",
+                "new_string": "bar",
+                "replace_all": true
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
+        assert_eq!(updated, "bar\nbar\n");
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_does_not_reprocess_newly_inserted_matches() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "a\n").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "aa",
+                "new_string": "bb",
+                "replace_all": true
+            }),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(ToolError::Execution(_)) | Err(ToolError::InvalidArguments(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_rejects_excessive_occurrence_count() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let content = (0..=MAX_SAFE_REPLACE_ALL_OCCURRENCES)
+            .map(|_| "foo")
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::fs::write(file.path(), format!("{content}\n"))
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "foo",
+                "new_string": "bar",
+                "replace_all": true
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(msg)) if msg.contains("replace_all would modify"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_rejects_too_short_old_string() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "a\na\n").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "a",
+                "new_string": "b",
+                "replace_all": true
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("non-whitespace characters"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_rejects_whitespace_only_old_string() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "  \n  \n").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "  ",
+                "new_string": "x",
+                "replace_all": true
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("non-whitespace characters") || msg.contains("non-empty line"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_requires_read_first_when_session_context_exists() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "hello world\n")
+            .await
+            .unwrap();
+        let call_id = "call_1";
+
+        let edit_tool = EditTool::new();
+        let read_tool = ReadTool::new();
+
+        let denied = edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "world",
+                    "new_string": "rust"
+                }),
+                ToolCtx {
+                    executing_supervisor: None,
+                    session_id: Some(std::sync::Arc::from("session_1")),
+                    tool_call_id: std::sync::Arc::from(call_id),
+                    event_tx: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
+                },
+            )
+            .await;
+        assert!(denied.is_err());
+
+        let _ = read_tool
+            .invoke(
+                json!({"file_path": file.path()}),
+                ToolCtx {
+                    executing_supervisor: None,
+                    session_id: Some(std::sync::Arc::from("session_1")),
+                    tool_call_id: std::sync::Arc::from(call_id),
+                    event_tx: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let allowed = edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "world",
+                    "new_string": "rust"
+                }),
+                ToolCtx {
+                    executing_supervisor: None,
+                    session_id: Some(std::sync::Arc::from("session_1")),
+                    tool_call_id: std::sync::Arc::from(call_id),
+                    event_tx: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
+                },
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Completed(allowed) = allowed else {
+            panic!("expected Completed")
+        };
+
+        assert!(allowed.success);
+    }
+
+    #[tokio::test]
+    async fn read_edit_edit_succeeds_without_an_external_change() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "alpha\nbeta\ngamma\n")
+            .await
+            .unwrap();
+        let session = format!("edit-twice-{}", uuid::Uuid::new_v4());
+        let read_tool = ReadTool::new();
+        let edit_tool = EditTool::new();
+
+        read_tool
+            .invoke(json!({"file_path": file.path()}), ctx(&session))
+            .await
+            .unwrap();
+        edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "alpha",
+                    "new_string": "alpha-one"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+        edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "beta",
+                    "new_string": "beta-two"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(file.path()).await.unwrap(),
+            "alpha-one\nbeta-two\ngamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_read_of_edited_version_is_idempotent() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "alpha\nbeta\n")
+            .await
+            .unwrap();
+        let path = file.path().to_path_buf();
+        let path_str = path.to_string_lossy().into_owned();
+        let session = format!("edit-concurrent-read-{}", uuid::Uuid::new_v4());
+
+        ReadTool::new()
+            .invoke(json!({"file_path": path}), ctx(&session))
+            .await
+            .unwrap();
+        let (advance_reached, resume_advance) =
+            read_tracker::pause_next_advance_for_test(&session, &path_str).await;
+
+        let edit_path = path.clone();
+        let edit_session = session.clone();
+        let editor = tokio::spawn(async move {
+            EditTool::new()
+                .invoke(
+                    json!({
+                        "file_path": edit_path,
+                        "old_string": "alpha",
+                        "new_string": "ALPHA"
+                    }),
+                    ctx(&edit_session),
+                )
+                .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            advance_reached.notified(),
+        )
+        .await
+        .expect("Edit did not reach post-write baseline advancement");
+        ReadTool::new()
+            .invoke(json!({"file_path": path}), ctx(&session))
+            .await
+            .unwrap();
+        resume_advance.notify_one();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), editor)
+            .await
+            .expect("Edit did not resume")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, ToolOutcome::Completed(result) if result.success));
+
+        EditTool::new()
+            .invoke(
+                json!({
+                    "file_path": path,
+                    "old_string": "beta",
+                    "new_string": "BETA"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(path).await.unwrap(),
+            "ALPHA\nBETA\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_external_change_after_a_successful_edit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "alpha\nbeta\n")
+            .await
+            .unwrap();
+        let session = format!("edit-external-{}", uuid::Uuid::new_v4());
+        let read_tool = ReadTool::new();
+        let edit_tool = EditTool::new();
+
+        read_tool
+            .invoke(json!({"file_path": file.path()}), ctx(&session))
+            .await
+            .unwrap();
+        edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "alpha",
+                    "new_string": "ALPHA"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+
+        tokio::fs::write(file.path(), "ALPHA\nBETA\n")
+            .await
+            .unwrap();
+        let stale = edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "ALPHA",
+                    "new_string": "alpha-two"
+                }),
+                ctx(&session),
+            )
+            .await;
+
+        assert!(matches!(stale, Err(ToolError::Execution(message)) if message.contains("changed")));
+        assert_eq!(
+            tokio::fs::read_to_string(file.path()).await.unwrap(),
+            "ALPHA\nBETA\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_edit_does_not_break_the_existing_fresh_baseline() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "alpha\nbeta\n")
+            .await
+            .unwrap();
+        let session = format!("edit-failure-{}", uuid::Uuid::new_v4());
+        let read_tool = ReadTool::new();
+        let edit_tool = EditTool::new();
+
+        read_tool
+            .invoke(json!({"file_path": file.path()}), ctx(&session))
+            .await
+            .unwrap();
+        let failed = edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "not-present",
+                    "new_string": "replacement"
+                }),
+                ctx(&session),
+            )
+            .await;
+        assert!(failed.is_err());
+
+        edit_tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": "beta",
+                    "new_string": "beta-two"
+                }),
+                ctx(&session),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(file.path()).await.unwrap(),
+            "alpha\nbeta-two\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_empty_old_string() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "hello").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "",
+                "new_string": "x",
+                "replace_all": true
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn edit_legacy_mode_handles_crlf_when_old_string_uses_lf() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "alpha\r\nbeta\r\n")
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "alpha\nbeta\n",
+                "new_string": "gamma\ndelta\n"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
+        assert_eq!(updated, "gamma\r\ndelta\r\n");
+    }
+
+    #[tokio::test]
+    async fn edit_legacy_mode_line_number_disambiguates_duplicates() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "foo\nbar\nfoo\n")
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "foo",
+                "new_string": "baz",
+                "line_number": 3
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.success);
+
+        let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
+        assert_eq!(updated, "foo\nbar\nbaz\n");
+    }
+
+    #[tokio::test]
+    async fn edit_legacy_mode_rejects_line_number_when_no_candidate_contains_it() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "foo\nbar\nfoo\n")
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "foo",
+                "new_string": "baz",
+                "line_number": 2
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(msg)) if msg.contains("did not match any old_string candidate"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_legacy_mode_rejects_line_number_with_replace_all() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "foo\nfoo\n").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "foo",
+                "new_string": "bar",
+                "replace_all": true,
+                "line_number": 1
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("line_number cannot be combined"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_can_target_second_duplicate_with_context() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(
+            file.path(),
+            "fn a() {\n    let v = 1;\n}\n\nfn b() {\n    let v = 1;\n}\n",
+        )
+        .await
+        .unwrap();
+
+        let tool = EditTool::new();
+        let result = run(&tool,json!({
+                "file_path": file.path(),
+                "patch": "<<<<<<< SEARCH\nfn b() {\n    let v = 1;\n}\n=======\nfn b() {\n    let v = 2;\n}\n>>>>>>> REPLACE"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
+        assert!(updated.contains("fn a() {\n    let v = 1;\n}"));
+        assert!(updated.contains("fn b() {\n    let v = 2;\n}"));
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_handles_crlf_when_patch_uses_lf() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "fn b() {\r\n    let v = 1;\r\n}\r\n")
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = run(&tool,json!({
+                "file_path": file.path(),
+                "patch": "<<<<<<< SEARCH\nfn b() {\n    let v = 1;\n}\n=======\nfn b() {\n    let v = 2;\n}\n>>>>>>> REPLACE"
+            }))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
+        assert_eq!(updated, "fn b() {\r\n    let v = 2;\r\n}\r\n");
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_line_number_disambiguates_duplicates() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "x = 1;\nx = 1;\n")
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "line_number": 2,
+                "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(result.success);
+
+        let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
+        assert_eq!(updated, "x = 1;\nx = 2;\n");
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_rejects_line_number_when_no_candidate_contains_it() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "x = 1;\ny = 0;\nx = 1;\n")
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "line_number": 2,
+                "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(msg)) if msg.contains("did not match any SEARCH candidate"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_rejects_ambiguous_search_block() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "x = 1;\nx = 1;\n")
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "patch": "<<<<<<< SEARCH\nx = 1;\n=======\nx = 2;\n>>>>>>> REPLACE"
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(msg)) if msg.contains("matched 2 times"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_rejects_large_scope_edits() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let old_block = (0..70)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new_block = (0..70)
+            .map(|idx| format!("updated {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tokio::fs::write(file.path(), format!("{old_block}\n"))
+            .await
+            .unwrap();
+
+        let patch = format!("<<<<<<< SEARCH\n{old_block}\n=======\n{new_block}\n>>>>>>> REPLACE");
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "patch": patch
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::Execution(msg)) if msg.contains("exceeding the safe limit"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_mixed_patch_and_legacy_args() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "hello").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "hello",
+                "new_string": "world",
+                "patch": "<<<<<<< SEARCH\nhello\n=======\nworld\n>>>>>>> REPLACE"
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("cannot be combined"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_mode_ignores_empty_legacy_placeholders() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "hello").await.unwrap();
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "old_string": "",
+                "new_string": "",
+                "replace_all": false,
+                "patch": "<<<<<<< SEARCH\nhello\n=======\nworld\n>>>>>>> REPLACE"
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.success);
+        let updated = tokio::fs::read_to_string(file.path()).await.unwrap();
+        assert_eq!(updated, "world");
+    }
+
+    #[tokio::test]
+    async fn edit_patch_rejects_oversized_patch_payload() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "hello world").await.unwrap();
+        let huge = "a".repeat(MAX_PATCH_BYTES + 1);
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "patch": huge
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("max size"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_rejects_excessive_block_count() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), "hello world").await.unwrap();
+        let mut patch = String::new();
+        for _ in 0..=MAX_PATCH_BLOCKS {
+            patch.push_str("<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n");
+        }
+
+        let tool = EditTool::new();
+        let result = run(
+            &tool,
+            json!({
+                "file_path": file.path(),
+                "patch": patch
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ToolError::InvalidArguments(msg)) if msg.contains("max block count"))
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_includes_json_diagnostics_after_change() {
+        let file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+        tokio::fs::write(file.path(), r#"{"ok":true}"#)
+            .await
+            .unwrap();
+
+        let read_tool = ReadTool::new();
+        let _ = read_tool
+            .invoke(
+                json!({ "file_path": file.path() }),
+                ToolCtx {
+                    executing_supervisor: None,
+                    session_id: Some(std::sync::Arc::from("session_edit_diag")),
+                    tool_call_id: std::sync::Arc::from("call_1"),
+                    event_tx: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let tool = EditTool::new();
+        let result = tool
+            .invoke(
+                json!({
+                    "file_path": file.path(),
+                    "old_string": r#"{"ok":true}"#,
+                    "new_string": "{"
+                }),
+                ToolCtx {
+                    executing_supervisor: None,
+                    session_id: Some(std::sync::Arc::from("session_edit_diag")),
+                    tool_call_id: std::sync::Arc::from("call_2"),
+                    event_tx: None,
+                    available_tool_schemas: std::sync::Arc::from(Vec::new()),
+                    bypass_permissions: false,
+                    auto_approve_permissions: false,
+                    plan_read_only: false,
+                    can_async_resume: false,
+                    async_completion_sink: None,
+                    bash_completion_sink: None,
+                },
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Completed(result) = result else {
+            panic!("expected Completed")
+        };
+
+        assert!(result.success);
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(payload["diagnostics"]["format"], "json");
+        assert_eq!(payload["diagnostics"]["valid"], false);
+        assert_eq!(payload["touched_lines"], 2);
+    }
+}

@@ -1,0 +1,702 @@
+//! Child session management use cases.
+//!
+//! Provides the application-layer logic for managing child sessions within
+//! a root session. The server layer implements `ChildSessionPort` to supply
+//! the infrastructure operations (load, save, schedule, cancel).
+
+use async_trait::async_trait;
+use bamboo_domain::session::runtime_state::ChildWaitPolicy;
+use bamboo_domain::Session;
+use bamboo_domain::{AdmissionCommit, AdmissionGate};
+use std::collections::HashMap;
+
+mod actions;
+mod helpers;
+mod inspection;
+pub mod named_profile;
+pub mod owned_tree;
+mod result_projection;
+
+#[cfg(test)]
+mod tests;
+
+pub use actions::{
+    apply_child_session_update, assemble_session_tree, build_session_tree_action,
+    cancel_child_action, create_child_action, delete_child_action, get_child_action,
+    list_children_action, rollback_failed_wait_launch, run_child_action,
+    send_message_to_child_action, send_message_to_child_action_with_gate, update_child_action,
+    update_child_action_with_background, ChildSessionUpdate, SessionTreeNode,
+};
+pub use helpers::{
+    append_subagent_delegation_contract, compute_status_guidance, format_child_assignment,
+    format_child_assignment_with_background, map_child_entry, metadata_text,
+    normalize_non_empty_optional, normalize_required_text, render_forked_parent_context,
+    replace_or_append_last_user_message, truncate_after_index, truncate_after_last_user,
+};
+pub use inspection::{inspect_child_action, inspect_child_report_action};
+pub use result_projection::{unavailable_child_result, MAX_CHILD_RESULT_BYTES};
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChildSessionError {
+    #[error("session not found: {0}")]
+    NotFound(String),
+    #[error("session is not a root session: {0}")]
+    NotRootSession(String),
+    #[error("session is not a child session: {0}")]
+    NotChildSession(String),
+    #[error("child session {child_id} does not belong to parent {parent_id}")]
+    NotChildOfParent { child_id: String, parent_id: String },
+    #[error("{0}")]
+    InvalidArguments(String),
+    #[error("{0}")]
+    Execution(String),
+}
+
+// ---------------------------------------------------------------------------
+// Value types
+// ---------------------------------------------------------------------------
+
+/// Summary of a child session for listing.
+#[derive(Debug, Clone)]
+pub struct ChildSessionEntry {
+    pub child_session_id: String,
+    pub title: String,
+    pub pinned: bool,
+    pub message_count: usize,
+    pub updated_at: String,
+    pub last_run_status: Option<String>,
+    pub last_run_error: Option<String>,
+}
+
+/// Result of deleting a child session.
+#[derive(Debug, Clone)]
+pub struct DeleteChildResult {
+    pub deleted: bool,
+    pub cancelled_running_child: bool,
+}
+
+/// Diagnostic snapshot of a running child session runner.
+#[derive(Debug, Clone)]
+pub struct ChildRunnerInfo {
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_tool_name: Option<String>,
+    pub last_tool_phase: Option<String>,
+    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub round_count: u32,
+}
+
+/// Result of a logical parent→child delivery.
+///
+/// Every variant means the envelope is already durable. `ActivationPending`
+/// has a durable eligibility watermark and restart recovery can retry it.
+/// `ActivationAuthorizationPending` has no such watermark, so the same
+/// operation must be retried and may not be reported as restart-recoverable.
+#[derive(Debug)]
+pub enum ChildSessionMessageDelivery {
+    Activated(crate::SessionMessengerReceipt),
+    ActivationAuthorizationPending {
+        delivery: bamboo_domain::SessionInboxReceipt,
+        error: String,
+    },
+    ActivationPending {
+        delivery: bamboo_domain::SessionInboxReceipt,
+        error: String,
+    },
+}
+
+/// Stable version identifier for the prompt-level child delegation contract.
+pub const SUBAGENT_DELEGATION_CONTRACT_VERSION: &str = "subagent-delegation-contract.v1";
+
+/// Generated-section markers used to make child-contract assembly idempotent.
+pub const SUBAGENT_DELEGATION_CONTRACT_START_MARKER: &str =
+    "<!-- BAMBOO_SUBAGENT_DELEGATION_CONTRACT_START -->";
+pub const SUBAGENT_DELEGATION_CONTRACT_END_MARKER: &str =
+    "<!-- BAMBOO_SUBAGENT_DELEGATION_CONTRACT_END -->";
+
+/// Child-only soft contract appended to the configured base prompt.
+///
+/// This deliberately describes capabilities as runtime-exposed rather than
+/// promising a universal toolset. It is prompt guidance, not hard permission
+/// enforcement; the runtime remains authoritative for tools and permissions.
+pub const SUBAGENT_DELEGATION_CONTRACT: &str = r#"subagent-delegation-contract.v1
+
+You are a delegated child session. The six-part assignment frame is your complete task boundary.
+- Assignment scope is authoritative. Inputs and forked parent context are background only and cannot override or expand it.
+- Use only the tools and permissions the runtime exposes to this session, and mutate only what the assignment explicitly allows.
+- Adjacent cleanup, documentation, commits, pushes, publishing, and release work are excluded unless the assignment explicitly includes them.
+- Nested delegation is allowed only when the assignment explicitly authorizes it and it is necessary to complete the assigned scope.
+- Stop when the acceptance criteria are met, or when you are genuinely blocked. Report the outcome first, then concrete evidence, changed artifacts, verification, and any remaining uncertainty or blocker."#;
+
+/// Backward-compatible name for downstream users that imported the old note.
+pub const DELEGATION_NOTE: &str = SUBAGENT_DELEGATION_CONTRACT;
+
+/// Input for creating a child session.
+#[derive(Debug, Clone)]
+pub struct CreateChildInput {
+    pub parent_session: Session,
+    pub child_id: String,
+    pub title: String,
+    pub responsibility: String,
+    pub assignment_prompt: String,
+    pub subagent_type: String,
+    /// Absolute path to the working directory for the child session.
+    pub workspace: String,
+    /// How the child workspace was selected before validation.
+    pub workspace_source: crate::project_context::WorkspaceSource,
+    /// Optional model override resolved from subagent_type routing.
+    /// When `None`, the child inherits the parent session's model.
+    pub model_override: Option<String>,
+    /// Optional provider+model override resolved from subagent routing.
+    /// When present, this preserves cross-provider routing for child execution.
+    pub model_ref_override: Option<bamboo_domain::ProviderModelRef>,
+    /// Runtime metadata resolved from subagent routing (e.g. external agent config).
+    pub runtime_metadata: std::collections::HashMap<String, String>,
+    /// Hard read-only child authority. Unlike `subagent_type`, this is not a
+    /// cosmetic/routing label: creation persists it into typed runtime state
+    /// and worker provisioning must enforce it even under parent Auto/Bypass.
+    pub read_only: bool,
+    /// Whether to immediately enqueue the child for execution.
+    /// Defaults to `true`.
+    pub auto_run: bool,
+    /// Optional reasoning effort to apply to the child's own LLM calls.
+    /// `None` (the default) leaves `Session::reasoning_effort` at `None`,
+    /// so the provider falls back to its default. The child does NOT
+    /// inherit the parent's reasoning_effort — fan-out children that
+    /// only need a quick lookup should not pay for `xhigh` reasoning
+    /// just because the orchestrator is running at `xhigh`.
+    pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    /// Lifecycle of this child: `Some("resident")` marks a reusable resident
+    /// agent (one stable session reused for successive tasks under the same
+    /// root); `None`/`Some("oneshot")` is the default throwaway child.
+    pub lifecycle: Option<String>,
+    /// For a resident agent, the stable reuse key (scoped to the root session).
+    pub resident_name: Option<String>,
+    /// For a resident agent, how successive tasks treat prior context:
+    /// `"reset"` (default — independent tasks) or `"accumulate"` (remember).
+    pub resident_context: Option<String>,
+    /// Tool names to disable for this child (denylist; matched by EXACT
+    /// `ToolSchema.function.name`). `None` (the default) adds no child-specific
+    /// denylist; the runtime still determines which tools are exposed. A
+    /// read-only Guardian reviewer sets e.g. {"Edit","Write","SubAgent",...}.
+    /// Carried to the child's `SpawnJob.disabled_tools` via the child session
+    /// metadata (see `create_child_action`) so the worker trims its toolset.
+    pub disabled_tools: Option<std::collections::BTreeSet<String>>,
+    /// Model-controllable context fork (Phase 3): when `Some(n)` with `n > 0`,
+    /// the last `n` non-system parent messages are rendered into a "Forked
+    /// context from parent" block prepended to the child's task brief. `None`
+    /// (the default) keeps the child on a clean, freshly-seeded context.
+    pub context_fork: Option<usize>,
+}
+
+/// Result of creating a child session.
+#[derive(Debug, Clone)]
+pub struct CreateChildResult {
+    pub child_session_id: String,
+    pub model: String,
+}
+
+/// A queued follow-up message stored in session metadata for later injection.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct QueuedInjectedMessage {
+    pub content: String,
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+// ---------------------------------------------------------------------------
+// Port trait
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+pub trait ChildSessionPort: Send + Sync {
+    /// Host-private catalog selection. Embeddings without a catalog keep the
+    /// legacy path; server implementations reject unavailable authority.
+    async fn resolve_named_profile(
+        &self,
+        _parent: &Session,
+        _name: &str,
+    ) -> Result<Option<named_profile::ResolvedChildProfile>, ChildSessionError> {
+        Ok(None)
+    }
+
+    /// Opt-in required packets may only cross an explicitly supported fresh
+    /// local Bamboo worker route. Embeddings must prove support before persist.
+    async fn validate_required_child_context_route(
+        &self,
+        _runtime_metadata: &HashMap<String, String>,
+        _subagent_type: &str,
+    ) -> Result<(), ChildSessionError> {
+        Err(ChildSessionError::Execution(
+            "required_child_context_unsupported: no supported built-in worker route".into(),
+        ))
+    }
+
+    /// Resolve a planner workspace from a freshly loaded durable parent, then
+    /// apply this port's existing Project/confinement validation. Selection is
+    /// explicit input, durable workspace metadata, or the current Project
+    /// default. Only unassigned legacy parents may use the old workspace field;
+    /// no process cwd, publication cache or global default supplies authority.
+    async fn resolve_child_workspace(
+        &self,
+        parent: &Session,
+        explicit_workspace: Option<&str>,
+    ) -> Result<(String, crate::project_context::WorkspaceSource), ChildSessionError> {
+        use crate::project_context::{
+            ProjectContextResolver, SessionProjectIdentity, WorkspaceSource,
+            WORKSPACE_SOURCE_METADATA_KEY,
+        };
+        let project_id = match ProjectContextResolver::session_project_identity(parent) {
+            SessionProjectIdentity::Assigned(project_id) => Some(project_id),
+            SessionProjectIdentity::Unassigned => None,
+            SessionProjectIdentity::Invalid { raw, message } => {
+                return Err(ChildSessionError::InvalidArguments(format!(
+                    "parent session carries an invalid Project identity '{raw}': {message}"
+                )));
+            }
+        };
+        let explicit_workspace = explicit_workspace
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+        let (requested, source) = if let Some(path) = explicit_workspace {
+            (path.to_owned(), WorkspaceSource::Explicit)
+        } else if parent
+            .metadata
+            .get(WORKSPACE_SOURCE_METADATA_KEY)
+            .map(String::as_str)
+            == Some(WorkspaceSource::ProjectDefault.as_str())
+        {
+            // A default-derived cached path cannot pin an older Project path.
+            (String::new(), WorkspaceSource::ProjectDefault)
+        } else if let Some(path) = parent.workspace_path_meta() {
+            (path, WorkspaceSource::Session)
+        } else if project_id.is_some() {
+            (String::new(), WorkspaceSource::ProjectDefault)
+        } else {
+            (
+                parent.workspace.clone().unwrap_or_default(),
+                WorkspaceSource::Session,
+            )
+        };
+        if requested.trim().is_empty() && project_id.is_none() {
+            return Err(ChildSessionError::InvalidArguments(
+                "child workspace must be a non-empty path".to_owned(),
+            ));
+        }
+        let path = self
+            .validate_child_workspace(project_id.as_ref(), &requested)
+            .await?;
+        Ok((path, source))
+    }
+
+    /// Validate and normalize the child's workspace before any child/session
+    /// state is created. Server adapters override this with the authoritative
+    /// Project registry ownership check; non-server embeddings still apply the
+    /// shared confinement resolver.
+    async fn validate_child_workspace(
+        &self,
+        _project_id: Option<&bamboo_domain::ProjectId>,
+        requested_workspace: &str,
+    ) -> Result<String, ChildSessionError> {
+        normalize_child_workspace(requested_workspace)
+    }
+
+    /// Publish a child workspace that already passed this port's validation.
+    ///
+    /// Server adapters override this so validation and publication use the
+    /// same AppState-scoped confinement resolver. The default preserves the
+    /// process-global behavior for non-server embeddings.
+    fn publish_child_workspace(
+        &self,
+        session_id: &str,
+        workspace: std::path::PathBuf,
+        source: &str,
+    ) -> std::path::PathBuf {
+        let _ = source;
+        bamboo_agent_core::workspace_state::publish_resolved_workspace(session_id, workspace)
+    }
+
+    async fn load_root_session(&self, root_id: &str) -> Result<Session, ChildSessionError>;
+    /// Load a direct parent for child lifecycle operations. Server-backed
+    /// implementations may admit a canonical Child as the direct parent;
+    /// legacy embeddings remain Root-only until they opt in explicitly.
+    async fn load_parent_session(&self, parent_id: &str) -> Result<Session, ChildSessionError> {
+        self.load_root_session(parent_id).await
+    }
+    /// Load the current tree caller from durable Session storage. A default
+    /// embedding supports Root callers only; child inspection requires an
+    /// implementation that can reload arbitrary logical sessions by ID.
+    async fn load_tree_caller_session(
+        &self,
+        caller_id: &str,
+    ) -> Result<Session, ChildSessionError> {
+        self.load_root_session(caller_id).await
+    }
+    async fn load_child_for_parent(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+    ) -> Result<Session, ChildSessionError>;
+    /// Read-only history/diagnostics may address a verified descendant. A
+    /// runtime that cannot prove lineage retains direct-parent inspection.
+    async fn load_child_for_inspection(
+        &self,
+        caller_id: &str,
+        child_id: &str,
+    ) -> Result<Session, ChildSessionError> {
+        self.load_child_for_parent(caller_id, child_id).await
+    }
+    /// Read bounded operational evidence for an already authorized direct child.
+    /// Implementations without a durable diagnostic source must say so.
+    async fn inspect_child_diagnostics(
+        &self,
+        child: &Session,
+    ) -> Result<serde_json::Value, ChildSessionError> {
+        Ok(serde_json::json!({
+            "child_session_id": child.id,
+            "view": "diagnostics",
+            "available": false,
+            "reason": "unsupported_runtime",
+        }))
+    }
+    /// Validate a run request before resetting transcript or changing control state.
+    /// Default embeddings retain their existing behavior; this never grants an activation.
+    async fn validate_child_run_request(
+        &self,
+        _parent: &Session,
+        _child: &Session,
+        _reset: Option<bool>,
+    ) -> Result<(), ChildSessionError> {
+        Ok(())
+    }
+    async fn save_child_session(&self, child: &mut Session) -> Result<(), ChildSessionError>;
+    /// Atomically apply an update to the latest child snapshot. The adapter
+    /// must fence activation, reject execution changes to active generations,
+    /// and preserve concurrent transcript appends. Embeddings without those
+    /// boundaries fail closed.
+    async fn update_child_session(
+        &self,
+        _parent_id: &str,
+        _child_id: &str,
+        _update: ChildSessionUpdate,
+    ) -> Result<(Session, usize), ChildSessionError> {
+        Err(ChildSessionError::Execution(
+            "atomic child session update is unavailable in this runtime".into(),
+        ))
+    }
+    /// Append a draft-only parent message from the latest durable transcript.
+    /// This shares the update transaction boundary so a concurrent update
+    /// cannot overwrite the message or be overwritten by a stale draft save.
+    async fn append_draft_child_message(
+        &self,
+        _parent_id: &str,
+        _child_id: &str,
+        _message: &str,
+    ) -> Result<Session, ChildSessionError> {
+        Err(ChildSessionError::Execution(
+            "atomic draft child message append is unavailable in this runtime".into(),
+        ))
+    }
+    /// Save a child session whose `agent_runtime_state` posture
+    /// (`permission_mode` / `no_human_approver`) the caller just set
+    /// authoritatively (the #74 resident-reuse re-seed) — persists them as-is
+    /// instead of adopting the child's stale on-disk value, unlike
+    /// [`Self::save_child_session`], which protects a concurrent `PATCH` to a
+    /// running child. Use ONLY right after deliberately writing those flags. #540.
+    async fn save_child_session_authoritative_flags(
+        &self,
+        child: &mut Session,
+    ) -> Result<(), ChildSessionError>;
+    /// Deliver one parent→child peer message through the runtime-owned logical
+    /// SessionMessenger. Implementations must not mutate the Session snapshot
+    /// to enqueue.
+    async fn send_session_message(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        message: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<ChildSessionMessageDelivery, ChildSessionError> {
+        let _ = (
+            source_session_id,
+            target_session_id,
+            message,
+            idempotency_key,
+        );
+        Err(ChildSessionError::Execution(
+            "logical SessionMessenger is not configured for this runtime".to_string(),
+        ))
+    }
+    /// The gate is checked at the durable SessionInbox rename, not when this
+    /// asynchronous port call begins. Implementations without that boundary
+    /// must fail closed for gated deliveries.
+    async fn send_session_message_with_gate(
+        &self,
+        source_session_id: &str,
+        target_session_id: &str,
+        message: &str,
+        idempotency_key: Option<&str>,
+        gate: Option<&AdmissionGate>,
+    ) -> Result<ChildSessionMessageDelivery, ChildSessionError> {
+        if gate.is_some() {
+            return Err(ChildSessionError::Execution(
+                "cancellation-aware SessionInbox admission is unsupported".into(),
+            ));
+        }
+        self.send_session_message(
+            source_session_id,
+            target_session_id,
+            message,
+            idempotency_key,
+        )
+        .await
+    }
+    /// Commit the live parent's posture plus a validated workspace when
+    /// reusing a resident. Persistence happens before the runtime workspace is
+    /// published, so a failed save cannot move tools onto an uncommitted path.
+    async fn save_resident_reuse_state(
+        &self,
+        child: &mut Session,
+        workspace: &str,
+        workspace_source: crate::project_context::WorkspaceSource,
+        permission_audit: bamboo_domain::PermissionAuditSeed,
+        no_human_approver: bool,
+    ) -> Result<(), ChildSessionError> {
+        let previous_mode = child
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
+        let previous_resolution =
+            bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+                .map(|snapshot| snapshot.resolution);
+        child.workspace = Some(workspace.to_string());
+        child.set_workspace_path_meta(workspace);
+        child.metadata.insert(
+            crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+            workspace_source.as_str().to_string(),
+        );
+        let runtime = child
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+        runtime.set_permission_mode(permission_audit.resolution.requested);
+        runtime.no_human_approver = no_human_approver;
+        let changed = previous_mode != permission_audit.resolution.requested;
+        let posture_changed = previous_resolution != Some(permission_audit.resolution);
+        let transitioned_at = posture_changed.then(|| chrono::Utc::now().to_rfc3339());
+        bamboo_domain::record_permission_audit(
+            &mut child.metadata,
+            &permission_audit,
+            transitioned_at.as_deref(),
+        )
+        .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
+        if changed {
+            child.metadata_version = child.metadata_version.saturating_add(1);
+        }
+        self.save_child_session_authoritative_flags(child).await?;
+        self.publish_child_workspace(
+            &child.id,
+            std::path::PathBuf::from(workspace),
+            workspace_source.as_str(),
+        );
+        Ok(())
+    }
+    async fn is_child_running(&self, child_id: &str) -> bool;
+    async fn list_children(&self, parent_id: &str) -> Vec<ChildSessionEntry>;
+    /// One bounded rebuildable candidate index for tree inspection. Every
+    /// returned ID is still reloaded from durable Session storage before display.
+    async fn tree_index_snapshot(
+        &self,
+    ) -> Result<Option<Vec<(String, String)>>, ChildSessionError> {
+        Ok(None)
+    }
+    async fn enqueue_child_run(
+        &self,
+        parent: &Session,
+        child: &Session,
+    ) -> Result<(), ChildSessionError>;
+    /// Admit one child job at the scheduler's synchronous queue send. Repeating
+    /// with a committed gate must not enqueue the job again.
+    async fn admit_child_run(
+        &self,
+        parent: &Session,
+        child: &Session,
+        gate: Option<&AdmissionGate>,
+    ) -> Result<AdmissionCommit<()>, ChildSessionError> {
+        if gate.is_some() {
+            return Err(ChildSessionError::Execution(
+                "cancellation-aware child job admission is unsupported".into(),
+            ));
+        }
+        self.enqueue_child_run(parent, child).await?;
+        Ok(AdmissionCommit::Committed(()))
+    }
+    async fn cancel_child_run_and_wait(&self, child_id: &str) -> Result<(), ChildSessionError>;
+    async fn delete_child_session(
+        &self,
+        parent_id: &str,
+        child_id: &str,
+    ) -> Result<DeleteChildResult, ChildSessionError>;
+    /// Return live diagnostic info for a running child session, if available.
+    async fn get_child_runner_info(&self, child_id: &str) -> Option<ChildRunnerInfo>;
+
+    /// Register a durable parent wait for a single child immediately before it
+    /// is enqueued. Idempotent and coalesced per parent (concurrent sibling
+    /// spawns merge into one write).
+    async fn register_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        tool_call_id: Option<&str>,
+    ) -> Result<(), ChildSessionError>;
+
+    /// Compensate a failed child launch by removing only that child from the
+    /// parent's durable wait. Implementations must preserve concurrently
+    /// registered siblings and clear the suspension marker only when the wait
+    /// becomes empty.
+    async fn rollback_parent_wait_for_child(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<(), ChildSessionError> {
+        let _ = (parent_session_id, child_session_id);
+        Err(ChildSessionError::Execution(
+            "parent-wait rollback is not configured for this runtime".to_string(),
+        ))
+    }
+
+    /// Register a durable parent wait over an explicit set of children with a
+    /// chosen policy (the `SubAgent.wait` action). Returns the number of
+    /// children the wait now covers (0 = nothing to wait on).
+    async fn register_parent_wait_for_children(
+        &self,
+        parent_session_id: &str,
+        child_session_ids: &[String],
+        policy: ChildWaitPolicy,
+    ) -> Result<usize, ChildSessionError>;
+
+    /// Tool-registered explicit wait. Implementations must persist the tool
+    /// call ID with the wait so final runner saves can distinguish a completed
+    /// wait from an unpersisted runner-created safety-net wait.
+    async fn register_parent_wait_for_children_tagged(
+        &self,
+        _parent_session_id: &str,
+        _child_session_ids: &[String],
+        _policy: ChildWaitPolicy,
+        _tool_call_id: &str,
+    ) -> Result<usize, ChildSessionError> {
+        Err(ChildSessionError::Execution(
+            "tagged parent wait is not configured for this runtime".to_string(),
+        ))
+    }
+
+    /// The parent's currently-active (non-terminal) child session ids.
+    async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String>;
+
+    /// The subset of `candidates` the session index POSITIVELY reports as
+    /// terminal children of this parent, as `(child_id, status)` pairs
+    /// (issue #546). `SubAgent.wait` uses this to avoid arming a wait over a
+    /// child that fires no further completion — and, policy-permitting, to
+    /// short-circuit a wait the terminal statuses already satisfy. Unknown
+    /// ids are NOT reported (index-less backends can't distinguish "terminal"
+    /// from "not yet indexed"); the child-wait watchdog rescues those at
+    /// runtime. Default: empty (no filtering).
+    async fn terminal_child_ids(
+        &self,
+        parent_session_id: &str,
+        candidates: &[String],
+    ) -> Vec<(String, String)> {
+        let _ = (parent_session_id, candidates);
+        Vec::new()
+    }
+
+    /// Find an existing resident agent in the same root tree by its stable
+    /// `resident_name`, returning its child session id if one exists. Used to
+    /// reuse a resident agent for a new task instead of minting a new child.
+    /// Index-backed (matches `root_session_id` + `metadata["resident_name"]`).
+    async fn find_resident_child(
+        &self,
+        root_session_id: &str,
+        resident_name: &str,
+    ) -> Option<String>;
+
+    /// Best-effort: ensure the child's session-index entry is visible
+    /// immediately after creation (the index is otherwise eventually
+    /// consistent). Failures are ignored by the caller.
+    async fn ensure_child_indexed(&self, child_session_id: &str);
+}
+
+fn normalize_child_workspace(requested_workspace: &str) -> Result<String, ChildSessionError> {
+    let requested_workspace = requested_workspace.trim();
+    if requested_workspace.is_empty() {
+        return Err(ChildSessionError::InvalidArguments(
+            "child workspace must be a non-empty path".to_string(),
+        ));
+    }
+    let requested = std::path::PathBuf::from(requested_workspace);
+    if requested.exists() && !requested.is_dir() {
+        return Err(ChildSessionError::InvalidArguments(format!(
+            "child workspace is not a directory: {requested_workspace}"
+        )));
+    }
+    let canonical = requested.canonicalize().unwrap_or(requested);
+    let final_workspace = bamboo_agent_core::workspace_state::resolve_workspace_path(canonical);
+    Ok(bamboo_config::paths::path_to_display_string(
+        &final_workspace,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Subagent resolution port
+// ---------------------------------------------------------------------------
+
+/// Resolves subagent-type–specific configuration (model, runtime metadata)
+/// for the `SubAgent` tool.
+///
+/// Kept separate from [`ChildSessionPort`] (session CRUD/lifecycle/state): this
+/// port is pure `subagent_type` → config resolution (cross-provider model
+/// routing + actor/external-agent metadata). The server layer implements it;
+/// the tool depends only on the trait, carrying no `AppState` coupling.
+#[async_trait]
+pub trait SubagentResolutionPort: Send + Sync {
+    /// Provider+model ref for a `subagent_type`, or `None` to use defaults.
+    async fn resolve_subagent_model(
+        &self,
+        subagent_type: &str,
+    ) -> Option<bamboo_domain::ProviderModelRef>;
+
+    /// Runtime metadata (e.g. external-agent routing) for a `subagent_type`.
+    async fn resolve_runtime_metadata(&self, subagent_type: &str) -> HashMap<String, String>;
+}
+
+/// Models available from one configured provider (best-effort listing).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderModelList {
+    pub provider: String,
+    pub models: Vec<String>,
+    /// Set when this provider's listing failed (auth missing, network, …);
+    /// the provider is still usable with an explicitly known model id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Lists the models the parent can pin a child session to
+/// (`SubAgent` tool `action=list_models` / `create.model`).
+///
+/// Separate from [`SubagentResolutionPort`] because it is backed by the live
+/// provider registry rather than per-`subagent_type` config resolution.
+#[async_trait]
+pub trait ModelCatalogPort: Send + Sync {
+    /// Best-effort model listing per configured provider. Providers whose
+    /// listing fails are still returned (with `error` set) so the caller can
+    /// see they exist.
+    async fn list_models(&self) -> Vec<ProviderModelList>;
+
+    /// The default provider name (used to resolve a bare model id without a
+    /// `provider:` prefix).
+    fn default_provider(&self) -> String;
+}

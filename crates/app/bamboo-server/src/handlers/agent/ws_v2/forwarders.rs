@@ -1,0 +1,2002 @@
+//! Per-channel forwarder tasks for the v2 WS multiplex.
+//!
+//! Each subscribed channel runs its OWN task with its OWN broadcast receiver,
+//! pushing [`ServerEnvelope`]s onto its OWN bounded `mpsc` queue. The driver
+//! holds a `StreamMap<channel, ReceiverStream>` and drains every per-channel
+//! queue with a fair merge (see below) to the WS session.
+//!
+//! Backpressure (RFC §10-Q3): the design now gives **per-channel independence at
+//! BOTH ends**:
+//!   1. *Source* — each forwarder owns its own broadcast receiver, so a
+//!      slow/lagging channel only overruns its own broadcast ring and is never
+//!      blocked at the source by another channel (the lag recovery is local).
+//!   2. *Socket* — each forwarder owns its own bounded outbound queue
+//!      (`OUTBOUND_BUFFER`), and the driver merges them with `tokio_stream`'s
+//!      `StreamMap`, whose poll order ROTATES its start index every poll. So a
+//!      sustained burst on one channel fills only its OWN queue (its forwarder
+//!      then awaits on `send`, applying backpressure to THAT channel alone) and
+//!      can no longer head-of-line another channel's frames at the socket — the
+//!      shared-FIFO head-of-line point of the first cut is removed.
+//!
+//! Fairness guarantee (honest): the merge is **fair-ish, not strict
+//! round-robin**. `StreamMap` polls all ready per-channel queues starting from a
+//! randomized index each poll, so over time no channel is systematically starved, and a
+//! flooding channel cannot monopolize the socket while another has frames ready.
+//! It does NOT guarantee exact 1:1 interleaving or any latency bound; it
+//! guarantees starvation-freedom and that per-channel backpressure stays local.
+//!
+//! Ordering WITHIN a channel is preserved end-to-end: a single forwarder pushes
+//! to a single FIFO `mpsc`, and `StreamMap` drains each inner stream in order; it
+//! only interleaves ACROSS channels.
+//!
+//! The driver keeps a `JoinHandle` per channel AND the matching queue receiver in
+//! the `StreamMap`, both keyed by the channel id, so `unsubscribe` (or teardown)
+//! aborts exactly that forwarder AND drops its queue, leaving no orphaned
+//! broadcast reader and no stale queued frame.
+
+use std::future::Future;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::Serialize;
+use tokio::sync::{broadcast, mpsc};
+
+use bamboo_agent_core::AgentEvent;
+use bamboo_domain::ActorSnapshotError;
+use bamboo_engine::events::change_feed::ChangeEvent;
+use bamboo_engine::events::journal;
+use bamboo_engine::{
+    VisibleAssistantMessage, VisibleMessageEvent, VisibleMessageEventKind, VisibleMessageSnapshot,
+};
+
+use actix_web::web;
+
+use super::envelope::{
+    actor_snapshot_required_control, feed_reset_control, gap_control, terminal_control, Encoding,
+    OutFrame, ServerEnvelope,
+};
+use crate::app_state::actor_events::{
+    ActorHubMessage, ActorReplay, ActorSubscription, SequencedActorChange,
+};
+use crate::app_state::{AgentStatus, AppState};
+use crate::handlers::agent::events::{
+    has_running_child, reconcile_abandoned_startup, startup_reconcile_delay,
+    terminal_event_if_ready, Coalescer,
+};
+use crate::handlers::agent::stream::{plan_replay, ReplayPlan};
+
+/// What the driver sends to the WS writer: an already-encoded frame (a JSON text
+/// frame or a MessagePack binary frame), tagged so the driver picks
+/// `session.text` vs `session.binary` (v2-P3, #181). The forwarder encodes per
+/// the connection's [`Encoding`] up front, keeping the final encode out of the
+/// driver's hot select loop.
+pub(crate) type OutboundTx = mpsc::Sender<OutFrame>;
+
+/// Encode a server envelope per `encoding` and push it onto the shared outbound
+/// mpsc. Returns `false` if the driver-side receiver is gone (connection
+/// closing), so the forwarder stops.
+async fn send_env(out: &OutboundTx, encoding: Encoding, env: ServerEnvelope) -> bool {
+    match env.encode(encoding) {
+        Some(frame) => out.send(frame).await.is_ok(),
+        // A serialization failure is per-event; skip it but keep the forwarder
+        // alive (matches the v1 SSE `serde_json::to_string(...).ok()` discipline).
+        None => true,
+    }
+}
+
+/// Tree notifications are revision advances in the same durable per-Root
+/// domain as `PublicActorSubtreeSnapshot.stream_cursor`. There is no delta
+/// journal: every advance requires an authorized snapshot. Polling covers
+/// writers in other processes and does not rely on the process-local Actor Hub.
+pub(crate) fn spawn_actor_tree_forwarder(
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    state: web::Data<AppState>,
+    root_id: String,
+    since: Option<String>,
+) -> tokio::task::JoinHandle<()> {
+    let store = state.session_store.clone();
+    tokio::spawn(run_actor_tree_forwarder(
+        out,
+        encoding,
+        ch,
+        since,
+        Duration::from_secs(2),
+        move || {
+            let store = store.clone();
+            let root_id = root_id.clone();
+            async move { store.actor_tree_cursor(&root_id).await }
+        },
+    ))
+}
+
+async fn run_actor_tree_forwarder<F, Fut>(
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    since: Option<String>,
+    poll_interval: Duration,
+    mut read_cursor: F,
+) where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Option<(String, u64)>, ActorSnapshotError>>,
+{
+    // An unavailable transaction is temporary. Keep the channel alive and
+    // retry the same durable cursor after bounded backoff; once the write
+    // finishes, a successful read resumes normal polling cadence.
+    let mut next_delay = Duration::ZERO;
+    let mut retry_delay = Duration::ZERO;
+    let mut observed: Option<(String, u64)> = None;
+    let mut first = true;
+    loop {
+        if !next_delay.is_zero() {
+            tokio::time::sleep(next_delay).await;
+        }
+        // A commit racing this read is either in the read or in a later
+        // poll. Polling does not depend on process-local notifications.
+        let latest = match read_cursor().await {
+            Ok(latest) => latest,
+            Err(ActorSnapshotError::NotFound) => {
+                let _ = send_env(
+                        &out,
+                        encoding,
+                        ServerEnvelope::control(
+                            &ch,
+                            0,
+                            serde_json::json!({"type":"actor_snapshot_required","reason":"unavailable","cursor":null}),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            Err(error) => {
+                retry_delay = if retry_delay.is_zero() {
+                    poll_interval
+                } else {
+                    retry_delay.saturating_mul(2).min(Duration::from_secs(30))
+                };
+                next_delay = retry_delay;
+                tracing::debug!(%error, ?next_delay, "actor tree cursor poll will retry");
+                continue;
+            }
+        };
+        retry_delay = Duration::ZERO;
+        next_delay = poll_interval;
+        if !first && observed == latest {
+            continue;
+        }
+        let reason = if !first {
+            "changed"
+        } else if latest.is_none() {
+            "unavailable"
+        } else if since.is_none() {
+            "initial"
+        } else {
+            "gap"
+        };
+        let continuous = first
+            && latest
+                .as_ref()
+                .is_some_and(|(cursor, _)| since.as_deref() == Some(cursor.as_str()));
+        first = false;
+        observed = latest;
+        if continuous {
+            continue;
+        }
+        let (cursor, revision) = observed.as_ref().map_or((None, 0), |(cursor, revision)| {
+            (Some(cursor.as_str()), *revision)
+        });
+        if !send_env(
+            &out,
+            encoding,
+            ServerEnvelope::control(
+                &ch,
+                revision,
+                serde_json::json!({
+                    "type": "actor_snapshot_required",
+                    "reason": reason,
+                    "cursor": cursor,
+                }),
+            ),
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+async fn send_actor_change(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    item: &SequencedActorChange,
+) -> bool {
+    match serde_json::to_value(&item.change) {
+        Ok(change) => {
+            send_env(
+                out,
+                encoding,
+                ServerEnvelope::event(ch, item.cursor, change),
+            )
+            .await
+        }
+        Err(_) => false,
+    }
+}
+
+async fn send_actor_plan(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    plan: ActorReplay,
+    last: &mut u64,
+) -> bool {
+    match plan {
+        ActorReplay::Events(events) => {
+            for event in events {
+                if event.cursor > *last {
+                    if !send_actor_change(out, encoding, ch, &event).await {
+                        return false;
+                    }
+                    *last = event.cursor;
+                }
+            }
+        }
+        ActorReplay::SnapshotRequired { cursor, reason } => {
+            if !send_env(
+                out,
+                encoding,
+                ServerEnvelope::control(
+                    ch,
+                    cursor,
+                    actor_snapshot_required_control(reason, cursor),
+                ),
+            )
+            .await
+            {
+                return false;
+            }
+            *last = cursor;
+        }
+    }
+    true
+}
+
+/// One lazy canonical Actor channel. The subscription lease drops on abort,
+/// closing the source sender and replay window after the final observer leaves.
+pub(crate) fn spawn_actor_forwarder(
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    mut subscription: ActorSubscription,
+    since: Option<u64>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last = since.unwrap_or(0);
+        let initial = std::mem::replace(&mut subscription.initial, ActorReplay::Events(Vec::new()));
+        if !send_actor_plan(&out, encoding, &ch, initial, &mut last).await {
+            return;
+        }
+        loop {
+            match subscription.receiver.recv().await {
+                Ok(ActorHubMessage::Change(item)) => {
+                    if item.cursor <= last {
+                        continue; // replay/live overlap
+                    }
+                    if item.cursor != last.saturating_add(1) {
+                        let plan = subscription.replay_after(last);
+                        if !send_actor_plan(&out, encoding, &ch, plan, &mut last).await {
+                            return;
+                        }
+                        if item.cursor <= last {
+                            continue;
+                        }
+                    }
+                    if !send_actor_change(&out, encoding, &ch, &item).await {
+                        return;
+                    }
+                    last = item.cursor;
+                }
+                Ok(ActorHubMessage::Reset(cursor)) => {
+                    if !send_actor_plan(
+                        &out,
+                        encoding,
+                        &ch,
+                        ActorReplay::SnapshotRequired {
+                            cursor,
+                            reason: "gap",
+                        },
+                        &mut last,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let plan = subscription.replay_after(last);
+                    if !send_actor_plan(&out, encoding, &ch, plan, &mut last).await {
+                        return;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
+}
+
+/// Spawn the `feed` forwarder.
+///
+/// Replicates the v1 SSE feed's subscribe-first → replay → live-skip → re-seek
+/// discipline **exactly** (it reuses the same [`plan_replay`] / journal reads),
+/// so a resuming client sees every event after its cursor exactly once with no
+/// duplication across the handoff. The caller MUST have already subscribed
+/// (`receiver`) before computing `latest_at_start`, so events written during
+/// replay are buffered in the ring (no gap).
+pub(crate) fn spawn_feed_forwarder(
+    out: OutboundTx,
+    encoding: Encoding,
+    mut receiver: broadcast::Receiver<Arc<ChangeEvent>>,
+    events_dir: PathBuf,
+    since: u64,
+    latest_at_start: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Phase A: replay the durable journal from the cursor (with a feed_reset
+        // directive when the cursor predates the retained window).
+        let ReplayPlan {
+            reset_from,
+            events,
+            last_replayed,
+        } = plan_replay(&events_dir, since, latest_at_start);
+        let mut last_replayed = last_replayed;
+
+        if let Some(from) = reset_from {
+            // seq 0 on a control frame: the reset itself carries no feed seq; the
+            // client resyncs via REST and the live tail serves anything newer.
+            if !send_env(
+                &out,
+                encoding,
+                ServerEnvelope::control("feed", 0, feed_reset_control(from)),
+            )
+            .await
+            {
+                return;
+            }
+        }
+        for ce in events {
+            if !send_env(&out, encoding, feed_envelope(&ce)).await {
+                return;
+            }
+        }
+
+        // Phase B: live tail with overlap-dedupe and lagged re-seek.
+        loop {
+            match receiver.recv().await {
+                Ok(ce) => {
+                    if ce.seq <= last_replayed {
+                        continue; // dedupe the replay/live overlap
+                    }
+                    if !send_env(&out, encoding, feed_envelope(&ce)).await {
+                        return;
+                    }
+                    last_replayed = ce.seq;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Ring overran during a slow consumer; recover the gap from
+                    // the durable journal (the backstop), then continue live.
+                    if let Ok(events) = journal::read_since(&events_dir, last_replayed) {
+                        for ce in events {
+                            if ce.seq <= last_replayed {
+                                continue;
+                            }
+                            if !send_env(&out, encoding, feed_envelope(&ce)).await {
+                                return;
+                            }
+                            last_replayed = ce.seq;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// Build a `feed` envelope: `seq` = the `ChangeEvent.seq`, and the WHOLE
+/// `ChangeEvent` is serialized as `event` to preserve its schema byte-for-byte.
+fn feed_envelope(ce: &ChangeEvent) -> ServerEnvelope {
+    let event = serde_json::to_value(ce).unwrap_or(serde_json::Value::Null);
+    ServerEnvelope::event("feed", ce.seq, event)
+}
+
+/// Per-session monotonic envelope-seq counter for an `agent.{sid}` channel.
+/// `AgentEvent` carries no seq of its own, so the forwarder mints one.
+#[derive(Default)]
+pub(crate) struct AgentSeq(AtomicU64);
+
+impl AgentSeq {
+    /// Return the next seq (1-based, strictly increasing).
+    pub(crate) fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MessageWireItem {
+    id: String,
+    content: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<VisibleAssistantMessage> for MessageWireItem {
+    fn from(message: VisibleAssistantMessage) -> Self {
+        Self {
+            id: message.id,
+            content: message.content,
+            created_at: message.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct MessageSnapshotWire {
+    r#type: &'static str,
+    version: u64,
+    messages: Vec<MessageWireItem>,
+    history_committed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MessageEventWire {
+    Started {
+        version: u64,
+        message_id: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    },
+    Delta {
+        version: u64,
+        message_id: String,
+        offset: usize,
+        content: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    },
+    Discarded {
+        version: u64,
+        message_id: String,
+    },
+}
+
+fn message_snapshot_value(snapshot: VisibleMessageSnapshot) -> serde_json::Value {
+    serde_json::to_value(MessageSnapshotWire {
+        r#type: "snapshot",
+        version: snapshot.version,
+        messages: snapshot.messages.into_iter().map(Into::into).collect(),
+        history_committed: snapshot.history_committed,
+        terminal: snapshot.terminal,
+    })
+    .unwrap_or(serde_json::Value::Null)
+}
+
+fn message_event_value(event: VisibleMessageEvent) -> Option<serde_json::Value> {
+    let wire = match event.kind {
+        VisibleMessageEventKind::Started {
+            message_id,
+            created_at,
+        } => MessageEventWire::Started {
+            version: event.version,
+            message_id,
+            created_at,
+        },
+        VisibleMessageEventKind::Delta {
+            message_id,
+            offset,
+            content,
+            created_at,
+        } => MessageEventWire::Delta {
+            version: event.version,
+            message_id,
+            offset,
+            content,
+            created_at,
+        },
+        VisibleMessageEventKind::Discarded { message_id } => MessageEventWire::Discarded {
+            version: event.version,
+            message_id,
+        },
+        VisibleMessageEventKind::Terminal { .. } | VisibleMessageEventKind::HistoryCommitted => {
+            return None
+        }
+    };
+    serde_json::to_value(wire).ok()
+}
+
+fn history_committed_control(version: u64) -> serde_json::Value {
+    serde_json::json!({ "type": "history_committed", "version": version })
+}
+
+struct MessageSource {
+    run_id: String,
+    receiver: broadcast::Receiver<VisibleMessageEvent>,
+    last_version: u64,
+}
+
+async fn current_message_source(
+    state: &web::Data<AppState>,
+    session_id: &str,
+) -> Option<(MessageSource, VisibleMessageSnapshot)> {
+    let runners = state.agent_runners.read().await;
+    let runner = runners.get(session_id)?;
+    let run_id = runner.run_id.clone();
+    let (receiver, snapshot) = runner.visible_messages.subscribe_with_snapshot();
+    let source = MessageSource {
+        run_id,
+        receiver,
+        last_version: snapshot.version,
+    };
+    Some((source, snapshot))
+}
+
+async fn emit_message_snapshot(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+    snapshot: VisibleMessageSnapshot,
+) -> bool {
+    send_env(
+        out,
+        encoding,
+        ServerEnvelope::event(ch, seq.next(), message_snapshot_value(snapshot)),
+    )
+    .await
+}
+
+async fn emit_message_event(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+    event: VisibleMessageEvent,
+) -> bool {
+    let version = event.version;
+    let env = match event.kind {
+        VisibleMessageEventKind::Terminal { reason } => {
+            ServerEnvelope::control(ch, seq.next(), terminal_control(&reason))
+        }
+        VisibleMessageEventKind::HistoryCommitted => {
+            ServerEnvelope::control(ch, seq.next(), history_committed_control(version))
+        }
+        kind => {
+            let Some(value) = message_event_value(VisibleMessageEvent { version, kind }) else {
+                return true;
+            };
+            ServerEnvelope::event(ch, seq.next(), value)
+        }
+    };
+    send_env(out, encoding, env).await
+}
+
+async fn replace_message_source(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+) -> Result<Option<MessageSource>, ()> {
+    match current_message_source(state, session_id).await {
+        Some((source, snapshot)) => {
+            if emit_message_snapshot(out, encoding, ch, seq, snapshot).await {
+                Ok(Some(source))
+            } else {
+                Err(())
+            }
+        }
+        None => {
+            let snapshot = VisibleMessageSnapshot {
+                version: 0,
+                messages: Vec::new(),
+                terminal: None,
+                // No runner is not evidence that its final history was saved.
+                history_committed: false,
+            };
+            if emit_message_snapshot(out, encoding, ch, seq, snapshot).await {
+                Ok(None)
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
+enum MessageInput {
+    Visible(Result<VisibleMessageEvent, broadcast::error::RecvError>),
+    Generation(Result<Box<AgentEvent>, broadcast::error::RecvError>),
+}
+
+async fn receive_visible(
+    source: &mut Option<MessageSource>,
+) -> Result<VisibleMessageEvent, broadcast::error::RecvError> {
+    match source {
+        Some(source) => source.receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Spawn a strictly message-only `message.{sid}` forwarder.
+pub(crate) fn spawn_message_forwarder(
+    state: web::Data<AppState>,
+    session_id: String,
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    mut generation_receiver: broadcast::Receiver<AgentEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let seq = AgentSeq::default();
+        let _watcher_guard = crate::app_state::watchers::WatcherGuard::new(
+            state.session_watchers.clone(),
+            &session_id,
+        );
+        let mut source =
+            match replace_message_source(&state, &session_id, &out, encoding, &ch, &seq).await {
+                Ok(source) => source,
+                Err(()) => return,
+            };
+
+        loop {
+            let input = tokio::select! {
+                visible = receive_visible(&mut source) => MessageInput::Visible(visible),
+                generation = generation_receiver.recv() => {
+                    MessageInput::Generation(generation.map(Box::new))
+                },
+            };
+            match input {
+                MessageInput::Visible(Ok(event)) => {
+                    let generation_matches = {
+                        let runners = state.agent_runners.read().await;
+                        source.as_ref().is_some_and(|current| {
+                            runners
+                                .get(&session_id)
+                                .is_some_and(|runner| runner.run_id == current.run_id)
+                        })
+                    };
+                    if !generation_matches {
+                        source = match replace_message_source(
+                            &state,
+                            &session_id,
+                            &out,
+                            encoding,
+                            &ch,
+                            &seq,
+                        )
+                        .await
+                        {
+                            Ok(source) => source,
+                            Err(()) => return,
+                        };
+                        continue;
+                    }
+                    let Some(current) = source.as_mut() else {
+                        continue;
+                    };
+                    if event.version <= current.last_version {
+                        continue;
+                    }
+                    current.last_version = event.version;
+                    if !emit_message_event(&out, encoding, &ch, &seq, event).await {
+                        return;
+                    }
+                }
+                MessageInput::Visible(Err(broadcast::error::RecvError::Lagged(skipped)))
+                | MessageInput::Generation(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                    if !send_env(
+                        &out,
+                        encoding,
+                        ServerEnvelope::control(&ch, seq.next(), gap_control(skipped)),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    source = match replace_message_source(
+                        &state,
+                        &session_id,
+                        &out,
+                        encoding,
+                        &ch,
+                        &seq,
+                    )
+                    .await
+                    {
+                        Ok(source) => source,
+                        Err(()) => return,
+                    };
+                }
+                MessageInput::Visible(Err(broadcast::error::RecvError::Closed)) => {
+                    source = None;
+                    if !send_env(
+                        &out,
+                        encoding,
+                        ServerEnvelope::control(&ch, seq.next(), gap_control(0)),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                }
+                MessageInput::Generation(Ok(event)) => {
+                    let AgentEvent::ExecutionStarted {
+                        run_id,
+                        session_id: started_session,
+                        ..
+                    } = event.as_ref()
+                    else {
+                        // Full-fidelity events are internal generation signals only.
+                        continue;
+                    };
+                    if started_session != &session_id {
+                        continue;
+                    }
+                    if source
+                        .as_ref()
+                        .is_some_and(|current| current.run_id == *run_id)
+                    {
+                        continue;
+                    }
+                    if let Some((next, snapshot)) =
+                        current_message_source(&state, &session_id).await
+                    {
+                        if next.run_id != *run_id {
+                            continue;
+                        }
+                        if !emit_message_snapshot(&out, encoding, &ch, &seq, snapshot).await {
+                            return;
+                        }
+                        source = Some(next);
+                    }
+                }
+                MessageInput::Generation(Err(broadcast::error::RecvError::Closed)) => return,
+            }
+        }
+    })
+}
+
+/// Spawn an `agent.{sid}` forwarder.
+///
+/// Mirrors the v1 per-session SSE path: replay cached critical state events
+/// (and the last budget event) first, then live-tail. Reuses the v1
+/// [`Coalescer`] for token batching when `batch_ms > 0` (default 0 = no
+/// coalescing). On any terminal event it emits a `terminal` control frame.
+///
+/// `ch` is the full channel id (`agent.{sid}`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_agent_forwarder(
+    state: web::Data<AppState>,
+    session_id: String,
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    mut receiver: broadcast::Receiver<AgentEvent>,
+    budget_event_to_replay: Option<AgentEvent>,
+    critical_events_to_replay: Vec<AgentEvent>,
+    batch_ms: u64,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let seq = AgentSeq::default();
+
+        // Held for the whole forwarder task's lifetime: dropped on graceful
+        // completion (terminal/closed) OR on `JoinHandle::abort()` (channel
+        // unsubscribe / connection teardown both abort this task — Tokio
+        // still runs its local drop glue), decrementing the session's
+        // live-watcher count. Never read — only its RAII drop matters.
+        let _watcher_guard = crate::app_state::watchers::WatcherGuard::new(
+            state.session_watchers.clone(),
+            &session_id,
+        );
+
+        // Replay cached critical state events first (task list, sub-sessions, …),
+        // then the last budget event — mirroring the v1 SSE replay order.
+        for event in critical_events_to_replay {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+                return;
+            }
+        }
+        if let Some(event) = budget_event_to_replay {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+                return;
+            }
+        }
+
+        let initial_reconcile_delay = startup_reconcile_delay(&state, &session_id).await;
+        let startup_reconcile = tokio::time::sleep(initial_reconcile_delay);
+        tokio::pin!(startup_reconcile);
+
+        if batch_ms == 0 {
+            // Fast path: every event emitted immediately, byte-for-byte (desktop
+            // default), with no buffering.
+            //
+            // Terminal handling mirrors the v1 SSE stream: the parent's own turn
+            // can finish while its child sub-agents are still running. Children
+            // outlive the parent turn and forward their progress/preview onto THIS
+            // session's broadcast, so we must NOT close the channel on the parent
+            // terminal while descendants remain — doing so would silently drop
+            // every later child event. Hold the channel open and emit the
+            // `terminal` control only once no running child is left.
+            let mut awaiting_children = false;
+            loop {
+                let received = tokio::select! {
+                    received = receiver.recv() => received,
+                    _ = &mut startup_reconcile => {
+                        if reconcile_abandoned_startup(
+                            &state,
+                            &session_id,
+                            &receiver,
+                        ).await {
+                            let delay = startup_reconcile_delay(&state, &session_id).await;
+                            startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                            continue;
+                        }
+                        let delay = startup_reconcile_delay(&state, &session_id).await;
+                        startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                        continue;
+                    }
+                };
+                match received {
+                    Ok(event) => {
+                        let is_terminal = is_terminal_event(&event);
+                        let is_child_completed =
+                            matches!(event, AgentEvent::SubAgentCompleted { .. });
+                        if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+                            return;
+                        }
+                        if is_terminal {
+                            if has_running_child(&state, &session_id).await {
+                                awaiting_children = true;
+                                continue;
+                            }
+                            let _ = send_env(
+                                &out,
+                                encoding,
+                                ServerEnvelope::control(
+                                    &ch,
+                                    seq.next(),
+                                    terminal_control("complete"),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                        // A child just finished: if it was the last running child
+                        // after the parent already terminated, close now.
+                        if awaiting_children
+                            && is_child_completed
+                            && !has_running_child(&state, &session_id).await
+                        {
+                            let _ = send_env(
+                                &out,
+                                encoding,
+                                ServerEnvelope::control(
+                                    &ch,
+                                    seq.next(),
+                                    terminal_control("complete"),
+                                ),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        match handle_agent_lag(AgentLagContext {
+                            state: &state,
+                            session_id: &session_id,
+                            out: &out,
+                            encoding,
+                            channel: &ch,
+                            seq: &seq,
+                            skipped,
+                            own_terminal_already_emitted: awaiting_children,
+                        })
+                        .await
+                        {
+                            LagOutcome::Continue => continue,
+                            LagOutcome::Stop | LagOutcome::Disconnected => return,
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        }
+
+        // Coalescing path (`batch_ms > 0`): reuse the v1 Coalescer so token-class
+        // events of the same channel merge into one frame, flushed on a different
+        // event / the deadline / a terminal / a lag gap / close. Order is
+        // preserved by the Coalescer (push returns the flushed pending FIRST).
+        let mut coalescer = Coalescer::default();
+        let flush_window = Duration::from_millis(batch_ms);
+        let mut flush_deadline: Option<tokio::time::Instant> = None;
+        // See the fast-path comment: keep the channel open after the parent
+        // terminal while child sub-agents still run.
+        let mut awaiting_children = false;
+
+        loop {
+            let sleep_until = flush_deadline
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+
+            tokio::select! {
+                _ = &mut startup_reconcile => {
+                    if reconcile_abandoned_startup(
+                        &state,
+                        &session_id,
+                        &receiver,
+                    ).await {
+                        let delay = startup_reconcile_delay(&state, &session_id).await;
+                        startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                        continue;
+                    }
+                    let delay = startup_reconcile_delay(&state, &session_id).await;
+                    startup_reconcile.as_mut().reset(tokio::time::Instant::now() + delay);
+                }
+                _ = tokio::time::sleep_until(sleep_until), if flush_deadline.is_some() => {
+                    if let Some(pending) = coalescer.take_pending() {
+                        if !emit_agent_event(&out, encoding, &ch, &seq, pending).await {
+                            return;
+                        }
+                    }
+                    flush_deadline = None;
+                }
+                recv = receiver.recv() => {
+                    match recv {
+                        Ok(event) => {
+                            let is_terminal = is_terminal_event(&event);
+                            let is_child_completed =
+                                matches!(event, AgentEvent::SubAgentCompleted { .. });
+                            // Feed through the coalescer: it returns the ordered
+                            // events to emit now (a flushed pending buffer then the
+                            // new event when non-coalescible). Terminal events are
+                            // non-coalescible, so any pending tokens flush first.
+                            for out_event in coalescer.push(event) {
+                                if !emit_agent_event(&out, encoding, &ch, &seq, out_event).await {
+                                    return;
+                                }
+                            }
+                            if coalescer.has_pending() {
+                                if flush_deadline.is_none() {
+                                    flush_deadline =
+                                        Some(tokio::time::Instant::now() + flush_window);
+                                }
+                            } else {
+                                flush_deadline = None;
+                            }
+                            if is_terminal {
+                                // Keep the channel open while children run (v1
+                                // parity); the pending buffer was already flushed
+                                // above since a terminal is non-coalescible.
+                                if has_running_child(&state, &session_id).await {
+                                    awaiting_children = true;
+                                    continue;
+                                }
+                                let _ = send_env(
+                                    &out,
+                                    encoding,
+                                    ServerEnvelope::control(&ch, seq.next(), terminal_control("complete")),
+                                )
+                                .await;
+                                return;
+                            }
+                            if awaiting_children
+                                && is_child_completed
+                                && !has_running_child(&state, &session_id).await
+                            {
+                                let _ = send_env(
+                                    &out,
+                                    encoding,
+                                    ServerEnvelope::control(&ch, seq.next(), terminal_control("complete")),
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // A lag gap dropped intervening events; flush the
+                            // pending buffer so we never merge tokens across the
+                            // gap and fabricate adjacency.
+                            if let Some(pending) = coalescer.take_pending() {
+                                if !emit_agent_event(&out, encoding, &ch, &seq, pending).await {
+                                    return;
+                                }
+                                flush_deadline = None;
+                            }
+                            match handle_agent_lag(AgentLagContext {
+                                state: &state,
+                                session_id: &session_id,
+                                out: &out,
+                                encoding,
+                                channel: &ch,
+                                seq: &seq,
+                                skipped,
+                                own_terminal_already_emitted: awaiting_children,
+                            })
+                            .await
+                            {
+                                LagOutcome::Continue => {}
+                                LagOutcome::Stop | LagOutcome::Disconnected => return,
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Flush any buffered tokens before closing.
+                            if let Some(pending) = coalescer.take_pending() {
+                                let _ = emit_agent_event(&out, encoding, &ch, &seq, pending).await;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Spawn a one-shot `agent.{sid}` replay for a session that was already
+/// terminal when the client subscribed. This mirrors the v1 SSE terminal
+/// response: cached critical state, budget state, synthesized terminal event,
+/// then exactly one terminal control before the per-channel queue closes.
+pub(crate) fn spawn_agent_terminal_forwarder(
+    out: OutboundTx,
+    encoding: Encoding,
+    ch: String,
+    budget_event_to_replay: Option<AgentEvent>,
+    critical_events_to_replay: Vec<AgentEvent>,
+    terminal_event: AgentEvent,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let seq = AgentSeq::default();
+        for event in critical_events_to_replay {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+                return;
+            }
+        }
+        if let Some(event) = budget_event_to_replay {
+            if !emit_agent_event(&out, encoding, &ch, &seq, event).await {
+                return;
+            }
+        }
+        if !emit_agent_event(&out, encoding, &ch, &seq, terminal_event).await {
+            return;
+        }
+        let _ = send_env(
+            &out,
+            encoding,
+            ServerEnvelope::control(&ch, seq.next(), terminal_control("complete")),
+        )
+        .await;
+    })
+}
+
+/// What the agent forwarder should do after a broadcast-lag recovery attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum LagOutcome {
+    /// Keep live-tailing (the run is still live, or the socket is closing).
+    Continue,
+    /// The lost gap swallowed the run's terminal; the synthesized terminal was
+    /// emitted and the channel is done.
+    Stop,
+    /// The outbound queue is gone (connection closing) — stop silently.
+    Disconnected,
+}
+
+/// Named state for one broadcast-lag recovery decision.
+struct AgentLagContext<'a> {
+    state: &'a web::Data<AppState>,
+    session_id: &'a str,
+    out: &'a OutboundTx,
+    encoding: Encoding,
+    channel: &'a str,
+    seq: &'a AgentSeq,
+    skipped: u64,
+    own_terminal_already_emitted: bool,
+}
+
+/// Recover from a broadcast-ring overrun on an `agent.{sid}` channel (#543).
+///
+/// Agent events have NO durable journal (unlike the feed), so a lag gap is
+/// unrecoverable data loss — the events are gone. What we CAN do:
+///
+/// 1. Tell the client: emit a `{type:"gap", skipped}` control so it reconciles
+///    the session's authoritative state via REST instead of trusting a
+///    transcript with a hole in it.
+/// 2. Self-heal a swallowed terminal: if the runner is no longer `Running` and
+///    the one-shot predicate ([`terminal_event_if_ready`] — not suspended, no
+///    pending resume, no running child) says the run is over, the gap ate the
+///    terminal event. Emit the synthesized terminal + the `terminal` control
+///    and close, exactly as if the real one had been delivered — otherwise the
+///    channel goes silent forever and the client shows the last tool call as
+///    running indefinitely ON A HEALTHY SOCKET (the keepalive watchdog cannot
+///    catch this: keepalives keep arriving).
+///
+/// `own_terminal_already_emitted` is the caller's `awaiting_children` state:
+/// the parent's REAL terminal event already reached the client and the channel
+/// is only held open for child sub-agents. If the gap then swallows the last
+/// `SubAgentCompleted`, self-heal must send ONLY the `terminal` control —
+/// mirroring the normal `is_child_completed && !has_running_child` close — and
+/// never a second, synthesized terminal event for a session whose completion
+/// the client already saw.
+async fn handle_agent_lag(context: AgentLagContext<'_>) -> LagOutcome {
+    let AgentLagContext {
+        state,
+        session_id,
+        out,
+        encoding,
+        channel,
+        seq,
+        skipped,
+        own_terminal_already_emitted,
+    } = context;
+    tracing::warn!(
+        "[{}] ws_v2 agent channel lagged: {} events lost to broadcast-ring overrun; \
+         emitting gap control (client must reconcile via REST)",
+        session_id,
+        skipped
+    );
+    if !send_env(
+        out,
+        encoding,
+        ServerEnvelope::control(channel, seq.next(), gap_control(skipped)),
+    )
+    .await
+    {
+        return LagOutcome::Disconnected;
+    }
+
+    let runner_status = {
+        let runners = state.agent_runners.read().await;
+        runners.get(session_id).map(|runner| runner.status.clone())
+    };
+    if matches!(runner_status, Some(AgentStatus::Running)) {
+        return LagOutcome::Continue;
+    }
+    let Some(terminal_event) = terminal_event_if_ready(state, session_id, runner_status).await
+    else {
+        return LagOutcome::Continue;
+    };
+
+    tracing::warn!(
+        "[{}] ws_v2 agent channel: lag gap swallowed the run's terminal \
+         (own_terminal_already_emitted={}); closing the channel",
+        session_id,
+        own_terminal_already_emitted
+    );
+    // Only synthesize a terminal EVENT when the client never saw the real one.
+    // In the awaiting-children window the parent's terminal was already
+    // delivered — a second one would be a spurious duplicate completion.
+    if !own_terminal_already_emitted
+        && !emit_agent_event(out, encoding, channel, seq, terminal_event).await
+    {
+        return LagOutcome::Disconnected;
+    }
+    let _ = send_env(
+        out,
+        encoding,
+        ServerEnvelope::control(channel, seq.next(), terminal_control("complete")),
+    )
+    .await;
+    LagOutcome::Stop
+}
+
+/// Serialize an `AgentEvent` into an `{ch, seq, event}` envelope and push it,
+/// encoded per `encoding`.
+async fn emit_agent_event(
+    out: &OutboundTx,
+    encoding: Encoding,
+    ch: &str,
+    seq: &AgentSeq,
+    event: AgentEvent,
+) -> bool {
+    let value = match serde_json::to_value(&event) {
+        Ok(v) => v,
+        // Skip an unserializable event but keep the forwarder alive (v1 parity).
+        Err(_) => return true,
+    };
+    send_env(out, encoding, ServerEnvelope::event(ch, seq.next(), value)).await
+}
+
+/// Whether an agent event terminates the run (mirrors the v1 SSE predicate).
+fn is_terminal_event(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::Complete { .. } | AgentEvent::Cancelled { .. } | AgentEvent::Error { .. }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::AgentRunner;
+    use std::collections::VecDeque;
+
+    #[tokio::test]
+    async fn actor_tree_retries_pending_transaction_then_sends_recovered_cursor() {
+        let (out, mut rx) = mpsc::channel(4);
+        let mut reads = VecDeque::from([
+            Err(ActorSnapshotError::PendingTransaction),
+            Ok(Some(("root:1".to_owned(), 1))),
+            Err(ActorSnapshotError::PendingTransaction),
+            Ok(Some(("root:2".to_owned(), 2))),
+        ]);
+        let handle = tokio::spawn(run_actor_tree_forwarder(
+            out,
+            Encoding::Json,
+            "tree.root".to_owned(),
+            Some("root:1".to_owned()),
+            Duration::from_millis(10),
+            move || {
+                let read = reads
+                    .pop_front()
+                    .unwrap_or_else(|| Ok(Some(("root:2".to_owned(), 2))));
+                async move { read }
+            },
+        ));
+
+        let frame = next_json(&mut rx).await;
+        assert_eq!(frame["control"]["type"], "actor_snapshot_required");
+        assert_eq!(frame["control"]["reason"], "changed");
+        assert_eq!(frame["control"]["cursor"], "root:2");
+        assert_eq!(frame["seq"], 2);
+        assert!(
+            !handle.is_finished(),
+            "temporary errors keep the tree subscription open"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn actor_tree_not_found_sends_unavailable_and_ends_subscription() {
+        let (out, mut rx) = mpsc::channel(4);
+        let handle = tokio::spawn(run_actor_tree_forwarder(
+            out,
+            Encoding::Json,
+            "tree.root".to_owned(),
+            None,
+            Duration::from_millis(10),
+            || async { Err(ActorSnapshotError::NotFound) },
+        ));
+
+        let frame = next_json(&mut rx).await;
+        assert_eq!(frame["control"]["type"], "actor_snapshot_required");
+        assert_eq!(frame["control"]["reason"], "unavailable");
+        assert!(frame["control"]["cursor"].is_null());
+        handle.await.expect("not-found forwarder exits");
+    }
+
+    #[test]
+    fn agent_seq_is_monotonic_and_one_based() {
+        let seq = AgentSeq::default();
+        assert_eq!(seq.next(), 1);
+        assert_eq!(seq.next(), 2);
+        assert_eq!(seq.next(), 3);
+    }
+
+    #[test]
+    fn message_wire_schema_contains_only_visible_text_fields() {
+        let created_at = chrono::Utc::now();
+        let stream = bamboo_engine::VisibleMessageStream::new();
+        stream.start("message-1".to_string(), created_at);
+        stream.append("visible".to_string());
+        let (_receiver, snapshot) = stream.subscribe_with_snapshot();
+        let event = message_snapshot_value(snapshot);
+        assert_eq!(
+            event
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["history_committed", "messages", "type", "version"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        let message = event["messages"][0].as_object().unwrap();
+        assert_eq!(
+            message
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["content", "created_at", "id"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        let serialized = serde_json::to_string(&event).unwrap();
+        for forbidden in [
+            "reasoning",
+            "tool_calls",
+            "tool_result",
+            "metadata",
+            "content_parts",
+            "screenshot",
+            "approval",
+            "budget",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn message_delta_json_and_msgpack_use_the_same_safe_shape() {
+        let created_at = chrono::Utc::now();
+        let value = message_event_value(VisibleMessageEvent {
+            version: 9,
+            kind: VisibleMessageEventKind::Delta {
+                message_id: "message-1".to_string(),
+                offset: 3,
+                content: "ible".to_string(),
+                created_at,
+            },
+        })
+        .unwrap();
+        let envelope = ServerEnvelope::event("message.session-1", 2, value.clone());
+        let OutFrame::Binary(bytes) = envelope.encode(Encoding::Msgpack).unwrap() else {
+            panic!("msgpack must use binary frames");
+        };
+        let decoded: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded["event"], value);
+        let keys = decoded["event"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "content",
+                "created_at",
+                "message_id",
+                "offset",
+                "type",
+                "version"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        );
+    }
+
+    /// The live-skip predicate used in the feed handoff drops `seq <= cursor`
+    /// and keeps `seq > cursor`, so the replay/live overlap is deduped without
+    /// dropping anything past the cursor.
+    #[test]
+    fn feed_live_skip_predicate() {
+        let last_replayed = 1006u64;
+        let skip = |seq: u64| seq <= last_replayed;
+        assert!(skip(1005));
+        assert!(skip(1006)); // boundary: already replayed → skip
+        assert!(!skip(1007)); // first new event → keep
+        assert!(!skip(2000));
+    }
+
+    /// Smoke test that the v1 `Coalescer` is reachable + behaves from the ws_v2
+    /// module (proves the `pub(crate)` widening is wired, not just compiles).
+    #[test]
+    fn coalescer_reuse_smoke() {
+        let mut c = Coalescer::default();
+        assert!(c
+            .push(AgentEvent::Token {
+                content: "Hel".into()
+            })
+            .is_empty());
+        assert!(c
+            .push(AgentEvent::Token {
+                content: "lo".into()
+            })
+            .is_empty());
+        // A non-token event flushes the merged token first, in order.
+        let out = c.push(AgentEvent::Complete {
+            usage: Default::default(),
+        });
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            AgentEvent::Token { content } => assert_eq!(content, "Hello"),
+            other => panic!("expected merged Token, got {other:?}"),
+        }
+        assert!(matches!(out[1], AgentEvent::Complete { .. }));
+    }
+
+    #[test]
+    fn terminal_event_predicate() {
+        assert!(is_terminal_event(&AgentEvent::Complete {
+            usage: Default::default()
+        }));
+        assert!(is_terminal_event(&AgentEvent::Cancelled { message: None }));
+        assert!(is_terminal_event(&AgentEvent::Error {
+            message: "x".into()
+        }));
+        assert!(!is_terminal_event(&AgentEvent::Token {
+            content: "x".into()
+        }));
+    }
+
+    #[tokio::test]
+    async fn completed_subscription_replays_state_then_one_terminal_control() {
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let handle = spawn_agent_terminal_forwarder(
+            out_tx,
+            Encoding::Json,
+            "agent.done".to_string(),
+            None,
+            vec![AgentEvent::Token {
+                content: "critical-state".into(),
+            }],
+            AgentEvent::Complete {
+                usage: Default::default(),
+            },
+        );
+
+        let replay = next_json(&mut out_rx).await;
+        assert_eq!(replay["seq"], 1);
+        assert_eq!(replay["event"]["content"], "critical-state");
+        let terminal_event = next_json(&mut out_rx).await;
+        assert_eq!(terminal_event["seq"], 2);
+        assert_eq!(terminal_event["event"]["type"], "complete");
+        let terminal_control = next_json(&mut out_rx).await;
+        assert_eq!(terminal_control["seq"], 3);
+        assert_eq!(terminal_control["control"]["type"], "terminal");
+        handle.await.expect("one-shot forwarder completes");
+        assert!(
+            out_rx.recv().await.is_none(),
+            "terminal control is emitted once"
+        );
+    }
+
+    #[test]
+    fn feed_envelope_uses_change_event_seq_and_full_payload() {
+        let ce = ChangeEvent {
+            seq: 99,
+            ts: chrono::Utc::now(),
+            session_id: Some("s1".into()),
+            event: AgentEvent::Token {
+                content: "hi".into(),
+            },
+        };
+        let env = feed_envelope(&ce);
+        assert_eq!(env.seq, 99);
+        let v = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["ch"], "feed");
+        assert_eq!(v["seq"], 99);
+        // The whole ChangeEvent (seq, ts, session_id, event) is preserved.
+        assert_eq!(v["event"]["seq"], 99);
+        assert_eq!(v["event"]["session_id"], "s1");
+        assert_eq!(v["event"]["event"]["type"], "token");
+    }
+
+    // ── Broadcast-lag recovery (#543) ────────────────────────────────────────
+
+    /// Receive + decode the next JSON frame from the forwarder's outbound queue.
+    async fn next_json(rx: &mut mpsc::Receiver<OutFrame>) -> serde_json::Value {
+        match tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("frame arrives before timeout")
+            .expect("outbound queue still open")
+        {
+            OutFrame::Text(text) => serde_json::from_str(&text).expect("frame is JSON"),
+            OutFrame::Binary(_) => panic!("JSON mode must not emit binary frames"),
+        }
+    }
+
+    async fn test_state(session_id: &str) -> (web::Data<AppState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state = web::Data::new(AppState::new(tmp.path().to_path_buf()).await.unwrap());
+        let mut session = bamboo_agent_core::Session::new(session_id, "test-model");
+        // Last message = Assistant → does not prevent the one-shot terminal.
+        session.add_message(bamboo_agent_core::Message::assistant("done", None));
+        state.save_session(&mut session).await;
+        (state, tmp)
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_replays_safe_snapshot_and_ignores_full_fidelity_events() {
+        let (state, _tmp) = test_state("message-live").await;
+        let (generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(32);
+        let visible = {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry("message-live".to_string())
+                .or_insert_with(AgentRunner::new);
+            runner.status = AgentStatus::Running;
+            runner
+                .visible_messages
+                .start("visible-1".to_string(), chrono::Utc::now());
+            runner.visible_messages.append("before".to_string());
+            runner.visible_messages.clone()
+        };
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let handle = spawn_message_forwarder(
+            state,
+            "message-live".to_string(),
+            out_tx,
+            Encoding::Json,
+            "message.message-live".to_string(),
+            generation_rx,
+        );
+
+        let snapshot = next_json(&mut out_rx).await;
+        assert_eq!(snapshot["event"]["type"], "snapshot");
+        assert_eq!(snapshot["event"]["messages"][0]["id"], "visible-1");
+        assert_eq!(snapshot["event"]["messages"][0]["content"], "before");
+
+        for event in [
+            AgentEvent::ReasoningToken {
+                content: "private reasoning".to_string(),
+            },
+            AgentEvent::ToolToken {
+                tool_call_id: "tool-1".to_string(),
+                content: "private tool output".to_string(),
+            },
+            AgentEvent::Token {
+                content: "unsafe generic token".to_string(),
+            },
+        ] {
+            generation_tx.send(event).unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), out_rx.recv())
+                .await
+                .is_err(),
+            "full-fidelity events must never produce a message-channel frame"
+        );
+
+        visible.append(" after".to_string());
+        let delta = next_json(&mut out_rx).await;
+        assert_eq!(delta["event"]["type"], "delta");
+        assert_eq!(delta["event"]["message_id"], "visible-1");
+        assert_eq!(delta["event"]["offset"], 6);
+        assert_eq!(delta["event"]["content"], " after");
+
+        visible.mark_terminal("complete");
+        let terminal = next_json(&mut out_rx).await;
+        assert_eq!(terminal["control"], terminal_control("complete"));
+        visible.history_committed();
+        let committed = next_json(&mut out_rx).await;
+        assert_eq!(committed["control"]["type"], "history_committed");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_does_not_claim_history_commit_without_a_runner() {
+        let (state, _tmp) = test_state("message-no-runner").await;
+        let (_generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let handle = spawn_message_forwarder(
+            state,
+            "message-no-runner".to_string(),
+            out_tx,
+            Encoding::Json,
+            "message.message-no-runner".to_string(),
+            generation_rx,
+        );
+
+        let snapshot = next_json(&mut out_rx).await;
+        assert_eq!(snapshot["event"]["type"], "snapshot");
+        assert_eq!(snapshot["event"]["history_committed"], false);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_drops_queued_text_from_a_replaced_runner() {
+        let session_id = "message-replaced-runner";
+        let (state, _tmp) = test_state(session_id).await;
+        let old_visible = {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry(session_id.to_string())
+                .or_insert_with(AgentRunner::new);
+            runner
+                .visible_messages
+                .start("old".into(), chrono::Utc::now());
+            runner.visible_messages.append("old text".into());
+            runner.visible_messages.clone()
+        };
+        let (generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let handle = spawn_message_forwarder(
+            state.clone(),
+            session_id.to_string(),
+            out_tx,
+            Encoding::Json,
+            format!("message.{session_id}"),
+            generation_rx,
+        );
+        let first = next_json(&mut out_rx).await;
+        assert_eq!(first["event"]["messages"][0]["content"], "old text");
+
+        let new_run_id = {
+            let mut runners = state.agent_runners.write().await;
+            let replacement = AgentRunner::new();
+            let new_run_id = replacement.run_id.clone();
+            replacement
+                .visible_messages
+                .start("new".into(), chrono::Utc::now());
+            replacement.visible_messages.append("new text".into());
+            runners.insert(session_id.to_string(), replacement);
+            new_run_id
+        };
+        old_visible.append(" STALE_PRIVATE_TEXT".into());
+        generation_tx
+            .send(AgentEvent::ExecutionStarted {
+                run_id: new_run_id.clone(),
+                session_id: session_id.to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        let replacement = next_json(&mut out_rx).await;
+        assert_eq!(replacement["event"]["type"], "snapshot");
+        assert_eq!(replacement["event"]["messages"][0]["content"], "new text");
+        assert!(!replacement.to_string().contains("STALE_PRIVATE_TEXT"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), out_rx.recv())
+                .await
+                .is_err(),
+            "a queued start must not duplicate the replacement snapshot"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_forwarder_resnapshots_after_visible_channel_lag() {
+        let session_id = "message-lag-recovery";
+        let (state, _tmp) = test_state(session_id).await;
+        let visible = {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry(session_id.to_string())
+                .or_insert_with(AgentRunner::new);
+            runner
+                .visible_messages
+                .start("visible-1".into(), chrono::Utc::now());
+            runner.visible_messages.clone()
+        };
+        let (_generation_tx, generation_rx) = broadcast::channel::<AgentEvent>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let handle = spawn_message_forwarder(
+            state,
+            session_id.to_string(),
+            out_tx,
+            Encoding::Json,
+            format!("message.{session_id}"),
+            generation_rx,
+        );
+        let initial = next_json(&mut out_rx).await;
+        assert_eq!(initial["event"]["type"], "snapshot");
+
+        // The current-thread test does not yield while publishing, so the
+        // receiver must see a lagged ring rather than a partial token tail.
+        for _ in 0..1050 {
+            visible.append("x".into());
+        }
+        // A few deltas may already be in the outbound queue before the ring
+        // overflows; the forwarder must eventually announce the gap.
+        let mut gap = None;
+        for _ in 0..20 {
+            let frame = next_json(&mut out_rx).await;
+            if frame["control"]["type"] == "gap" {
+                gap = Some(frame);
+                break;
+            }
+            assert_eq!(frame["event"]["type"], "delta");
+        }
+        let gap = gap.expect("visible lag must be reported");
+        assert_eq!(gap["control"]["type"], "gap");
+        let recovered = next_json(&mut out_rx).await;
+        assert_eq!(recovered["event"]["type"], "snapshot");
+        assert_eq!(
+            recovered["event"]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .len(),
+            1050
+        );
+        handle.abort();
+    }
+
+    /// Overflow a 4-slot ring with 10 events BEFORE the forwarder polls, so its
+    /// first `recv()` yields `Lagged(6)` (the ring retains the newest 4). The
+    /// sender is returned so the caller keeps the channel open.
+    fn lagged_channel() -> (
+        broadcast::Sender<AgentEvent>,
+        broadcast::Receiver<AgentEvent>,
+    ) {
+        let (tx, rx) = broadcast::channel::<AgentEvent>(4);
+        for i in 0..10 {
+            let _ = tx.send(AgentEvent::Token {
+                content: format!("t{i}"),
+            });
+        }
+        (tx, rx)
+    }
+
+    /// The gap swallowed the run's terminal (no runner → the run is over, and
+    /// the session state allows the one-shot terminal): the forwarder must emit
+    /// the gap control, a SYNTHESIZED terminal event, and the terminal control,
+    /// then close — never strand the client on a silent channel (#543).
+    #[tokio::test]
+    async fn lag_emits_gap_control_and_synthesized_terminal_when_run_finished() {
+        let (state, _tmp) = test_state("lag-done").await;
+        let (_tx, rx) = lagged_channel();
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let _handle = spawn_agent_forwarder(
+            state.clone(),
+            "lag-done".to_string(),
+            out_tx,
+            Encoding::Json,
+            "agent.lag-done".to_string(),
+            rx,
+            None,
+            Vec::new(),
+            0,
+        );
+
+        let gap = next_json(&mut out_rx).await;
+        assert_eq!(gap["ch"], "agent.lag-done");
+        assert_eq!(gap["control"]["type"], "gap");
+        assert_eq!(gap["control"]["skipped"], 6);
+
+        let terminal_event = next_json(&mut out_rx).await;
+        assert_eq!(terminal_event["event"]["type"], "complete");
+
+        let terminal = next_json(&mut out_rx).await;
+        assert_eq!(terminal["control"]["type"], "terminal");
+
+        // The forwarder is done: its sender is dropped, closing the queue.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+                .await
+                .expect("close arrives before timeout")
+                .is_none(),
+            "channel must close after the synthesized terminal"
+        );
+    }
+
+    /// The run is still live (runner `Running`): the forwarder emits the gap
+    /// control so the client reconciles, then KEEPS tailing — the retained ring
+    /// events and later live events still flow.
+    #[tokio::test]
+    async fn lag_emits_gap_control_and_keeps_tailing_when_runner_running() {
+        let (state, _tmp) = test_state("lag-live").await;
+        {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry("lag-live".to_string())
+                .or_insert_with(AgentRunner::new);
+            runner.status = AgentStatus::Running;
+        }
+        let (tx, rx) = lagged_channel();
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let _handle = spawn_agent_forwarder(
+            state.clone(),
+            "lag-live".to_string(),
+            out_tx,
+            Encoding::Json,
+            "agent.lag-live".to_string(),
+            rx,
+            None,
+            Vec::new(),
+            0,
+        );
+
+        let gap = next_json(&mut out_rx).await;
+        assert_eq!(gap["control"]["type"], "gap");
+        assert_eq!(gap["control"]["skipped"], 6);
+
+        // The ring's retained tail (t6..t9) still flows after the gap.
+        for i in 6..10 {
+            let frame = next_json(&mut out_rx).await;
+            assert_eq!(frame["event"]["type"], "token");
+            assert_eq!(frame["event"]["content"], format!("t{i}"));
+        }
+
+        // And the channel is still LIVE: a later event arrives too.
+        let _ = tx.send(AgentEvent::Token {
+            content: "after-gap".to_string(),
+        });
+        let frame = next_json(&mut out_rx).await;
+        assert_eq!(frame["event"]["content"], "after-gap");
+    }
+
+    /// Review regression (#544): a lag inside the awaiting-children window —
+    /// the parent's REAL terminal was already delivered, the channel is only
+    /// held open for a child sub-agent, and the gap swallows the final
+    /// `SubAgentCompleted`. Self-heal must close with ONLY the `terminal`
+    /// control (mirroring the normal child-completion close) and never emit a
+    /// second, synthesized terminal event for a completion the client already
+    /// saw.
+    #[tokio::test]
+    async fn lag_during_awaiting_children_closes_without_duplicate_terminal_event() {
+        let (state, _tmp) = test_state("lag-parent").await;
+        // A REAL child session (kind=Child, root=parent) with a Running runner,
+        // so the parent's terminal holds the channel open (awaiting_children).
+        let mut child =
+            bamboo_agent_core::Session::new_child("lag-child", "lag-parent", "test-model", "child");
+        state.save_session(&mut child).await;
+        {
+            let mut runners = state.agent_runners.write().await;
+            let runner = runners
+                .entry("lag-child".to_string())
+                .or_insert_with(AgentRunner::new);
+            runner.status = AgentStatus::Running;
+        }
+
+        let (tx, rx) = broadcast::channel::<AgentEvent>(4);
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+        let _handle = spawn_agent_forwarder(
+            state.clone(),
+            "lag-parent".to_string(),
+            out_tx,
+            Encoding::Json,
+            "agent.lag-parent".to_string(),
+            rx,
+            None,
+            Vec::new(),
+            0,
+        );
+
+        // The parent's REAL terminal: emitted to the client, and the running
+        // child holds the channel open (no terminal control yet).
+        let _ = tx.send(AgentEvent::Complete {
+            usage: Default::default(),
+        });
+        let real_terminal = next_json(&mut out_rx).await;
+        assert_eq!(real_terminal["event"]["type"], "complete");
+
+        // The child finishes: its runner goes away — but the SubAgentCompleted
+        // that would have closed the channel is swallowed by a ring overrun.
+        {
+            let mut runners = state.agent_runners.write().await;
+            runners.remove("lag-child");
+        }
+        // Overflow the 4-slot ring synchronously (current-thread test runtime:
+        // the forwarder cannot run between these sends), so its next recv()
+        // yields Lagged and the SubAgentCompleted inside the gap is lost.
+        let _ = tx.send(AgentEvent::SubAgentCompleted {
+            parent_session_id: "lag-parent".to_string(),
+            child_session_id: "lag-child".to_string(),
+            status: "completed".to_string(),
+            error: None,
+        });
+        for i in 0..9 {
+            let _ = tx.send(AgentEvent::Token {
+                content: format!("child-tail-{i}"),
+            });
+        }
+
+        // Recovery: the gap control, then ONLY the terminal control — no second
+        // synthesized `complete` event.
+        let gap = next_json(&mut out_rx).await;
+        assert_eq!(gap["control"]["type"], "gap");
+        let terminal = next_json(&mut out_rx).await;
+        assert_eq!(
+            terminal["control"]["type"], "terminal",
+            "self-heal must close with the control only — a synthesized terminal \
+             event here would be a duplicate completion: {terminal}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
+                .await
+                .expect("close arrives before timeout")
+                .is_none(),
+            "channel must close after the terminal control"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_ws_reconciles_abandoned_startup_in_both_batch_paths() {
+        for batch_ms in [0, 1_000] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = web::Data::new(AppState::new(tmp.path().to_path_buf()).await.unwrap());
+            let session_id = format!("ws-abandoned-{batch_ms}");
+            let mut session = bamboo_agent_core::Session::new(&session_id, "test-model");
+            session.add_message(bamboo_agent_core::Message::user("slow startup"));
+            crate::handlers::agent::events::mark_pending_turn(&mut session);
+            session.metadata.insert(
+                "execute.startup_handoff_at".to_string(),
+                (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+            );
+            state.save_session(&mut session).await;
+
+            let tx = state.get_session_event_sender(&session_id).await;
+            let rx = tx.subscribe();
+            tx.send(AgentEvent::Token {
+                content: "before-terminal".to_string(),
+            })
+            .expect("live receiver");
+            let guard =
+                crate::handlers::agent::events::begin_execute_startup(state.get_ref(), &session_id);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                drop(guard);
+            });
+
+            let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+            let handle = spawn_agent_forwarder(
+                state,
+                session_id.clone(),
+                out_tx,
+                Encoding::Json,
+                format!("agent.{session_id}"),
+                rx,
+                None,
+                Vec::new(),
+                batch_ms,
+            );
+
+            let token = next_json(&mut out_rx).await;
+            assert_eq!(token["event"]["content"], "before-terminal");
+            let terminal_event = next_json(&mut out_rx).await;
+            assert_eq!(terminal_event["event"]["type"], "error");
+            assert!(terminal_event["event"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("was not started")));
+            let terminal_control = next_json(&mut out_rx).await;
+            assert_eq!(terminal_control["control"]["type"], "terminal");
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("forwarder terminates")
+                .expect("forwarder task succeeds");
+            assert!(out_rx.try_recv().is_err(), "replay must be one-shot");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_ws_idle_probe_discovers_later_abandoned_turn() {
+        for batch_ms in [0, 1_000] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let state = web::Data::new(AppState::new(tmp.path().to_path_buf()).await.unwrap());
+            let session_id = format!("ws-late-pending-{batch_ms}");
+            let mut session = bamboo_agent_core::Session::new(&session_id, "test-model");
+            state.save_session(&mut session).await;
+            let sender = state.get_session_event_sender(&session_id).await;
+            let receiver = sender.subscribe();
+            let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(64);
+            let handle = spawn_agent_forwarder(
+                state.clone(),
+                session_id.clone(),
+                out_tx,
+                Encoding::Json,
+                format!("agent.{session_id}"),
+                receiver,
+                None,
+                Vec::new(),
+                batch_ms,
+            );
+
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            session.add_message(bamboo_agent_core::Message::user("never executed"));
+            crate::handlers::agent::events::mark_pending_turn(&mut session);
+            session.metadata.insert(
+                "execute.startup_handoff_at".to_string(),
+                (chrono::Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
+            );
+            state.save_session(&mut session).await;
+
+            let terminal_event = next_json(&mut out_rx).await;
+            assert_eq!(terminal_event["event"]["type"], "error");
+            assert!(terminal_event["event"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("was not started")));
+            let terminal_control = next_json(&mut out_rx).await;
+            assert_eq!(terminal_control["control"]["type"], "terminal");
+            tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("forwarder terminates")
+                .expect("forwarder task succeeds");
+        }
+    }
+}

@@ -1,0 +1,1254 @@
+//! Execution context for tool calls.
+//!
+//! Tools normally return a single `ToolResult` after completion. Some tools
+//! (for example, long-running CLIs) may want to stream intermediate progress
+//! to clients. The agent loop passes a `ToolExecutionContext` that allows tools
+//! to emit `AgentEvent`s while they run.
+
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+
+use serde_json::Value;
+
+use crate::tools::{BashCompletionSink, ToolCall, ToolSchema};
+use crate::{AgentEvent, Session};
+use bamboo_domain::{
+    PermissionMode, SessionAuthorityIdentity, SessionKind, SupervisorReference,
+    DEFAULT_SUPERVISOR_SESSION_ID,
+};
+use uuid::Uuid;
+
+/// The lifetime observed when a real Supervisor Session admits a tool call.
+///
+/// This is not a grant: consumers must still check the reference against the
+/// canonical Supervisor service. It is intentionally separate from permission
+/// flags and is never deserialized from model arguments or permission lookups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExecutingSupervisorObservation {
+    incarnation_id: Uuid,
+}
+
+/// Host metadata only; never copied from a tool's result payload.
+const SUPERVISOR_PERMISSION_REPLAY_METADATA_KEY: &str = "permission.executing_supervisor.v1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SupervisorPermissionReplayRecord {
+    version: u8,
+    incarnation_id: Uuid,
+    session_id: String,
+    result_message_id: String,
+    request_generation: String,
+    tool_call: ToolCall,
+    execution_name: String,
+}
+
+impl ExecutingSupervisorObservation {
+    pub const PERMISSION_REPLAY_METADATA_KEY: &'static str =
+        SUPERVISOR_PERMISSION_REPLAY_METADATA_KEY;
+
+    /// Capture only from the Session actually executing the call, before its
+    /// context is queued or transferred. Never call this on a replacement
+    /// Session loaded to resolve configuration or replay an old operation.
+    pub fn capture_from_executing_session(session: &Session) -> Option<Self> {
+        let SessionAuthorityIdentity::Supervisor { incarnation_id } = &session.authority_identity
+        else {
+            return None;
+        };
+        (session.id == DEFAULT_SUPERVISOR_SESSION_ID
+            && session.kind == SessionKind::Root
+            && session.root_session_id == session.id
+            && session.parent_session_id.is_none()
+            && session.spawn_depth == 0
+            && !incarnation_id.is_nil())
+        .then_some(Self {
+            incarnation_id: *incarnation_id,
+        })
+    }
+
+    /// Original identity for the canonical service to revalidate. Possession
+    /// of this observation does not attest that this lifetime still exists.
+    pub fn supervisor_reference(self) -> SupervisorReference {
+        SupervisorReference {
+            session_id: DEFAULT_SUPERVISOR_SESSION_ID.to_string(),
+            incarnation_id: self.incarnation_id,
+        }
+    }
+
+    /// Encode this already captured observation at the host's waiting-message
+    /// writer. The original operation and actual new result ID are immutable
+    /// bindings, not values to recover from model-visible result JSON.
+    pub fn permission_replay_record(
+        self,
+        session_id: &str,
+        result_message_id: &str,
+        tool_call: &ToolCall,
+        execution_name: &str,
+        request_generation: &str,
+    ) -> Value {
+        serde_json::to_value(SupervisorPermissionReplayRecord {
+            version: 1,
+            incarnation_id: self.incarnation_id,
+            session_id: session_id.to_string(),
+            result_message_id: result_message_id.to_string(),
+            request_generation: request_generation.to_string(),
+            tool_call: tool_call.clone(),
+            execution_name: execution_name.to_string(),
+        })
+        .expect("Supervisor permission binding serializes")
+    }
+
+    /// Narrow host restoration from an exact durable result occurrence. The
+    /// caller must additionally validate the typed request/receipt contract
+    /// before granting permissions or handing this observation to a tool.
+    /// This never captures an identity from the reloaded Session.
+    pub fn restore_permission_replay_record(
+        session: &Session,
+        result_index: usize,
+        tool_call: &ToolCall,
+        execution_name: &str,
+        request_generation: Option<&str>,
+    ) -> Result<Option<Self>, &'static str> {
+        let message = session
+            .messages
+            .get(result_index)
+            .ok_or("result occurrence missing")?;
+        if serde_json::from_str::<Value>(&message.content)
+            .ok()
+            .is_some_and(|payload| {
+                payload
+                    .get(SUPERVISOR_PERMISSION_REPLAY_METADATA_KEY)
+                    .is_some()
+            })
+        {
+            return Err("Supervisor authority is not accepted from a result payload");
+        }
+        let Some(value) = message
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get(SUPERVISOR_PERMISSION_REPLAY_METADATA_KEY))
+        else {
+            return Ok(None);
+        };
+        let record: SupervisorPermissionReplayRecord = serde_json::from_value(value.clone())
+            .map_err(|_| "Supervisor permission binding is malformed")?;
+        let latest_result = session
+            .messages
+            .iter()
+            .rposition(|message| message.tool_call_id.as_deref() == Some(tool_call.id.as_str()));
+        let newer_call = session.messages[result_index + 1..].iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == tool_call.id))
+        });
+        let preceding_call = session.messages[..result_index]
+            .iter()
+            .rev()
+            .find(|message| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|call| call.id == tool_call.id))
+            });
+        let exact_call = preceding_call.is_some_and(|message| {
+            message.role == bamboo_domain::Role::Assistant
+                && message.tool_calls.as_ref().is_some_and(|calls| {
+                    let matching: Vec<_> = calls
+                        .iter()
+                        .filter(|call| call.id == tool_call.id)
+                        .collect();
+                    matching.len() == 1 && matching[0] == tool_call
+                })
+        });
+        if record.version != 1
+            || record.incarnation_id.is_nil()
+            || session.id != DEFAULT_SUPERVISOR_SESSION_ID
+            || session.kind != SessionKind::Root
+            || session.root_session_id != session.id
+            || session.parent_session_id.is_some()
+            || session.spawn_depth != 0
+            || session.authority_identity
+                != (SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: record.incarnation_id,
+                })
+            || message.role != bamboo_domain::Role::Tool
+            || latest_result != Some(result_index)
+            || newer_call
+            || !exact_call
+            || record.session_id != session.id
+            || record.result_message_id != message.id
+            || record.tool_call != *tool_call
+            || record.execution_name != execution_name
+            || execution_name.trim().is_empty()
+            || record.request_generation.trim().is_empty()
+            || Some(record.request_generation.as_str()) != request_generation
+        {
+            return Err("Supervisor permission binding does not match the current operation");
+        }
+        Ok(Some(Self {
+            incarnation_id: record.incarnation_id,
+        }))
+    }
+
+    pub(super) fn for_caller(self, session_id: Option<&str>) -> Option<Self> {
+        (session_id == Some(DEFAULT_SUPERVISOR_SESSION_ID)).then_some(self)
+    }
+}
+
+/// Per-session flags that flow into every tool call's [`ToolExecutionContext`].
+///
+/// These are derived ONCE from the executing [`Session`] (via
+/// [`ToolExecutionSessionFlags::from_session`]) and copied into the context. To
+/// add a new per-session execution flag, add a field here, derive it in
+/// `from_session`, and map it in [`ToolExecutionContext::for_dispatch`]. Because
+/// both agent loops build their context through `for_dispatch`, a new flag
+/// reaches every dispatch path automatically — it can't be wired into one loop
+/// and silently skipped in the other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolExecutionSessionFlags {
+    /// When `true`, the session is in "bypass permissions" mode and tool
+    /// permission checks are skipped. Sourced from the session's runtime state.
+    pub bypass_permissions: bool,
+    /// When `true`, approval requests are suppressed even for hard-dangerous
+    /// and always-ask operations. Hard policy denials remain enforced.
+    pub auto_approve_permissions: bool,
+    /// Hard read-only authorization overlay. Independent from approval
+    /// suppression: Plan+Auto is no-prompt but still denies every mutating tool.
+    pub plan_read_only: bool,
+}
+
+impl ToolExecutionSessionFlags {
+    /// Derive the per-session tool-execution flags from a session's runtime
+    /// state. This is the single source of truth for both agent loops.
+    pub fn from_session(session: &Session) -> Self {
+        Self::from_session_and_configured_mode(session, PermissionMode::Default)
+    }
+
+    /// Derive flags from the typed session request and the process-wide mode.
+    /// This is the execution-boundary form: default sessions inherit global
+    /// Auto, explicit Bypass remains Bypass, and Plan produces neither
+    /// permissive flag.
+    pub fn from_session_and_configured_mode(
+        session: &Session,
+        configured_mode: PermissionMode,
+    ) -> Self {
+        let requested = session
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode())
+            .unwrap_or_default();
+        let configured_mode = if session
+            .agent_runtime_state
+            .as_ref()
+            .is_some_and(|state| state.plan_mode.is_some())
+        {
+            PermissionMode::Plan
+        } else {
+            configured_mode
+        };
+        let resolution = bamboo_domain::resolve_permission_mode(requested, configured_mode);
+        Self {
+            bypass_permissions: resolution.bypass_permissions(),
+            auto_approve_permissions: resolution.auto_approve_permissions(),
+            plan_read_only: resolution.effective == PermissionMode::Plan,
+        }
+    }
+}
+
+/// Context passed to tools during execution.
+///
+/// Optional context does not grant authority. A captured Supervisor observation
+/// remains tied to its original caller and requires canonical revalidation.
+///
+/// ⚠️ Real tool dispatch must build this via [`ToolExecutionContext::for_dispatch`]
+/// (both agent loops do), NOT a struct literal — that routes every per-session
+/// flag through [`ToolExecutionSessionFlags`] so a new flag can't be wired into
+/// one loop and silently skipped in the other. Struct literals are for tests
+/// and tools that synthesize a child context.
+#[derive(Clone, Copy)]
+pub struct ToolExecutionContext<'a> {
+    /// Bamboo session id that is executing the tool.
+    pub session_id: Option<&'a str>,
+    /// Original executing lifetime, absent for synthetic/permission-only paths.
+    pub executing_supervisor: Option<ExecutingSupervisorObservation>,
+    /// Authoritative root-session identity for the executing session tree.
+    /// Real dispatch snapshots it from `Session.root_session_id`; synthetic or
+    /// opaque direct contexts leave it absent rather than inventing authority.
+    pub root_session_id: Option<&'a str>,
+    /// Tool call id from the model (`ToolCall.id`).
+    pub tool_call_id: &'a str,
+    /// Event sender for streaming progress to clients (agent SSE stream).
+    pub event_tx: Option<&'a mpsc::Sender<AgentEvent>>,
+    /// Snapshot of tools currently available to the executing session.
+    pub available_tool_schemas: Option<&'a [ToolSchema]>,
+    /// When `true`, the executing session is in "bypass permissions" mode, so
+    /// tool permission checks are skipped. Sourced per-session from the
+    /// session's runtime state (`runtime.json`), not the global checker.
+    pub bypass_permissions: bool,
+    /// Stronger, explicitly selected auto mode. This skips every approval
+    /// request but is still evaluated behind platform and explicit deny rules.
+    pub auto_approve_permissions: bool,
+    /// Hard Plan/read-only overlay, evaluated before checker/bypass/Auto paths.
+    pub plan_read_only: bool,
+    /// When `true`, the executing agent loop can suspend the current turn for a
+    /// backgrounded shell and self-resume once it finishes (i.e. a
+    /// `bash_resume_hook` AND persistence are wired). The Bash tool uses this to
+    /// decide whether its auto path (`run_in_background` omitted) may promote a
+    /// long command to background: when `false`, the auto path stays purely
+    /// synchronous so the command's output is never orphaned on a loop that
+    /// can't resume it (issue #84, phase 2d). Derived from the loop config at
+    /// the dispatch site — NOT session-derived — so it is a direct
+    /// `for_dispatch` parameter rather than a `ToolExecutionSessionFlags` field.
+    pub can_async_resume: bool,
+    /// Loop-facing sink invoked once when a background Bash shell owned by this
+    /// session completes (issue #84 Phase 2b follow-up). When wired, the Bash
+    /// tool hands it to the background completion-poll task so the shell's result
+    /// is pushed into the loop (injected at the next round boundary while it is
+    /// actively looping, or via a resume when it is idle) — instead of the model
+    /// having to poll `BashOutput`. Borrowed like `event_tx` (kept `Copy`) and
+    /// cloned into the spawned task via [`Self::cloned_bash_completion_sink`].
+    /// Derived from the loop config at the dispatch site — NOT session-derived —
+    /// so it is a direct `for_dispatch` parameter, not a session flag. `None`
+    /// leaves the push inert (the durable end-of-turn poll backstop still runs).
+    pub bash_completion_sink: Option<&'a Arc<dyn BashCompletionSink>>,
+    /// The tool call's `function.arguments` JSON string, already parsed once by
+    /// the dispatching agent loop (which also parses it to populate the
+    /// `ToolStart` event). When `Some`, downstream executors should reuse this
+    /// instead of calling `parse_tool_args_best_effort` on the raw string a
+    /// second time — the value here is the *exact* output of that same parser on
+    /// the same input, so reuse is behavior-preserving (issue #106, deferred B1
+    /// from #17). When `None` (e.g. `none()` contexts, tests, or executors that
+    /// synthesize a child call), executors parse the raw string themselves,
+    /// preserving the original single-parse-per-consumer behavior.
+    pub pre_parsed_args: Option<&'a Value>,
+}
+
+// Hand-written so implementors of `BashCompletionSink` (a trait object stored
+// here) don't have to be `Debug`. The sink is rendered as a presence flag.
+impl std::fmt::Debug for ToolExecutionContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolExecutionContext")
+            .field("session_id", &self.session_id)
+            .field("executing_supervisor", &self.executing_supervisor)
+            .field("root_session_id", &self.root_session_id)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("event_tx", &self.event_tx)
+            .field("available_tool_schemas", &self.available_tool_schemas)
+            .field("bypass_permissions", &self.bypass_permissions)
+            .field("auto_approve_permissions", &self.auto_approve_permissions)
+            .field("plan_read_only", &self.plan_read_only)
+            .field("can_async_resume", &self.can_async_resume)
+            .field("bash_completion_sink", &self.bash_completion_sink.is_some())
+            .field("pre_parsed_args", &self.pre_parsed_args)
+            .finish()
+    }
+}
+
+impl<'a> ToolExecutionContext<'a> {
+    pub fn none(tool_call_id: &'a str) -> Self {
+        Self {
+            session_id: None,
+            executing_supervisor: None,
+            root_session_id: None,
+            tool_call_id,
+            event_tx: None,
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        }
+    }
+
+    /// Build a context applying every permission flag from
+    /// [`ToolExecutionSessionFlags`], without minting executing authority.
+    /// Real dispatch separately captures its executing Session observation and
+    /// retains it through [`Self::with_executing_supervisor`]. This maps
+    /// session flags onto the context, and the only constructor the agent loops
+    /// use — keep both loops (`per_call.rs`, `result_handler.rs`) on it so a new
+    /// per-session field reaches all dispatch paths without per-site edits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_dispatch(
+        session_id: &'a str,
+        root_session_id: &'a str,
+        tool_call_id: &'a str,
+        event_tx: &'a mpsc::Sender<AgentEvent>,
+        available_tool_schemas: &'a [ToolSchema],
+        flags: ToolExecutionSessionFlags,
+        // Whether the executing loop can suspend for and self-resume a
+        // backgrounded bash shell (`bash_resume_hook` + persistence wired).
+        // When `false`, the Bash auto path stays synchronous (issue #84,
+        // phase 2d). NOT session-derived — set by the dispatch site.
+        can_async_resume: bool,
+        // Loop-facing sink for background-Bash completion (issue #84 Phase 2b
+        // follow-up). Set by the dispatch site from the loop config; `None` on
+        // loops without the engine suspend/resume machinery so the push stays
+        // inert. NOT session-derived.
+        bash_completion_sink: Option<&'a Arc<dyn BashCompletionSink>>,
+        // The call's arguments, already parsed once at the dispatch site (to
+        // populate the `ToolStart` event). Threaded down so the executor reuses
+        // it instead of re-parsing the raw JSON string (issue #106). Only pass
+        // `Some` when the value was produced by `parse_tool_args_best_effort`
+        // (the executor's own parser) so reuse is byte-for-byte equivalent; a
+        // dispatch site that parses with a different/stricter parser must pass
+        // `None` so the executor re-parses leniently and behavior is preserved.
+        pre_parsed_args: Option<&'a Value>,
+    ) -> Self {
+        Self {
+            session_id: Some(session_id),
+            executing_supervisor: None,
+            root_session_id: Some(if root_session_id.trim().is_empty() {
+                session_id
+            } else {
+                root_session_id
+            }),
+            tool_call_id,
+            event_tx: Some(event_tx),
+            available_tool_schemas: Some(available_tool_schemas),
+            bypass_permissions: flags.bypass_permissions,
+            auto_approve_permissions: flags.auto_approve_permissions,
+            plan_read_only: flags.plan_read_only,
+            can_async_resume,
+            bash_completion_sink,
+            pre_parsed_args,
+        }
+    }
+
+    /// Retain an already captured observation only for its original caller.
+    /// A child or absent caller cannot inherit Supervisor identity.
+    pub fn with_executing_supervisor(
+        mut self,
+        observation: Option<ExecutingSupervisorObservation>,
+    ) -> Self {
+        self.executing_supervisor =
+            observation.and_then(|observation| observation.for_caller(self.session_id));
+        self
+    }
+
+    /// Clone the sender (when present) for use in spawned tasks.
+    pub fn cloned_sender(&self) -> Option<mpsc::Sender<AgentEvent>> {
+        self.event_tx.cloned()
+    }
+
+    /// Clone the background-Bash completion sink (when present) into an owned
+    /// handle for a spawned task — mirrors [`Self::cloned_sender`]. Returns an
+    /// owned `Arc` so the shell's detached completion-poll task can outlive the
+    /// borrowed dispatch context.
+    pub fn cloned_bash_completion_sink(&self) -> Option<Arc<dyn BashCompletionSink>> {
+        self.bash_completion_sink.map(Arc::clone)
+    }
+
+    /// Authoritative root-session identity captured with this dispatch.
+    pub fn root_session_id(&self) -> Option<&'a str> {
+        self.root_session_id
+    }
+
+    /// TRANSITIONAL bridge to the owned [`ToolCtx`](crate::tools::ToolCtx) that the
+    /// rewritten `Tool::invoke` takes. Clones this borrowed dispatch context into
+    /// owned/`Arc` form at the concrete-executor seam, so the trait + dispatch
+    /// path keep using `ToolExecutionContext` (no wide ripple) while tools run on
+    /// `ToolCtx`. Removed in Phase B when the dispatch path adopts `ToolCtx`
+    /// directly.
+    pub fn to_tool_ctx(&self) -> crate::tools::ToolCtx {
+        crate::tools::ToolCtx {
+            session_id: self.session_id.map(Arc::from),
+            executing_supervisor: self
+                .executing_supervisor
+                .and_then(|observation| observation.for_caller(self.session_id)),
+            tool_call_id: Arc::from(self.tool_call_id),
+            event_tx: self.event_tx.cloned(),
+            available_tool_schemas: self
+                .available_tool_schemas
+                .map(Arc::from)
+                .unwrap_or_else(|| Arc::from(Vec::new())),
+            bypass_permissions: self.bypass_permissions,
+            auto_approve_permissions: self.auto_approve_permissions,
+            plan_read_only: self.plan_read_only,
+            can_async_resume: self.can_async_resume,
+            async_completion_sink: None,
+            bash_completion_sink: self.bash_completion_sink.map(Arc::clone),
+        }
+    }
+
+    /// Best-effort emit of an event (ignored if no sender).
+    pub async fn emit(&self, event: AgentEvent) {
+        if let Some(tx) = self.event_tx {
+            // Tools sometimes want to stream incremental output. Historically they emitted
+            // `AgentEvent::Token`, but that mixes tool output into the assistant stream.
+            // When emitting from a tool context, treat `Token` as tool-scoped output.
+            let event = match event {
+                AgentEvent::Token { content } => AgentEvent::ToolToken {
+                    tool_call_id: self.tool_call_id.to_string(),
+                    content,
+                },
+                other => other,
+            };
+            let _ = tx.try_send(event);
+        }
+    }
+
+    /// Convenience helper for streaming tool-scoped output.
+    pub async fn emit_tool_token(&self, content: impl Into<String>) {
+        self.emit(AgentEvent::ToolToken {
+            tool_call_id: self.tool_call_id.to_string(),
+            content: content.into(),
+        })
+        .await;
+    }
+}
+
+#[cfg(test)]
+mod supervisor_observation_tests {
+    use super::*;
+
+    fn supervisor() -> Session {
+        let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: Uuid::new_v4(),
+        };
+        session
+    }
+
+    #[test]
+    fn supervisor_observation_requires_typed_canonical_root_lineage() {
+        let valid = supervisor();
+        let observed = ExecutingSupervisorObservation::capture_from_executing_session(&valid)
+            .expect("canonical executing Supervisor");
+        assert_eq!(observed.supervisor_reference().session_id, valid.id);
+        for mutation in [
+            |s: &mut Session| s.authority_identity = SessionAuthorityIdentity::Ordinary,
+            |s: &mut Session| s.id = "other".into(),
+            |s: &mut Session| s.root_session_id = "other".into(),
+            |s: &mut Session| s.parent_session_id = Some("parent".into()),
+            |s: &mut Session| s.spawn_depth = 1,
+            |s: &mut Session| s.kind = SessionKind::Child,
+            |s: &mut Session| {
+                s.authority_identity = SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: Uuid::nil(),
+                }
+            },
+        ] {
+            let mut malformed = valid.clone();
+            mutation(&mut malformed);
+            assert_eq!(
+                ExecutingSupervisorObservation::capture_from_executing_session(&malformed),
+                None,
+                "malformed Session: {malformed:?}"
+            );
+        }
+        let mut ordinary = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        ordinary.metadata.insert(
+            "authority_identity".into(),
+            serde_json::to_string(&valid.authority_identity).unwrap(),
+        );
+        ordinary.metadata.insert("supervisor".into(), "true".into());
+        assert_eq!(
+            ExecutingSupervisorObservation::capture_from_executing_session(&ordinary),
+            None,
+            "reserved ID and forged metadata cannot supply a typed identity"
+        );
+    }
+
+    #[test]
+    fn supervisor_observation_is_not_minted_by_flags_arguments_or_generic_contexts() {
+        let session = supervisor();
+        let (tx, _rx) = mpsc::channel(1);
+        let forged_args = serde_json::json!({
+            "executing_supervisor": session.authority_identity,
+            "session_id": DEFAULT_SUPERVISOR_SESSION_ID,
+        });
+        let ctx = ToolExecutionContext::for_dispatch(
+            &session.id,
+            &session.root_session_id,
+            "call",
+            &tx,
+            &[],
+            ToolExecutionSessionFlags {
+                bypass_permissions: true,
+                auto_approve_permissions: true,
+                plan_read_only: true,
+            },
+            false,
+            None,
+            Some(&forged_args),
+        );
+        assert_eq!(ctx.executing_supervisor, None);
+        assert_eq!(ctx.to_tool_ctx().executing_supervisor, None);
+        assert_eq!(
+            ToolExecutionContext::none("none").executing_supervisor,
+            None
+        );
+        assert_eq!(
+            crate::tools::ToolCtx::none("owned").executing_supervisor,
+            None
+        );
+
+        let observation = ExecutingSupervisorObservation::capture_from_executing_session(&session);
+        let captured = ctx.with_executing_supervisor(observation);
+        let owned = captured.to_tool_ctx().clone();
+        assert_eq!(owned.executing_supervisor_for(&session.id), observation);
+        assert_eq!(owned.executing_supervisor_for("child"), None);
+        assert_eq!(
+            ToolExecutionContext::none("missing")
+                .with_executing_supervisor(observation)
+                .executing_supervisor,
+            None
+        );
+        // Even a struct-update caller mismatch is filtered at the owned seam.
+        let mismatched = ToolExecutionContext {
+            session_id: Some("child"),
+            ..captured
+        };
+        assert_eq!(mismatched.to_tool_ctx().executing_supervisor, None);
+    }
+}
+
+#[cfg(test)]
+mod session_flags_tests {
+    use super::*;
+    use bamboo_domain::{AgentRuntimeState, SessionPermissionMode};
+
+    #[test]
+    fn dispatch_context_falls_back_from_empty_legacy_root_to_session_id() {
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let ctx = ToolExecutionContext::for_dispatch(
+            "session-id",
+            "  ",
+            "call-id",
+            &event_tx,
+            &[],
+            ToolExecutionSessionFlags::default(),
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(ctx.root_session_id(), Some("session-id"));
+    }
+
+    #[test]
+    fn from_session_defaults_false_without_runtime_state() {
+        let session = Session::new("s-none", "test-model");
+        assert_eq!(
+            ToolExecutionSessionFlags::from_session(&session),
+            ToolExecutionSessionFlags {
+                bypass_permissions: false,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn from_session_reads_bypass_from_runtime_state() {
+        let mut session = Session::new("s-bypass", "test-model");
+        let mut runtime = AgentRuntimeState::new("run-1");
+        runtime.bypass_permissions = true;
+        session.agent_runtime_state = Some(runtime);
+        assert!(ToolExecutionSessionFlags::from_session(&session).bypass_permissions);
+        assert!(!ToolExecutionSessionFlags::from_session(&session).auto_approve_permissions);
+    }
+
+    #[test]
+    fn from_session_distinguishes_auto_from_legacy_bypass() {
+        let mut session = Session::new("s-auto", "test-model");
+        let mut runtime = AgentRuntimeState::new("run-1");
+        runtime.set_permission_mode(SessionPermissionMode::Auto);
+        session.agent_runtime_state = Some(runtime);
+
+        let flags = ToolExecutionSessionFlags::from_session(&session);
+        assert!(!flags.bypass_permissions);
+        assert!(flags.auto_approve_permissions);
+    }
+
+    #[test]
+    fn configured_auto_applies_to_default_but_not_explicit_bypass() {
+        let default_session = Session::new("s-global-auto", "test-model");
+        let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+            &default_session,
+            PermissionMode::Auto,
+        );
+        assert_eq!(
+            flags,
+            ToolExecutionSessionFlags {
+                bypass_permissions: false,
+                auto_approve_permissions: true,
+                plan_read_only: false,
+            }
+        );
+
+        let mut bypass_session = default_session;
+        bypass_session
+            .agent_runtime_state
+            .get_or_insert_default()
+            .set_permission_mode(SessionPermissionMode::Bypass);
+        let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+            &bypass_session,
+            PermissionMode::Auto,
+        );
+        assert!(flags.bypass_permissions);
+        assert!(!flags.auto_approve_permissions);
+    }
+
+    #[test]
+    fn configured_plan_preserves_no_prompt_but_sets_read_only_gate() {
+        let mut session = Session::new("s-plan-auto", "test-model");
+        session
+            .agent_runtime_state
+            .get_or_insert_default()
+            .set_permission_mode(SessionPermissionMode::Auto);
+        let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+            &session,
+            PermissionMode::Plan,
+        );
+        assert!(!flags.bypass_permissions);
+        assert!(flags.auto_approve_permissions);
+        assert!(flags.plan_read_only);
+    }
+
+    #[test]
+    fn persisted_plan_overlay_is_honored_without_config_reconstruction() {
+        let mut session = Session::new("s-persisted-plan-auto", "test-model");
+        let runtime = session.agent_runtime_state.get_or_insert_default();
+        runtime.set_permission_mode(SessionPermissionMode::Auto);
+        runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "auto".to_string(),
+            plan_file_path: None,
+            status: bamboo_domain::PlanModeStatus::Designing,
+        });
+
+        let flags = ToolExecutionSessionFlags::from_session(&session);
+        assert!(flags.plan_read_only);
+        assert!(flags.auto_approve_permissions);
+        assert!(!flags.bypass_permissions);
+    }
+
+    #[test]
+    fn typed_read_only_child_does_not_reactivate_the_legacy_plan_name_gate() {
+        for requested in [SessionPermissionMode::Auto, SessionPermissionMode::Bypass] {
+            let mut session = Session::new("s-read-only-child", "test-model");
+            let runtime = session.agent_runtime_state.get_or_insert_default();
+            runtime.set_permission_mode(requested);
+            runtime.read_only = true;
+
+            // Runtime-enforced read-only children use a host-provisioned
+            // no-shell denylist plus ReadOnlyCommandChecker. Keep the typed
+            // child's exact Auto/Bypass flags here; the checker remains the
+            // non-bypassable authority for every permission-bearing call.
+            let flags = ToolExecutionSessionFlags::from_session_and_configured_mode(
+                &session,
+                PermissionMode::Auto,
+            );
+
+            assert!(!flags.plan_read_only);
+            assert_eq!(
+                flags.bypass_permissions,
+                requested == SessionPermissionMode::Bypass
+            );
+            assert_eq!(
+                flags.auto_approve_permissions,
+                requested == SessionPermissionMode::Auto
+            );
+        }
+    }
+
+    #[test]
+    fn for_dispatch_maps_flags_onto_context() {
+        let (tx, _rx) = mpsc::channel(1);
+        let ctx = ToolExecutionContext::for_dispatch(
+            "s1",
+            "root-s1",
+            "call-1",
+            &tx,
+            &[],
+            ToolExecutionSessionFlags {
+                bypass_permissions: true,
+                auto_approve_permissions: false,
+                plan_read_only: false,
+            },
+            true,
+            None,
+            None,
+        );
+        assert_eq!(ctx.session_id, Some("s1"));
+        assert_eq!(ctx.root_session_id(), Some("root-s1"));
+        assert!(ctx.bypass_permissions);
+        assert!(!ctx.auto_approve_permissions);
+        assert!(ctx.can_async_resume);
+        assert!(ctx.pre_parsed_args.is_none());
+
+        let owned = ctx.to_tool_ctx();
+        assert!(owned.bypass_permissions);
+        assert!(!owned.auto_approve_permissions);
+        assert!(!owned.plan_read_only);
+    }
+
+    #[test]
+    fn for_dispatch_threads_pre_parsed_args() {
+        let (tx, _rx) = mpsc::channel(1);
+        let parsed = serde_json::json!({"v": "x"});
+        let ctx = ToolExecutionContext::for_dispatch(
+            "s1",
+            "root-s1",
+            "call-1",
+            &tx,
+            &[],
+            ToolExecutionSessionFlags::default(),
+            false,
+            None,
+            Some(&parsed),
+        );
+        assert_eq!(ctx.pre_parsed_args, Some(&parsed));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn emit_does_not_block_when_channel_is_full() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(AgentEvent::Token {
+            content: "full".to_string(),
+        })
+        .await
+        .unwrap();
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("session_1"),
+            root_session_id: None,
+            tool_call_id: "call_1",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            ctx.emit(AgentEvent::Token {
+                content: "next".to_string(),
+            }),
+        )
+        .await
+        .expect("emit should not block on full channel");
+
+        let first = rx.recv().await.unwrap();
+        match first {
+            AgentEvent::Token { content } => assert_eq!(content, "full"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_converts_token_to_tool_token() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("session_1"),
+            root_session_id: None,
+            tool_call_id: "call_123",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        ctx.emit(AgentEvent::Token {
+            content: "test content".to_string(),
+        })
+        .await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::ToolToken {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "call_123");
+                assert_eq!(content, "test content");
+            }
+            other => panic!("Expected ToolToken, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_passes_through_non_token_events() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("session_1"),
+            root_session_id: None,
+            tool_call_id: "call_456",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        // Test with various non-Token events
+        ctx.emit(AgentEvent::ToolToken {
+            tool_call_id: "other".to_string(),
+            content: "direct tool token".to_string(),
+        })
+        .await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::ToolToken { content, .. } => {
+                assert_eq!(content, "direct tool token");
+            }
+            other => panic!("Expected ToolToken, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_does_nothing_when_no_sender() {
+        let ctx = ToolExecutionContext::none("call_789");
+
+        // Should not panic or block
+        ctx.emit(AgentEvent::Token {
+            content: "test".to_string(),
+        })
+        .await;
+
+        // Success if we get here
+    }
+
+    #[tokio::test]
+    async fn emit_tool_token_convenience_method() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: None,
+            root_session_id: None,
+            tool_call_id: "call_abc",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        ctx.emit_tool_token("convenient output").await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::ToolToken {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "call_abc");
+                assert_eq!(content, "convenient output");
+            }
+            other => panic!("Expected ToolToken, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_tool_token_with_no_sender_does_nothing() {
+        let ctx = ToolExecutionContext::none("call_def");
+
+        // Should not panic or block
+        ctx.emit_tool_token("test").await;
+
+        // Success if we get here
+    }
+
+    #[test]
+    fn none_creates_context_with_no_optional_fields() {
+        let ctx = ToolExecutionContext::none("call_xyz");
+
+        assert_eq!(ctx.session_id, None);
+        assert_eq!(ctx.tool_call_id, "call_xyz");
+        assert!(ctx.event_tx.is_none());
+    }
+
+    #[test]
+    fn cloned_sender_returns_none_when_no_sender() {
+        let ctx = ToolExecutionContext::none("call_test");
+        assert!(ctx.cloned_sender().is_none());
+    }
+
+    #[tokio::test]
+    async fn cloned_sender_returns_clone_when_sender_present() {
+        let (tx, _rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: None,
+            root_session_id: None,
+            tool_call_id: "call_clone",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let cloned = ctx.cloned_sender();
+        assert!(cloned.is_some());
+
+        // Can use cloned sender
+        cloned
+            .unwrap()
+            .send(AgentEvent::Token {
+                content: "test".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn emit_handles_multiple_sequential_calls() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("session_multi"),
+            root_session_id: None,
+            tool_call_id: "call_multi",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        for i in 0..5 {
+            ctx.emit(AgentEvent::Token {
+                content: format!("message {}", i),
+            })
+            .await;
+        }
+
+        for i in 0..5 {
+            let event = rx.recv().await.unwrap();
+            match event {
+                AgentEvent::ToolToken { content, .. } => {
+                    assert_eq!(content, format!("message {}", i));
+                }
+                other => panic!("Expected ToolToken, got: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn context_is_clone_and_copy() {
+        let (tx, _rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("session_copy"),
+            root_session_id: None,
+            tool_call_id: "call_copy",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        // Can clone (Copy implies Clone)
+        let _cloned = ctx;
+
+        // Can copy
+        let copied = ctx;
+
+        // Both are valid
+        assert_eq!(copied.tool_call_id, "call_copy");
+    }
+
+    #[test]
+    fn context_is_debug() {
+        let ctx = ToolExecutionContext::none("call_debug");
+        let debug_str = format!("{:?}", ctx);
+        assert!(debug_str.contains("call_debug"));
+    }
+
+    #[tokio::test]
+    async fn emit_with_empty_tool_call_id() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: None,
+            root_session_id: None,
+            tool_call_id: "",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        ctx.emit(AgentEvent::Token {
+            content: "test".to_string(),
+        })
+        .await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::ToolToken { tool_call_id, .. } => {
+                assert_eq!(tool_call_id, "");
+            }
+            other => panic!("Expected ToolToken, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_with_unicode_content() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: Some("会话"),
+            root_session_id: None,
+            tool_call_id: "调用_123",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        ctx.emit(AgentEvent::Token {
+            content: "测试内容 🎯".to_string(),
+        })
+        .await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::ToolToken {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id, "调用_123");
+                assert_eq!(content, "测试内容 🎯");
+            }
+            other => panic!("Expected ToolToken, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_with_special_characters_in_tool_call_id() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: None,
+            root_session_id: None,
+            tool_call_id: "call-with_special.chars:123",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        ctx.emit(AgentEvent::Token {
+            content: "test".to_string(),
+        })
+        .await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::ToolToken { tool_call_id, .. } => {
+                assert_eq!(tool_call_id, "call-with_special.chars:123");
+            }
+            other => panic!("Expected ToolToken, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_tool_token_with_string_content() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: None,
+            root_session_id: None,
+            tool_call_id: "call_string",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        let content = String::from("owned string");
+        ctx.emit_tool_token(content).await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::ToolToken { content, .. } => {
+                assert_eq!(content, "owned string");
+            }
+            other => panic!("Expected ToolToken, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_tool_token_with_str_content() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let ctx = ToolExecutionContext {
+            executing_supervisor: None,
+            session_id: None,
+            root_session_id: None,
+            tool_call_id: "call_str",
+            event_tx: Some(&tx),
+            available_tool_schemas: None,
+            bypass_permissions: false,
+            auto_approve_permissions: false,
+            plan_read_only: false,
+            can_async_resume: false,
+            bash_completion_sink: None,
+            pre_parsed_args: None,
+        };
+
+        ctx.emit_tool_token("string slice").await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            AgentEvent::ToolToken { content, .. } => {
+                assert_eq!(content, "string slice");
+            }
+            other => panic!("Expected ToolToken, got: {other:?}"),
+        }
+    }
+}

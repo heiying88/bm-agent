@@ -1,0 +1,1445 @@
+//! Application-layer action functions for child session management.
+
+use bamboo_domain::Session;
+use chrono::Utc;
+use serde_json::json;
+use std::{future::Future, pin::Pin};
+
+use super::helpers::{
+    append_subagent_delegation_contract, compute_status_guidance,
+    format_child_assignment_with_background, map_child_entry, metadata_text,
+    normalize_non_empty_optional, normalize_required_text, render_forked_parent_context,
+    replace_or_append_last_user_message, truncate_after_index, truncate_after_last_user,
+};
+use super::{
+    ChildSessionEntry, ChildSessionError, ChildSessionPort, CreateChildInput, CreateChildResult,
+};
+
+pub async fn create_child_action(
+    port: &dyn ChildSessionPort,
+    mut input: CreateChildInput,
+) -> Result<CreateChildResult, ChildSessionError> {
+    use crate::runner::refresh_prompt_snapshot;
+    use bamboo_agent_core::Message;
+
+    let profile = port
+        .resolve_named_profile(&input.parent_session, &input.subagent_type)
+        .await?;
+    if let Some(profile) = &profile {
+        if input.lifecycle.as_deref() == Some("resident")
+            || input.resident_name.is_some()
+            || input.context_fork.unwrap_or_default() > 0
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                "named_profile_requires_fresh_local_child".into(),
+            ));
+        }
+        input.read_only |= profile.read_only()
+            || bamboo_domain::PermissionAuditSnapshot::from_metadata(
+                &input.parent_session.metadata,
+            )
+            .is_some_and(|audit| audit.resolution.effective == bamboo_domain::PermissionMode::Plan)
+            || input
+                .parent_session
+                .agent_runtime_state
+                .as_ref()
+                .is_some_and(|r| r.read_only || r.plan_mode.is_some());
+        if let Some(model) = profile.model().filter(|_| {
+            !input
+                .runtime_metadata
+                .contains_key(super::named_profile::PROFILE_EXPLICIT_MODEL_KEY)
+        }) {
+            input.model_override = Some(model.model.clone());
+            input.model_ref_override = Some(model.clone());
+        }
+        // The existing strict route protects the complete assignment. This
+        // default adds no invented user constraints or parent-history fork.
+        if !input
+            .runtime_metadata
+            .contains_key(bamboo_domain::CHILD_PACKET_INPUT_KEY)
+        {
+            let packet = bamboo_domain::ChildContextPacket {
+                version: 1,
+                objective: input.assignment_prompt.clone(),
+                constraints: Vec::new(),
+                acceptance: vec!["Complete the assigned task; report concrete evidence, verification and remaining blockers.".into()],
+                non_goals: Vec::new(),
+                necessary_user_instructions: Vec::new(),
+                recorded_decisions: Vec::new(),
+                source_user_message_ids: Vec::new(),
+                background_message_ids: Vec::new(),
+            };
+            input.runtime_metadata.insert(
+                bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
+                serde_json::to_string(&packet).map_err(|_| {
+                    ChildSessionError::InvalidArguments("invalid_child_context_packet".into())
+                })?,
+            );
+        }
+        if let Some(raw) = input.parent_session.metadata.get("disabled_tools") {
+            let parent_denied: std::collections::BTreeSet<String> = serde_json::from_str(raw)
+                .map_err(|_| {
+                    ChildSessionError::Execution("named_profile_parent_tools_invalid".into())
+                })?;
+            input
+                .disabled_tools
+                .get_or_insert_with(Default::default)
+                .extend(parent_denied);
+        }
+    }
+
+    // Resolve only from the durable parent, before constructing or persisting a
+    // child. The observation is content identity, not task/permission CAS.
+    let required_context = if let Some(raw) = input
+        .runtime_metadata
+        .get(bamboo_domain::CHILD_PACKET_INPUT_KEY)
+    {
+        if input.lifecycle.as_deref() == Some("resident")
+            || input.context_fork.unwrap_or_default() > 0
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                "required_child_context_unsupported: fresh one-shot only".into(),
+            ));
+        }
+        if raw.len() > bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES {
+            return Err(ChildSessionError::InvalidArguments(
+                bamboo_domain::ChildContextPacketError::Budget.to_string(),
+            ));
+        }
+        let packet: bamboo_domain::ChildContextPacket =
+            serde_json::from_str(raw).map_err(|_| {
+                ChildSessionError::InvalidArguments(
+                    bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+                )
+            })?;
+        if [&input.title, &input.responsibility, &input.subagent_type]
+            .into_iter()
+            .any(|text| text.lines().any(|line| line.len() > 2048))
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                bamboo_domain::ChildContextPacketError::Budget.to_string(),
+            ));
+        }
+        let parent = port.load_parent_session(&input.parent_session.id).await?;
+        if parent.created_at != input.parent_session.created_at {
+            return Err(ChildSessionError::InvalidArguments(
+                "invalid_child_context_packet: parent lifetime changed".into(),
+            ));
+        }
+        let resolved = packet
+            .resolve(&parent, &input.assignment_prompt)
+            .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
+        if resolved.required_input_bytes
+            + input.title.len()
+            + input.responsibility.len()
+            + input.subagent_type.len()
+            > bamboo_domain::MAX_CHILD_REQUIRED_BYTES
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                bamboo_domain::ChildContextPacketError::Budget.to_string(),
+            ));
+        }
+        let assignment = format_child_assignment_with_background(
+            &input.title,
+            &input.responsibility,
+            &input.subagent_type,
+            &resolved.required_brief,
+            None,
+        );
+        let binding =
+            bamboo_domain::ChildContextBinding::new(&parent, &input.child_id, assignment, resolved)
+                .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
+        port.validate_required_child_context_route(&input.runtime_metadata, &input.subagent_type)
+            .await?;
+        Some(binding)
+    } else {
+        None
+    };
+
+    let inherited_project_id =
+        match crate::project_context::ProjectContextResolver::session_project_identity(
+            &input.parent_session,
+        ) {
+            crate::project_context::SessionProjectIdentity::Assigned(project_id) => {
+                Some(project_id)
+            }
+            crate::project_context::SessionProjectIdentity::Unassigned => None,
+            crate::project_context::SessionProjectIdentity::Invalid { raw, message } => {
+                return Err(ChildSessionError::InvalidArguments(format!(
+                    "parent session carries an invalid Project identity '{raw}': {message}"
+                )));
+            }
+        };
+    let final_workspace = port
+        .validate_child_workspace(inherited_project_id.as_ref(), &input.workspace)
+        .await?;
+
+    // Use `new_child_of` so the child inherits the parent's tree root and a
+    // depth of parent+1. For a root parent this is identical to the old
+    // flat-tree behavior; for a child parent it enables nesting while keeping
+    // `root_session_id` constant across the whole tree (completion/SSE keying).
+    let mut child = Session::new_child_of(
+        input.child_id.clone(),
+        &input.parent_session,
+        input
+            .model_ref_override
+            .as_ref()
+            .map(|model_ref| model_ref.model.clone())
+            .or_else(|| input.model_override.clone())
+            .unwrap_or_else(|| input.parent_session.model.clone()),
+        input.title.clone(),
+    );
+    // Project is stable tree identity: every child/resident/guardian inherits
+    // it even when the requested workspace differs from its parent.
+    if let Some(project_id) = inherited_project_id {
+        child.set_project_id_meta(project_id.to_string());
+    }
+
+    if let Some(model_ref) = input.model_ref_override.clone() {
+        child.model_ref = Some(model_ref.clone());
+        child
+            .metadata
+            .insert("provider_name".to_string(), model_ref.provider);
+    } else if let Some(parent_model_ref) = input.parent_session.model_ref.clone() {
+        child.model_ref = Some(parent_model_ref.clone());
+        child.set_provider_name(parent_model_ref.provider);
+    } else if let Some(parent_provider) = input.parent_session.provider_name() {
+        child.set_provider_name(parent_provider);
+    }
+
+    // Apply explicit reasoning_effort override if the LLM passed one;
+    // otherwise leave at `None` (provider default). Per CreateChildInput
+    // contract, children do NOT inherit the parent's reasoning_effort.
+    if let Some(effort) = input.reasoning_effort {
+        child.reasoning_effort = Some(effort);
+    }
+
+    // Children inherit the parent's exact permission posture. Auto must remain
+    // distinct from legacy Bypass so forced confirmations do not reappear at a
+    // child boundary.
+    let inherited_permission_mode = input
+        .parent_session
+        .agent_runtime_state
+        .as_ref()
+        .map(|state| state.effective_permission_mode())
+        .unwrap_or_default();
+    let child_runtime = child
+        .agent_runtime_state
+        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+    child_runtime.set_permission_mode(inherited_permission_mode);
+    child_runtime.read_only = input.read_only;
+    let parent_audit =
+        bamboo_domain::PermissionAuditSnapshot::from_metadata(&input.parent_session.metadata);
+    let parent_plan_active = input
+        .parent_session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.plan_mode.is_some());
+    let effective = if input.read_only || parent_plan_active {
+        bamboo_domain::PermissionMode::Plan
+    } else {
+        parent_audit
+            .as_ref()
+            .filter(|audit| {
+                audit.resolution.requested == inherited_permission_mode
+                    && audit.resolution.is_consistent()
+            })
+            .map(|audit| audit.resolution.effective)
+            .unwrap_or_else(|| {
+                bamboo_domain::resolve_permission_mode(
+                    inherited_permission_mode,
+                    bamboo_domain::PermissionMode::Default,
+                )
+                .effective
+            })
+    };
+    let resolution = bamboo_domain::PermissionModeResolution {
+        requested: inherited_permission_mode,
+        effective,
+    };
+    bamboo_domain::record_permission_audit(
+        &mut child.metadata,
+        &bamboo_domain::PermissionAuditSeed::new(
+            parent_audit
+                .as_ref()
+                .map(|audit| audit.policy_revision)
+                .unwrap_or_default(),
+            resolution,
+            format!("child_activation:{}", resolution.effective.as_str()),
+        ),
+        Some(&Utc::now().to_rfc3339()),
+    )
+    .map_err(|error| ChildSessionError::Execution(error.to_string()))?;
+
+    // #73: children inherit "no interactive human approver" too — if the run has
+    // no human to answer approvals (headless / scheduled / deployed), neither do
+    // its sub-agents, so their gated actions must be model-reviewed locally
+    // rather than escalated to a human who will never answer (300s fail-deny).
+    if input
+        .parent_session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.no_human_approver)
+    {
+        child
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
+            .no_human_approver = true;
+    }
+
+    // `validate_child_workspace` already returned the confinement-adjusted,
+    // ownership-checked path. Publish that exact authority without applying a
+    // process-global confinement policy a second time: server embeddings may
+    // use an instance-scoped resolver whose policy differs from the first
+    // AppState registered in this process.
+    let stored_workspace = port.publish_child_workspace(
+        &child.id,
+        std::path::PathBuf::from(final_workspace),
+        input.workspace_source.as_str(),
+    );
+    child.workspace = Some(stored_workspace.to_string_lossy().to_string());
+    child.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(
+        &stored_workspace,
+    ));
+    child.metadata.insert(
+        crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        input.workspace_source.as_str().to_string(),
+    );
+
+    child
+        .metadata
+        .insert("spawned_by".to_string(), "SubAgent".to_string());
+    child.set_subagent_type(input.subagent_type.clone());
+    child
+        .metadata
+        .insert("responsibility".to_string(), input.responsibility.clone());
+    child.metadata.insert(
+        "assignment_prompt".to_string(),
+        input.assignment_prompt.clone(),
+    );
+    // Resident-agent tagging (plain metadata, like `responsibility` above). Only
+    // a resident carries these; their presence is how a later create reuses this
+    // session instead of minting a new one. Mirrored into the session index so
+    // the lookup + the frontend can read them without loading session.json.
+    if input.lifecycle.as_deref() == Some("resident") {
+        child
+            .metadata
+            .insert("lifecycle".to_string(), "resident".to_string());
+        if let Some(name) = input.resident_name.clone().filter(|n| !n.trim().is_empty()) {
+            child.metadata.insert("resident_name".to_string(), name);
+        }
+        child.metadata.insert(
+            "resident_context".to_string(),
+            input
+                .resident_context
+                .clone()
+                .filter(|c| matches!(c.as_str(), "reset" | "accumulate"))
+                .unwrap_or_else(|| "reset".to_string()),
+        );
+    }
+    child.set_last_run_status("pending");
+    child
+        .advance_child_launch_generation()
+        .ok_or_else(|| ChildSessionError::Execution("child launch generation exhausted".into()))?;
+    if input.auto_run {
+        child.mark_child_auto_run_launch_intent();
+    }
+    child.clear_last_run_error();
+
+    // Apply runtime metadata (e.g. external agent routing).
+    for (key, value) in input.runtime_metadata {
+        if key != bamboo_domain::CHILD_PACKET_INPUT_KEY
+            && key != super::named_profile::PROFILE_EXPLICIT_MODEL_KEY
+        {
+            child.metadata.insert(key, value);
+        }
+    }
+
+    // Preserve the configured global custom template/fallback, then append the
+    // child-only contract idempotently. Deliberately do not inherit the parent
+    // session's per-session prompt: it can contain root-only private policy and
+    // has never been the child-base source. Runtime context enhancement is
+    // applied uniformly by the runner to the resulting child base.
+    let base_prompt = {
+        let global = crate::prompt_defaults::read_global_default_system_prompt_template();
+        if global.trim().is_empty() {
+            crate::context::DEFAULT_BASE_PROMPT.to_string()
+        } else {
+            global
+        }
+    };
+    let base_prompt = profile.as_ref().map_or(base_prompt.clone(), |profile| {
+        profile.append_prompt(&base_prompt)
+    });
+    let system_prompt = append_subagent_delegation_contract(&base_prompt);
+
+    child
+        .metadata
+        .insert("base_system_prompt".to_string(), system_prompt.clone());
+
+    child.add_message(Message::system(&system_prompt));
+
+    // Child sessions get more aggressive compression: trigger at 70% instead
+    // of the default 85%, target 35% instead of 40%. This prevents long child
+    // tasks from exhausting the context window before the parent can intervene.
+    if let Some(parent_budget) = input.parent_session.effective_token_budget() {
+        let mut child_budget = parent_budget.clone();
+        child_budget.compression_trigger_percent = 70;
+        child_budget.compression_target_percent = 35;
+        child.token_budget = Some(child_budget);
+    }
+
+    refresh_prompt_snapshot(&mut child);
+    // Phase 3: optionally fork a slice of the parent's recent context into the
+    // assignment's separately labeled background section (model-controllable
+    // via the SubAgent tool's `fork_last_messages`). `None`/0 keeps the child
+    // on a clean fresh context. Policy and stop/report sections remain after
+    // the fork, so transcript recency never closes the assignment frame.
+    let background = input
+        .context_fork
+        .and_then(|n| render_forked_parent_context(&input.parent_session, n));
+    let assignment = format_child_assignment_with_background(
+        &input.title,
+        &input.responsibility,
+        &input.subagent_type,
+        &input.assignment_prompt,
+        background.as_deref(),
+    );
+    if let Some(mut binding) = required_context {
+        binding
+            .bind_host_budget(&child)
+            .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
+        binding
+            .install(&mut child)
+            .map_err(|error| ChildSessionError::InvalidArguments(error.to_string()))?;
+        child.add_message(binding.assignment_message());
+        for message in binding.background_messages() {
+            child.add_message(message);
+        }
+    } else {
+        child.add_message(Message::user(assignment));
+    }
+
+    if let Some(parent_task_list) = input.parent_session.task_list.clone() {
+        child.set_task_list(parent_task_list);
+    }
+
+    // Persist any per-child tool denylist so the spawn path (enqueue_child_run
+    // → SpawnJob.disabled_tools) can trim the runtime-exposed toolset (e.g. a
+    // read-only Guardian reviewer). Most children add no child-specific denylist.
+    if let Some(ref disabled) = input.disabled_tools {
+        if !disabled.is_empty() {
+            child.metadata.insert(
+                "disabled_tools".to_string(),
+                serde_json::to_string(disabled).unwrap_or_default(),
+            );
+        }
+    }
+
+    if let Some(profile) = profile {
+        profile.bind(&mut child, &input.parent_session)?;
+    }
+
+    let model = child.model.clone();
+    port.save_child_session(&mut child).await?;
+    if input.auto_run {
+        port.enqueue_child_run(&input.parent_session, &child)
+            .await?;
+    }
+
+    Ok(CreateChildResult {
+        child_session_id: child.id,
+        model,
+    })
+}
+
+pub async fn list_children_action(
+    port: &dyn ChildSessionPort,
+    parent_id: &str,
+) -> serde_json::Value {
+    let children = port.list_children(parent_id).await;
+    json!({
+        "parent_session_id": parent_id,
+        "children": children.iter().map(map_child_entry).collect::<Vec<_>>(),
+        "count": children.len(),
+    })
+}
+
+/// A node in the materialized parent→child session graph (Phase 6: persistent
+/// multi-level nesting graph). `children` are the transitive descendants.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SessionTreeNode {
+    pub session_id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_status: Option<String>,
+    pub depth: u32,
+    pub children: Vec<SessionTreeNode>,
+}
+
+/// Assemble the transitive parent→child tree rooted at `root_id` from a
+/// pre-fetched adjacency map (pure — unit-testable without a port). Bounded by
+/// `max_depth`; a first-visit guard breaks cycles (a re-encountered session
+/// becomes a leaf rather than recursing forever).
+pub fn assemble_session_tree(
+    root_id: &str,
+    root_title: &str,
+    adjacency: &std::collections::HashMap<String, Vec<ChildSessionEntry>>,
+    max_depth: u32,
+) -> SessionTreeNode {
+    fn build(
+        id: &str,
+        title: &str,
+        status: Option<String>,
+        depth: u32,
+        max_depth: u32,
+        adjacency: &std::collections::HashMap<String, Vec<ChildSessionEntry>>,
+        visited: &mut std::collections::HashSet<String>,
+    ) -> SessionTreeNode {
+        let first_visit = visited.insert(id.to_string());
+        let mut children = Vec::new();
+        if first_visit && depth < max_depth {
+            if let Some(kids) = adjacency.get(id) {
+                for kid in kids {
+                    children.push(build(
+                        &kid.child_session_id,
+                        &kid.title,
+                        kid.last_run_status.clone(),
+                        depth + 1,
+                        max_depth,
+                        adjacency,
+                        visited,
+                    ));
+                }
+            }
+        }
+        SessionTreeNode {
+            session_id: id.to_string(),
+            title: title.to_string(),
+            last_run_status: status,
+            depth,
+            children,
+        }
+    }
+    let mut visited = std::collections::HashSet::new();
+    build(
+        root_id,
+        root_title,
+        None,
+        0,
+        max_depth,
+        adjacency,
+        &mut visited,
+    )
+}
+
+/// Materialize the full transitive parent→child session graph rooted at
+/// `root_id` from the persisted session index (Phase 6). BFS-fetches each
+/// level's children via [`ChildSessionPort::list_children`] (a first-visit guard
+/// and a hard node cap protect against cycles / runaway trees), then assembles the
+/// tree. The graph is derived from durable index state, so it survives restarts.
+pub async fn build_session_tree_action(
+    port: &dyn ChildSessionPort,
+    root_id: &str,
+    max_depth: u32,
+) -> SessionTreeNode {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    const NODE_CAP: usize = 5000;
+
+    let root_title = port
+        .load_root_session(root_id)
+        .await
+        .map(|s| s.title)
+        .unwrap_or_default();
+
+    let mut adjacency: HashMap<String, Vec<ChildSessionEntry>> = HashMap::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, u32)> = VecDeque::new();
+    queue.push_back((root_id.to_string(), 0));
+
+    while let Some((id, depth)) = queue.pop_front() {
+        if depth >= max_depth || adjacency.len() >= NODE_CAP || !visited.insert(id.clone()) {
+            continue;
+        }
+        let kids = port.list_children(&id).await;
+        for kid in &kids {
+            queue.push_back((kid.child_session_id.clone(), depth + 1));
+        }
+        adjacency.insert(id, kids);
+    }
+
+    assemble_session_tree(root_id, &root_title, &adjacency, max_depth)
+}
+
+pub async fn get_child_action(
+    port: &dyn ChildSessionPort,
+    parent_id: &str,
+    child_session_id: String,
+) -> Result<serde_json::Value, ChildSessionError> {
+    let child = port
+        .load_child_for_inspection(parent_id, &child_session_id)
+        .await?;
+
+    let status = child.last_run_status();
+    let runner_info = port.get_child_runner_info(&child.id).await;
+    let mut truncated_fields = Vec::new();
+    let title = bounded_overview_field(Some(child.title.clone()), "title", &mut truncated_fields);
+    let model = bounded_overview_field(Some(child.model.clone()), "model", &mut truncated_fields);
+    let error = bounded_overview_field(
+        child.last_run_error(),
+        "last_run_error",
+        &mut truncated_fields,
+    );
+    let responsibility = bounded_overview_field(
+        metadata_text(&child, "responsibility"),
+        "responsibility",
+        &mut truncated_fields,
+    );
+    let subagent_type = bounded_overview_field(
+        metadata_text(&child, "subagent_type"),
+        "subagent_type",
+        &mut truncated_fields,
+    );
+    let prompt = bounded_overview_field(
+        metadata_text(&child, "assignment_prompt"),
+        "prompt",
+        &mut truncated_fields,
+    );
+    let latest_user_message = bounded_overview_field(
+        child
+            .messages
+            .iter()
+            .rfind(|message| matches!(message.role, bamboo_agent_core::Role::User))
+            .map(|message| message.content.clone()),
+        "latest_user_message",
+        &mut truncated_fields,
+    );
+    let guidance = bounded_overview_field(
+        Some(compute_status_guidance(
+            status.as_deref(),
+            runner_info.as_ref(),
+            child.has_pending_injected_messages(),
+        )),
+        "guidance",
+        &mut truncated_fields,
+    );
+
+    Ok(json!({
+        "child_session_id": child.id,
+        "title": title,
+        "model": model,
+        "pinned": child.pinned,
+        "message_count": child.messages.len(),
+        "is_running": port.is_child_running(&child.id).await,
+        "last_run_status": bounded_overview_field(status.clone(), "last_run_status", &mut truncated_fields),
+        "last_run_error": error,
+        "responsibility": responsibility,
+        "subagent_type": subagent_type,
+        "prompt": prompt,
+        "latest_user_message": latest_user_message,
+        "runtime_kind": bounded_overview_field(metadata_text(&child, "runtime.kind"), "runtime_kind", &mut truncated_fields),
+        "external_protocol": bounded_overview_field(metadata_text(&child, "external.protocol"), "external_protocol", &mut truncated_fields),
+        "external_agent_id": bounded_overview_field(metadata_text(&child, "external.agent_id"), "external_agent_id", &mut truncated_fields),
+        "a2a_context_id": bounded_overview_field(metadata_text(&child, "a2a.context_id"), "a2a_context_id", &mut truncated_fields),
+        "a2a_latest_task_id": bounded_overview_field(metadata_text(&child, "a2a.latest_task_id"), "a2a_latest_task_id", &mut truncated_fields),
+        "a2a_last_state": bounded_overview_field(metadata_text(&child, "a2a.last_state"), "a2a_last_state", &mut truncated_fields),
+        "runner_started_at": runner_info.as_ref().and_then(|r| r.started_at.map(|t| t.to_rfc3339())),
+        "runner_completed_at": runner_info.as_ref().and_then(|r| r.completed_at.map(|t| t.to_rfc3339())),
+        "last_tool_name": bounded_overview_field(runner_info.as_ref().and_then(|r| r.last_tool_name.clone()), "last_tool_name", &mut truncated_fields),
+        "last_tool_phase": bounded_overview_field(runner_info.as_ref().and_then(|r| r.last_tool_phase.clone()), "last_tool_phase", &mut truncated_fields),
+        "last_event_at": runner_info.as_ref().and_then(|r| r.last_event_at.map(|t| t.to_rfc3339())),
+        "round_count": runner_info.as_ref().map(|r| r.round_count).unwrap_or(0),
+        "has_pending_injected_messages": child.has_pending_injected_messages(),
+        "guidance": guidance,
+        "truncated_fields": truncated_fields,
+        "inspection_hint": "This overview contains metadata and bounded previews, not the child transcript. Use view=messages for paginated previews and view=result for bounded final-answer slices.",
+    }))
+}
+
+fn bounded_overview_field(
+    value: Option<String>,
+    field: &'static str,
+    truncated_fields: &mut Vec<&'static str>,
+) -> Option<String> {
+    const MAX_BYTES: usize = 2048;
+    value.map(|value| {
+        if value.len() <= MAX_BYTES {
+            return value;
+        }
+        let mut end = MAX_BYTES;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        truncated_fields.push(field);
+        value[..end].to_string()
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_child_action(
+    port: &dyn ChildSessionPort,
+    parent_id: &str,
+    child_session_id: String,
+    title: Option<String>,
+    responsibility: Option<String>,
+    prompt: Option<String>,
+    subagent_type: Option<String>,
+    reset_after_update: Option<bool>,
+    model_ref_override: Option<bamboo_domain::ProviderModelRef>,
+    reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    auto_run: bool,
+) -> Result<serde_json::Value, ChildSessionError> {
+    update_child_action_with_background(
+        port,
+        parent_id,
+        child_session_id,
+        title,
+        responsibility,
+        prompt,
+        subagent_type,
+        reset_after_update,
+        model_ref_override,
+        reasoning_effort,
+        None,
+        auto_run,
+    )
+    .await
+}
+
+/// Background-aware form used by resident reuse with `fork_last_messages`.
+/// The canonical raw assignment prompt remains in metadata; rendered fork text
+/// only belongs to this task frame, so later reuse cannot compound it.
+#[allow(clippy::too_many_arguments)]
+pub async fn update_child_action_with_background(
+    port: &dyn ChildSessionPort,
+    parent_id: &str,
+    child_session_id: String,
+    title: Option<String>,
+    responsibility: Option<String>,
+    prompt: Option<String>,
+    subagent_type: Option<String>,
+    reset_after_update: Option<bool>,
+    model_ref_override: Option<bamboo_domain::ProviderModelRef>,
+    reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    assignment_background: Option<String>,
+    auto_run: bool,
+) -> Result<serde_json::Value, ChildSessionError> {
+    let update = ChildSessionUpdate {
+        title: normalize_non_empty_optional(title, "title")?,
+        responsibility: normalize_non_empty_optional(responsibility, "responsibility")?,
+        prompt: normalize_non_empty_optional(prompt, "prompt")?,
+        subagent_type: normalize_non_empty_optional(subagent_type, "subagent_type")?,
+        reset_after_update,
+        model_ref_override,
+        reasoning_effort,
+        assignment_background,
+        auto_run,
+    };
+
+    if update.title.is_none()
+        && !update.refreshes_assignment()
+        && update.model_ref_override.is_none()
+        && update.reasoning_effort.is_none()
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "update requires at least one field: title/responsibility/prompt/subagent_type/model/reasoning_effort"
+                .to_string(),
+        ));
+    }
+
+    let (child, messages_removed) = port
+        .update_child_session(parent_id, &child_session_id, update)
+        .await?;
+
+    Ok(json!({
+        "child_session_id": child.id,
+        "title": child.title,
+        "model": child.model,
+        "model_ref": child.model_ref,
+        "reasoning_effort": child.reasoning_effort.map(|effort| effort.as_str()),
+        "messages_removed": messages_removed,
+        "last_run_status": metadata_text(&child, "last_run_status"),
+        "note": "Child session updated in place. Use action=run to execute the same child session.",
+    }))
+}
+
+/// The fields of one update request. The server applies this to the latest
+/// durable child while holding both the launch fence and session write lock.
+#[derive(Clone)]
+pub struct ChildSessionUpdate {
+    pub title: Option<String>,
+    pub responsibility: Option<String>,
+    pub prompt: Option<String>,
+    pub subagent_type: Option<String>,
+    pub reset_after_update: Option<bool>,
+    pub model_ref_override: Option<bamboo_domain::ProviderModelRef>,
+    pub reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+    pub assignment_background: Option<String>,
+    pub auto_run: bool,
+}
+
+impl ChildSessionUpdate {
+    pub fn refreshes_assignment(&self) -> bool {
+        self.responsibility.is_some() || self.prompt.is_some() || self.subagent_type.is_some()
+    }
+
+    pub fn changes_execution(&self) -> bool {
+        self.refreshes_assignment()
+            || self.model_ref_override.is_some()
+            || self.reasoning_effort.is_some()
+            || self.auto_run
+    }
+}
+
+pub fn apply_child_session_update(
+    child: &mut Session,
+    update: ChildSessionUpdate,
+) -> Result<usize, ChildSessionError> {
+    let should_refresh_assignment = update.refreshes_assignment();
+    if super::named_profile::has_named_profile(&child)
+        && (should_refresh_assignment
+            || update.assignment_background.is_some()
+            || update.model_ref_override.is_some()
+            || update.reasoning_effort.is_some())
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "named_profile_contract_is_frozen; create a new Child to select another profile or model".into()));
+    }
+    if (should_refresh_assignment || update.assignment_background.is_some())
+        && bamboo_domain::ChildContextBinding::from_session(&child)
+            .map_err(|error| ChildSessionError::Execution(error.to_string()))?
+            .is_some()
+    {
+        return Err(ChildSessionError::InvalidArguments(
+            "required_child_context_unsupported: immutable assignment cannot be updated in place; create a new Child".into()));
+    }
+
+    if let Some(model_ref) = update.model_ref_override {
+        apply_model_ref_override(child, model_ref)?;
+    }
+
+    if let Some(effort) = update.reasoning_effort {
+        child.reasoning_effort = Some(effort);
+    }
+
+    if let Some(title) = update.title {
+        if child.title != title {
+            child.title = title;
+            child.title_generated = false;
+            child.title_version = child.title_version.saturating_add(1);
+            child.metadata_version = child.metadata_version.saturating_add(1);
+        }
+    }
+
+    let mut messages_removed = 0usize;
+
+    if should_refresh_assignment {
+        let effective_responsibility = normalize_required_text(
+            update
+                .responsibility
+                .or_else(|| metadata_text(&child, "responsibility")),
+            "responsibility",
+        )?;
+        let effective_subagent_type = normalize_required_text(
+            update
+                .subagent_type
+                .or_else(|| metadata_text(&child, "subagent_type")),
+            "subagent_type",
+        )?;
+        let effective_prompt = normalize_required_text(
+            update
+                .prompt
+                .or_else(|| metadata_text(&child, "assignment_prompt")),
+            "prompt",
+        )?;
+
+        child.metadata.insert(
+            "responsibility".to_string(),
+            effective_responsibility.clone(),
+        );
+        child
+            .metadata
+            .insert("subagent_type".to_string(), effective_subagent_type.clone());
+        child
+            .metadata
+            .insert("assignment_prompt".to_string(), effective_prompt.clone());
+        child.set_last_run_status("pending");
+        child.advance_child_launch_generation().ok_or_else(|| {
+            ChildSessionError::Execution("child launch generation exhausted".into())
+        })?;
+        child.clear_last_run_error();
+
+        let assignment = format_child_assignment_with_background(
+            &child.title,
+            &effective_responsibility,
+            &effective_subagent_type,
+            &effective_prompt,
+            update.assignment_background.as_deref(),
+        );
+        let user_index = replace_or_append_last_user_message(child, assignment);
+
+        if update.reset_after_update.unwrap_or(true) {
+            messages_removed = truncate_after_index(child, user_index);
+        }
+    }
+
+    if update.auto_run {
+        if !should_refresh_assignment {
+            child.set_last_run_status("pending");
+            child.advance_child_launch_generation().ok_or_else(|| {
+                ChildSessionError::Execution("child launch generation exhausted".into())
+            })?;
+            child.clear_last_run_error();
+        }
+        child.mark_child_auto_run_launch_intent();
+    }
+
+    child.updated_at = Utc::now();
+    Ok(messages_removed)
+}
+
+fn apply_model_ref_override(
+    child: &mut Session,
+    model_ref: bamboo_domain::ProviderModelRef,
+) -> Result<(), ChildSessionError> {
+    let provider = model_ref.provider.trim();
+    let model = model_ref.model.trim();
+    if provider.is_empty() || model.is_empty() {
+        return Err(ChildSessionError::InvalidArguments(
+            "model provider and id must both be non-empty".to_string(),
+        ));
+    }
+    let model_ref = bamboo_domain::ProviderModelRef {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        reasoning_effort: model_ref.reasoning_effort,
+    };
+    child.model = model_ref.model.clone();
+    child.set_provider_name(model_ref.provider.clone());
+    child.model_ref = Some(model_ref);
+    Ok(())
+}
+
+/// Prepare an existing child for a fresh run without making it runnable. The
+/// caller must durably arm any synchronous parent wait before enqueueing it.
+pub async fn run_child_action(
+    port: &dyn ChildSessionPort,
+    parent: &Session,
+    child_session_id: String,
+    reset_to_last_user: Option<bool>,
+) -> Result<serde_json::Value, ChildSessionError> {
+    let mut child = port
+        .load_child_for_parent(&parent.id, &child_session_id)
+        .await?;
+
+    if port.is_child_running(&child.id).await {
+        return Ok(json!({
+            "child_session_id": child.id,
+            "status": "already_running",
+            "note": "Child session is already running.",
+        }));
+    }
+
+    port.validate_child_run_request(parent, &child, reset_to_last_user)
+        .await?;
+    let mut messages_removed = 0usize;
+    if reset_to_last_user.unwrap_or(true) {
+        messages_removed = truncate_after_last_user(&mut child)?;
+    }
+
+    child.set_last_run_status("pending");
+    child
+        .advance_child_launch_generation()
+        .ok_or_else(|| ChildSessionError::Execution("child launch generation exhausted".into()))?;
+    child.mark_child_auto_run_launch_intent();
+    child.clear_last_run_error();
+    child.updated_at = Utc::now();
+    port.save_child_session(&mut child).await?;
+
+    Ok(json!({
+        "child_session_id": child.id,
+        "status": "queued",
+        "messages_removed": messages_removed,
+        "note": "Queued existing child session for retry in place.",
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn send_message_to_child_action(
+    port: &dyn ChildSessionPort,
+    parent: &Session,
+    child_session_id: String,
+    message: String,
+    auto_run: Option<bool>,
+    interrupt_running: Option<bool>,
+    idempotency_key: Option<&str>,
+    wait_if_queued: bool,
+) -> Result<serde_json::Value, ChildSessionError> {
+    send_message_to_child_action_with_gate(
+        port,
+        parent,
+        child_session_id,
+        message,
+        auto_run,
+        interrupt_running,
+        idempotency_key,
+        wait_if_queued,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn send_message_to_child_action_with_gate(
+    port: &dyn ChildSessionPort,
+    parent: &Session,
+    child_session_id: String,
+    message: String,
+    auto_run: Option<bool>,
+    interrupt_running: Option<bool>,
+    idempotency_key: Option<&str>,
+    wait_if_queued: bool,
+    admission_gate: Option<&bamboo_domain::AdmissionGate>,
+) -> Result<serde_json::Value, ChildSessionError> {
+    let mut child = port
+        .load_child_for_parent(&parent.id, &child_session_id)
+        .await?;
+
+    // Preserve the historical existence/ownership error priority above, then
+    // validate before any runner query or interrupt. Ordinary corrective
+    // content stays byte-for-byte raw through draft and SessionInbox paths.
+    if message.trim().is_empty() {
+        return Err(ChildSessionError::InvalidArguments(
+            "message must be non-empty".to_string(),
+        ));
+    }
+
+    let mut is_running = port.is_child_running(&child.id).await;
+    let should_interrupt = interrupt_running.unwrap_or(false);
+    let mut delivery_gate = admission_gate;
+
+    if is_running && should_interrupt {
+        // Interrupting an existing run is itself an irreversible part of this
+        // delivery. Once it starts, the owner must finish preparing the new
+        // message even if the caller disappears.
+        if let Some(gate) = admission_gate {
+            match gate.commit(|| Ok::<(), ChildSessionError>(()))? {
+                bamboo_domain::AdmissionCommit::Cancelled => {
+                    return Err(ChildSessionError::Execution(
+                        "SubAgent tool cancelled before child interruption".to_string(),
+                    ));
+                }
+                bamboo_domain::AdmissionCommit::Committed(())
+                | bamboo_domain::AdmissionCommit::AlreadyCommitted => {}
+            }
+        }
+        // The stop is the first irreversible effect, so this branch has
+        // committed its owner before that call. A second Inbox gate would see
+        // an already-committed operation rather than a message receipt.
+        delivery_gate = None;
+        port.cancel_child_run_and_wait(&child.id).await?;
+        child = port
+            .load_child_for_parent(&parent.id, &child_session_id)
+            .await?;
+        // Cancellation changes the routing decision. In particular,
+        // auto_run=false means "leave a draft" after interrupting the old run,
+        // not "wake a successor" based on the pre-cancel snapshot.
+        is_running = port.is_child_running(&child.id).await;
+    }
+
+    let should_auto_run = auto_run.unwrap_or(true);
+    // `interrupt_running` is meaningful only for an actually-running child.
+    // On an idle child, `auto_run=false` must retain the historical draft-only
+    // behavior regardless of that otherwise-inert flag.
+    if should_route_child_message_through_inbox(is_running, should_auto_run) {
+        // An idle child's SessionInbox delivery can reserve and execute its
+        // activation inside send_session_message. Arm the parent's durable wait
+        // first, then remove it if delivery did not actually queue a new run.
+        // Live messages intentionally retain their non-suspending semantics.
+        let armed_wait = wait_if_queued && !is_running;
+        let had_wait = if armed_wait {
+            port.load_parent_session(&parent.id)
+                .await?
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.waiting_for_children.as_ref())
+                .is_some_and(|wait| wait.child_session_ids.iter().any(|id| id == &child.id))
+        } else {
+            false
+        };
+        if armed_wait {
+            if let Err(error) = port
+                .register_parent_wait_for_child(&parent.id, &child.id, idempotency_key)
+                .await
+            {
+                return Err(if had_wait {
+                    error
+                } else {
+                    rollback_failed_wait_launch(port, &parent.id, &child.id, error).await
+                });
+            }
+        }
+        if delivery_gate.is_some_and(bamboo_domain::AdmissionGate::is_cancelled) {
+            let error = ChildSessionError::Execution(
+                "SubAgent tool cancelled before child delivery".to_string(),
+            );
+            return Err(if armed_wait && !had_wait {
+                rollback_failed_wait_launch(port, &parent.id, &child.id, error).await
+            } else {
+                error
+            });
+        }
+        let send = port.send_session_message_with_gate(
+            &parent.id,
+            &child.id,
+            &message,
+            idempotency_key,
+            delivery_gate,
+        );
+        // The detached owner must not hold a newly armed parent wait while a
+        // pre-commit inbox lock or temp write remains blocked. The durable
+        // rename runs synchronously under this same gate; after it commits,
+        // cancellation cannot win this select and activation keeps its owner.
+        let delivery = match delivery_gate {
+            Some(gate) => tokio::select! {
+                biased;
+                _ = gate.cancelled() => Err(ChildSessionError::Execution(
+                    "SubAgent tool cancelled before child delivery".to_string(),
+                )),
+                result = send => result,
+            },
+            None => send.await,
+        };
+        let delivery = match delivery {
+            Ok(delivery) => delivery,
+            Err(error) if armed_wait && !had_wait => {
+                return Err(rollback_failed_wait_launch(port, &parent.id, &child.id, error).await);
+            }
+            Err(error) => return Err(error),
+        };
+        let (delivery, activation, status, note, activation_error) = match delivery {
+            super::ChildSessionMessageDelivery::Activated(receipt) => {
+                let (status, note) = match receipt.activation {
+                    bamboo_domain::SessionActivationDisposition::ActiveNotified => (
+                        "message_delivered_live",
+                        "Message durably delivered and the owning active loop was notified.",
+                    ),
+                    bamboo_domain::SessionActivationDisposition::ActivationReserved => (
+                        "queued",
+                        "Message durably delivered and exactly one session activation was reserved.",
+                    ),
+                    bamboo_domain::SessionActivationDisposition::ActivationCoalesced => (
+                        "message_queued",
+                        "Message durably delivered; activation coalesced with existing session work.",
+                    ),
+                };
+                (
+                    receipt.delivery,
+                    Some(receipt.activation),
+                    status,
+                    note,
+                    None,
+                )
+            }
+            super::ChildSessionMessageDelivery::ActivationPending { delivery, error } => (
+                delivery,
+                None,
+                "activation_pending",
+                "Message is durable; activation is pending and will be retried from the inbox watermark.",
+                Some(error),
+            ),
+            super::ChildSessionMessageDelivery::ActivationAuthorizationPending {
+                delivery,
+                error,
+            } => (
+                delivery,
+                None,
+                "activation_retry_required",
+                "Message is durable, but activation authorization was not persisted. The same message ID must be retried; restart alone cannot wake this delivery.",
+                Some(error),
+            ),
+        };
+        if armed_wait && !had_wait && status != "queued" {
+            port.rollback_parent_wait_for_child(&parent.id, &child.id)
+                .await?;
+        }
+        return Ok(json!({
+            "child_session_id": child.id,
+            "status": status,
+            "auto_run": !matches!(
+                activation,
+                Some(bamboo_domain::SessionActivationDisposition::ActiveNotified)
+            ),
+            "message": message,
+            "message_id": delivery.id.to_string(),
+            "inbox_generation": delivery.generation,
+            "activation_error": activation_error,
+            "message_count": child.messages.len(),
+            "note": note,
+        }));
+    }
+
+    // Explicit `auto_run=false` on an idle child retains its historical
+    // draft-only behavior. All runnable/live delivery paths above converge on
+    // SessionMessenger and never rewrite a snapshot to enqueue. The draft's
+    // multi-file Session save still needs its own final-commit cancellation
+    // fence (#1328); this fast check only avoids work already cancelled here.
+    if delivery_gate.is_some_and(bamboo_domain::AdmissionGate::is_cancelled) {
+        return Err(ChildSessionError::Execution(
+            "SubAgent tool cancelled before child delivery".to_string(),
+        ));
+    }
+    let child = port
+        .append_draft_child_message(&parent.id, &child.id, &message)
+        .await?;
+
+    Ok(json!({
+        "child_session_id": child.id,
+        "status": "pending",
+        "auto_run": false,
+        "message": message,
+        "message_count": child.messages.len(),
+        "note": "Follow-up message appended. Use action=run to execute the child session.",
+    }))
+}
+
+/// Undo only this child's wait entry when a launch fails after the wait was
+/// armed. Keep the original failure visible even if compensation also fails.
+pub async fn rollback_failed_wait_launch(
+    port: &dyn ChildSessionPort,
+    parent_session_id: &str,
+    child_session_id: &str,
+    error: ChildSessionError,
+) -> ChildSessionError {
+    match port
+        .rollback_parent_wait_for_child(parent_session_id, child_session_id)
+        .await
+    {
+        Ok(()) => error,
+        Err(rollback_error) => ChildSessionError::Execution(format!(
+            "{error}; parent-wait rollback failed: {rollback_error}"
+        )),
+    }
+}
+
+fn should_route_child_message_through_inbox(is_running: bool, should_auto_run: bool) -> bool {
+    is_running || should_auto_run
+}
+
+pub fn cancel_child_action<'a>(
+    port: &'a dyn ChildSessionPort,
+    parent_id: &'a str,
+    child_session_id: String,
+) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, ChildSessionError>> + Send + 'a>> {
+    Box::pin(cancel_child_action_inner(port, parent_id, child_session_id))
+}
+
+async fn cancel_child_action_inner(
+    port: &dyn ChildSessionPort,
+    parent_id: &str,
+    child_session_id: String,
+) -> Result<serde_json::Value, ChildSessionError> {
+    // Validate ownership before doing anything.
+    let _ = port
+        .load_child_for_parent(parent_id, &child_session_id)
+        .await?;
+    port.cancel_child_run_and_wait(&child_session_id).await?;
+
+    // RELOAD after the wait — writing the pre-wait snapshot would clobber
+    // whatever the finishing run persisted (its terminal status AND any
+    // messages it appended). And if the child completed naturally while the
+    // cancel was in flight, keep that truth instead of mislabeling it.
+    let mut child = port
+        .load_child_for_parent(parent_id, &child_session_id)
+        .await?;
+    let latest_status = child.last_run_status().unwrap_or_default();
+    if latest_status == "cancelled" {
+        return Ok(json!({
+            "child_session_id": child_session_id,
+            "status": "cancelled",
+        }));
+    }
+    if matches!(
+        latest_status.as_str(),
+        "completed" | "error" | "timeout" | "skipped"
+    ) {
+        return Ok(json!({
+            "child_session_id": child_session_id,
+            "status": latest_status,
+            "note": "Child reached a natural terminal state while the cancel was in flight; its real outcome was kept.",
+        }));
+    }
+    child.set_last_run_status("cancelled");
+    child.set_last_run_error("Cancelled by parent");
+    port.save_child_session(&mut child).await?;
+    Ok(json!({
+        "child_session_id": child_session_id,
+        "status": "cancelled",
+    }))
+}
+
+pub async fn delete_child_action(
+    port: &dyn ChildSessionPort,
+    parent_id: &str,
+    child_session_id: String,
+) -> Result<serde_json::Value, ChildSessionError> {
+    // Load child first to get its ID (port.delete_child_session handles cancellation + cleanup)
+    let child = port
+        .load_child_for_parent(parent_id, &child_session_id)
+        .await?;
+    let result = port.delete_child_session(parent_id, &child.id).await?;
+
+    if !result.deleted {
+        return Err(ChildSessionError::Execution(format!(
+            "child session was not deleted: {}",
+            child.id
+        )));
+    }
+
+    Ok(json!({
+        "child_session_id": child.id,
+        "deleted": true,
+        "cancelled_running_child": result.cancelled_running_child,
+    }))
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::super::ChildSessionEntry;
+    use super::assemble_session_tree;
+    use std::collections::HashMap;
+
+    fn entry(id: &str, title: &str) -> ChildSessionEntry {
+        ChildSessionEntry {
+            child_session_id: id.to_string(),
+            title: title.to_string(),
+            pinned: false,
+            message_count: 0,
+            updated_at: String::new(),
+            last_run_status: Some("completed".to_string()),
+            last_run_error: None,
+        }
+    }
+
+    #[test]
+    fn assembles_multi_level_tree() {
+        let mut adj: HashMap<String, Vec<ChildSessionEntry>> = HashMap::new();
+        adj.insert(
+            "root".into(),
+            vec![entry("c1", "child 1"), entry("c2", "child 2")],
+        );
+        adj.insert("c1".into(), vec![entry("g1", "grandchild")]);
+
+        let tree = assemble_session_tree("root", "Root", &adj, 8);
+        assert_eq!(tree.session_id, "root");
+        assert_eq!(tree.depth, 0);
+        assert_eq!(tree.children.len(), 2);
+        let c1 = tree.children.iter().find(|n| n.session_id == "c1").unwrap();
+        assert_eq!(c1.depth, 1);
+        assert_eq!(c1.children.len(), 1);
+        assert_eq!(c1.children[0].session_id, "g1");
+        assert_eq!(c1.children[0].depth, 2);
+        let c2 = tree.children.iter().find(|n| n.session_id == "c2").unwrap();
+        assert!(c2.children.is_empty());
+    }
+
+    #[test]
+    fn depth_cap_stops_descent() {
+        let mut adj: HashMap<String, Vec<ChildSessionEntry>> = HashMap::new();
+        adj.insert("root".into(), vec![entry("c1", "c1")]);
+        adj.insert("c1".into(), vec![entry("g1", "g1")]);
+        let tree = assemble_session_tree("root", "Root", &adj, 1);
+        assert_eq!(tree.children.len(), 1);
+        assert!(
+            tree.children[0].children.is_empty(),
+            "depth cap stops expansion at depth 1"
+        );
+    }
+
+    #[test]
+    fn cycle_is_broken_by_first_visit_guard() {
+        let mut adj: HashMap<String, Vec<ChildSessionEntry>> = HashMap::new();
+        adj.insert("a".into(), vec![entry("b", "b")]);
+        adj.insert("b".into(), vec![entry("a", "a")]); // cycle a → b → a
+        let tree = assemble_session_tree("a", "A", &adj, 100);
+        assert_eq!(tree.children.len(), 1);
+        let b = &tree.children[0];
+        assert_eq!(b.session_id, "b");
+        assert_eq!(b.children.len(), 1);
+        let a2 = &b.children[0];
+        assert_eq!(a2.session_id, "a");
+        assert!(a2.children.is_empty(), "cycle must terminate as a leaf");
+    }
+}
+
+#[cfg(test)]
+mod update_model_tests {
+    use super::apply_model_ref_override;
+
+    #[test]
+    fn model_override_updates_all_session_model_authority() {
+        let mut child = bamboo_domain::Session::new("child", "old-model");
+        child.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+            "old-provider",
+            "old-model",
+        ));
+        child.set_provider_name("old-provider");
+
+        apply_model_ref_override(
+            &mut child,
+            bamboo_domain::ProviderModelRef::new(" new-provider ", " new-model "),
+        )
+        .expect("valid model override");
+
+        assert_eq!(child.model, "new-model");
+        assert_eq!(child.provider_name().as_deref(), Some("new-provider"));
+        assert_eq!(
+            child
+                .model_ref
+                .as_ref()
+                .map(|model_ref| model_ref.to_pair()),
+            Some(("new-provider", "new-model"))
+        );
+    }
+
+    #[test]
+    fn model_override_rejects_empty_provider_or_model() {
+        let mut child = bamboo_domain::Session::new("child", "old-model");
+        assert!(apply_model_ref_override(
+            &mut child,
+            bamboo_domain::ProviderModelRef::new("", "new-model")
+        )
+        .is_err());
+        assert!(apply_model_ref_override(
+            &mut child,
+            bamboo_domain::ProviderModelRef::new("provider", "  ")
+        )
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod send_message_tests {
+    use super::should_route_child_message_through_inbox;
+
+    #[test]
+    fn running_auto_run_interrupt_matrix_preserves_idle_draft_contract() {
+        for (is_running, auto_run, interrupt_running, expected_inbox) in [
+            (false, false, false, false),
+            (false, false, true, false),
+            (false, true, false, true),
+            (false, true, true, true),
+            (true, false, false, true),
+            (true, false, true, false),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            let effective_running = is_running && !interrupt_running;
+            assert_eq!(
+                should_route_child_message_through_inbox(effective_running, auto_run),
+                expected_inbox,
+                "is_running={is_running} auto_run={auto_run} interrupt_running={interrupt_running}"
+            );
+        }
+    }
+}

@@ -1,0 +1,7535 @@
+//! Anthropic provider and request-building helpers.
+
+pub mod api_types;
+pub mod conversion;
+pub mod stream;
+
+// Re-export commonly used types
+pub use api_types::*;
+pub use conversion::{
+    convert_complete_request, convert_complete_response, convert_messages_request,
+    convert_messages_response, format_model_display_name,
+};
+pub use stream::{
+    format_sse_data, format_sse_event, map_completion_stream_chunk, AnthropicStreamAdapter,
+};
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::LazyLock;
+
+use async_trait::async_trait;
+use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
+use bamboo_domain::{
+    resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
+    ClassifiedToolIdentity, ToolSchema,
+};
+use bamboo_domain::{
+    Message, MessagePart, PromptBlock, ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor,
+    ProviderTranscriptGroup, ProviderTranscriptItem, ProviderTranscriptItemKind,
+    ProviderTranscriptOrigin, Role,
+};
+use reqwest::{header::HeaderMap, Client};
+use serde_json::{json, Value};
+
+use crate::cache::{CacheTtl, PromptCachePlan, MAX_ANTHROPIC_CACHE_BREAKPOINTS};
+use crate::prompt_ir::PromptIR;
+use crate::provider::LLMRequestOptions;
+use crate::provider::{
+    required_tool_from_options, LLMError, LLMProvider, LLMStream, ProviderVisibleToolFootprint,
+    ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind, Result,
+};
+use crate::providers::common::model_fetcher;
+use crate::providers::common::request_overrides;
+use crate::types::LLMChunk;
+use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
+use bamboo_domain::ReasoningEffort;
+
+static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
+    LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
+
+const ANTHROPIC_TOOL_SEARCH_TYPE: &str = "tool_search_tool_regex_20251119";
+const ANTHROPIC_TOOL_SEARCH_NAME: &str = "tool_search_tool_regex";
+/// Per-response resource ceilings for the optional provider-native transcript
+/// lane. The normalized token/tool stream is intentionally independent of
+/// these budgets and continues when native capture is discarded.
+///
+/// Byte ceilings count retained UTF-8 bytes: a block's initial JSON plus later
+/// string fragments. They are deliberately larger than an ordinary Anthropic
+/// response while still placing a fixed upper bound on provider-controlled
+/// capture state.
+const ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS: usize = 128;
+const ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK: usize = 1024 * 1024;
+const ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK: usize = 1024 * 1024;
+const ANTHROPIC_NATIVE_CAPTURE_MAX_INPUT_JSON_BYTES_PER_BLOCK: usize = 1024 * 1024;
+const ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const ANTHROPIC_TOOL_SEARCH_MODEL_PREFIXES: [&str; 10] = [
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-opus-4-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5",
+];
+
+fn is_official_anthropic_base_url(base_url: &str) -> bool {
+    let normalized = base_url.trim_end_matches('/');
+    normalized.eq_ignore_ascii_case("https://api.anthropic.com")
+        || normalized.eq_ignore_ascii_case("https://api.anthropic.com/v1")
+}
+
+fn supports_anthropic_tool_search(model: &str) -> bool {
+    let model = model.trim();
+    ANTHROPIC_TOOL_SEARCH_MODEL_PREFIXES.iter().any(|prefix| {
+        model == *prefix
+            || model.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix.len() == 9
+                    && suffix.starts_with('-')
+                    && suffix[1..].bytes().all(|byte| byte.is_ascii_digit())
+            })
+    })
+}
+
+pub(crate) fn reasoning_effort_for_required_tool(
+    configured: Option<ReasoningEffort>,
+    required_tool: Option<&str>,
+) -> Option<ReasoningEffort> {
+    if required_tool.is_some() {
+        None
+    } else {
+        configured
+    }
+}
+
+/// Return the reasoning effort that will still need a numeric thinking budget
+/// after Anthropic's request-scoped compatibility downgrades run.
+///
+/// Keep the original effort for the request builder so it can emit the existing
+/// #520 warning and apply its full history conversion. This helper is only for
+/// deciding whether an impossible Max budget should reject the request before
+/// that builder runs.
+pub(crate) fn reasoning_effort_for_budget_validation(
+    reasoning_effort: Option<ReasoningEffort>,
+    messages: &[Message],
+    thinking_replay_always: bool,
+    native_groups: &[ProviderTranscriptGroup],
+) -> Option<ReasoningEffort> {
+    if reasoning_effort.is_some()
+        && !thinking_replay_always
+        && must_downgrade_thinking_for_unsigned_tool_turn(
+            messages,
+            native_groups,
+            thinking_replay_always,
+        )
+    {
+        None
+    } else {
+        reasoning_effort
+    }
+}
+
+pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option<&str>) {
+    if let Some(name) = required_tool {
+        // Anthropic-compatible reasoning models (including DeepSeek through an
+        // Anthropic endpoint) reject forced named-tool choice while thinking is
+        // enabled. This is a request-scoped activation turn, so remove thinking
+        // after all request overrides and restore normal behavior next round.
+        if let Some(object) = body.as_object_mut() {
+            object.remove("thinking");
+        }
+        body["tool_choice"] = json!({
+            "type": "tool",
+            "name": name,
+            "disable_parallel_tool_use": true
+        });
+    }
+}
+
+pub(crate) fn apply_required_tool_auto_fallback(body: &mut Value, required_tool: Option<&str>) {
+    if required_tool.is_some() {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("thinking");
+        }
+        body["tool_choice"] = json!({
+            "type": "auto",
+            "disable_parallel_tool_use": true
+        });
+    }
+}
+
+pub(crate) fn looks_like_thinking_forced_tool_choice_error(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> bool {
+    status == reqwest::StatusCode::BAD_REQUEST
+        && body
+            .to_ascii_lowercase()
+            .contains("thinking mode does not support this tool_choice")
+}
+
+/// Anthropic Messages API provider.
+pub struct AnthropicProvider {
+    client: Client,
+    api_key: String,
+    base_url: String,
+    max_tokens: u32,
+    default_reasoning_effort: Option<ReasoningEffort>,
+    request_overrides: Option<RequestOverridesConfig>,
+    masking_config: KeywordMaskingConfig,
+    /// Whether to replay a prior turn's `reasoning` text as a `thinking` content
+    /// block unconditionally (issue #520).
+    ///
+    /// The real Anthropic API requires `thinking` input blocks to carry a
+    /// `signature` it can cryptographically verify as its own — bamboo never
+    /// captures that signature (the SSE parser drops `signature_delta`), so any
+    /// block we replay is either foreign (minted by a different provider, e.g.
+    /// after a mid-session model switch) or an unsigned copy of Claude's own
+    /// prior thinking. Real Anthropic 400s on both. The safe default is to omit
+    /// the block entirely: Anthropic does not require prior-turn thinking to
+    /// continue a conversation.
+    ///
+    /// Some Anthropic-compatible upstreams (e.g. GLM's `/anthropic` endpoint)
+    /// have the opposite contract: they require the `thinking` block to be
+    /// PRESENT on every assistant turn once thinking is enabled, but never
+    /// validate its signature. Setting this to `true` restores the old
+    /// unconditional-emission behavior for that class of upstream.
+    thinking_replay_always: bool,
+}
+
+impl AnthropicProvider {
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            api_key: api_key.into(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            max_tokens: 1024,
+            default_reasoning_effort: None,
+            request_overrides: None,
+            masking_config: KeywordMaskingConfig::default(),
+            thinking_replay_always: false,
+        }
+    }
+
+    /// Configure keyword masking applied as a last-moment scan of every outbound
+    /// request body (see [`crate::masking`]).
+    pub fn with_masking(mut self, masking_config: KeywordMaskingConfig) -> Self {
+        self.masking_config = masking_config;
+        self
+    }
+
+    /// Overrides the internal HTTP client (e.g., to enable a proxy).
+    pub fn with_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
+    }
+
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
+    }
+
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Configure default reasoning effort for requests sent through this provider.
+    pub fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.default_reasoning_effort = effort;
+        self
+    }
+
+    /// Configure request overrides for this provider.
+    pub fn with_request_overrides(mut self, overrides: Option<RequestOverridesConfig>) -> Self {
+        self.request_overrides = overrides;
+        self
+    }
+
+    /// Opt into unconditional `thinking`-block replay (issue #520), for
+    /// Anthropic-compatible upstreams (e.g. GLM) that require the block to be
+    /// present regardless of signature. Real Anthropic should never set this —
+    /// it will reject an unsigned/foreign thinking block with a 400.
+    pub fn with_thinking_replay_always(mut self, always: bool) -> Self {
+        self.thinking_replay_always = always;
+        self
+    }
+
+    fn build_headers(&self, endpoint: &str, model: Option<&str>) -> Result<HeaderMap> {
+        use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(&self.api_key)
+                .map_err(|e| LLMError::Auth(format!("Invalid API key: {}", e)))?,
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        request_overrides::apply_overrides_to_header_map(
+            &mut headers,
+            self.request_overrides.as_ref(),
+            endpoint,
+            model,
+        );
+
+        Ok(headers)
+    }
+
+    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
+        // Shared, tightened heuristic (#237 finding 5). `budget_tokens` (Anthropic's
+        // thinking-budget param) is in the shared reasoning-token set.
+        crate::providers::common::looks_like_reasoning_unsupported_error(status, body)
+    }
+}
+
+#[async_trait]
+impl LLMProvider for AnthropicProvider {
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        if required_tool.is_none()
+            && is_official_anthropic_base_url(&self.base_url)
+            && supports_anthropic_tool_search(model)
+        {
+            CapabilityLoadingMode::Progressive
+        } else {
+            CapabilityLoadingMode::LegacyFullCatalog
+        }
+    }
+
+    async fn provider_visible_tool_footprint(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        let mode = self.capability_loading_mode(model, required_tool).await;
+        if mode == CapabilityLoadingMode::LegacyFullCatalog {
+            let projected = tools_to_anthropic_json(tools, mode);
+            if projected.is_empty() {
+                return Ok(ProviderVisibleToolFootprint::default());
+            }
+            return Ok(ProviderVisibleToolFootprint {
+                segments: vec![ProviderVisibleToolSegment::from_serializable(
+                    ProviderVisibleToolSegmentKind::InitialFullDefinition,
+                    &projected,
+                )?],
+            });
+        }
+
+        let initial = tools_to_anthropic_json(tools, mode)
+            .into_iter()
+            .filter(|tool| tool.get("defer_loading").and_then(Value::as_bool) != Some(true))
+            .collect::<Vec<_>>();
+        let mut segments = vec![ProviderVisibleToolSegment::from_serializable(
+            ProviderVisibleToolSegmentKind::InitialFullDefinition,
+            &initial,
+        )?];
+        segments.push(ProviderVisibleToolSegment::empty_marker(
+            ProviderVisibleToolSegmentKind::ProviderLateBound,
+        ));
+
+        for definition in validated_anthropic_reference_definitions_in_order(
+            ir.provider_transcript_groups.iter(),
+            tools,
+        )? {
+            segments.push(ProviderVisibleToolSegment::from_serializable(
+                ProviderVisibleToolSegmentKind::AnthropicToolReferenceExpansion,
+                &definition,
+            )?);
+        }
+
+        Ok(ProviderVisibleToolFootprint { segments })
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream> {
+        self.chat_stream_with_options(messages, tools, max_output_tokens, model, None)
+            .await
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        self.stream_messages_inner(
+            messages,
+            &[],
+            &[],
+            tools,
+            max_output_tokens,
+            model,
+            options,
+            CapabilityLoadingMode::LegacyFullCatalog,
+        )
+        .await
+    }
+
+    /// Render the canonical [`PromptIR`] into the Anthropic wire: the structured
+    /// system field rides `system_blocks` (per-block `cache_control`), and the
+    /// body is `ir.body_chat()`. Anthropic re-sends the full message array each
+    /// turn (the prompt-cache breakpoints absorb the stable prefix) and never uses
+    /// `previous_response_id`, so the IR continuation is not consulted here. Falls
+    /// back to `ir.flatten()` when there are no structured system blocks (the
+    /// zero-tools path), byte-identical to the legacy lanes rendering.
+    async fn chat_stream_ir(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        let required_tool = options
+            .and_then(|options| options.required_tool.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let capability_loading_mode = self.capability_loading_mode(model, required_tool).await;
+        if ir.system_blocks.is_empty() {
+            return self
+                .stream_messages_inner(
+                    &ir.flatten(),
+                    &[],
+                    &ir.provider_transcript_groups,
+                    tools,
+                    max_output_tokens,
+                    model,
+                    options,
+                    capability_loading_mode,
+                )
+                .await;
+        }
+        let messages = ir.body_chat();
+        self.stream_messages_inner(
+            &messages,
+            &ir.system_blocks,
+            &ir.provider_transcript_groups,
+            tools,
+            max_output_tokens,
+            model,
+            options,
+            capability_loading_mode,
+        )
+        .await
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let headers = self.build_headers(request_overrides::ENDPOINT_MODELS, None)?;
+        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
+        model_fetcher::fetch_model_list(&self.client, &url, headers, "Anthropic").await
+    }
+}
+
+impl AnthropicProvider {
+    /// Build and stream one Anthropic Messages request. `system_blocks`, when
+    /// non-empty, is the canonical structured system field; otherwise the system
+    /// is taken from the `System` messages in `messages`.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_messages_inner(
+        &self,
+        messages: &[Message],
+        system_blocks: &[PromptBlock],
+        native_groups: &[ProviderTranscriptGroup],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+        capability_loading_mode: CapabilityLoadingMode,
+    ) -> Result<LLMStream> {
+        let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
+        let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
+        let required_tool = required_tool_from_options(options, tools)?;
+        let configured_reasoning_effort = options
+            .and_then(|o| o.reasoning_effort)
+            .or(self.default_reasoning_effort);
+        let reasoning_effort =
+            reasoning_effort_for_required_tool(configured_reasoning_effort, required_tool);
+        let budget_reasoning_effort = reasoning_effort_for_budget_validation(
+            reasoning_effort,
+            messages,
+            self.thinking_replay_always,
+            native_groups,
+        );
+        crate::providers::common::validate_max_thinking_budget(
+            budget_reasoning_effort,
+            Some(max_tokens),
+        )?;
+        let request_reasoning_effort = reasoning_effort_for_required_tool(
+            options.and_then(|o| o.reasoning_effort),
+            required_tool,
+        );
+        let cache_plan = options.and_then(|o| o.cache.as_ref());
+        let extended_cache_ttl = cache_plan
+            .map(|plan| plan.ttl == CacheTtl::Extended)
+            .unwrap_or(false);
+        let reasoning_source = if required_tool.is_some() {
+            "required_tool_disabled"
+        } else if request_reasoning_effort.is_some() {
+            "request"
+        } else if self.default_reasoning_effort.is_some() {
+            "provider_default"
+        } else {
+            "none"
+        };
+
+        let request_purpose = options
+            .and_then(|o| o.request_purpose.as_deref())
+            .unwrap_or("unknown");
+        let session_log_id = options
+            .and_then(|o| o.session_id.as_deref())
+            .unwrap_or("unknown-session");
+
+        tracing::debug!("Anthropic provider using model: {}", model);
+
+        let mut body = build_anthropic_request_with_cache_blocks_native_mode(
+            messages,
+            system_blocks,
+            tools,
+            model,
+            max_tokens,
+            true,
+            reasoning_effort,
+            parallel_tool_calls,
+            cache_plan,
+            self.thinking_replay_always,
+            native_groups,
+            capability_loading_mode,
+        );
+        request_overrides::apply_overrides_to_body(
+            &mut body,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            Some(model),
+        );
+        apply_required_tool_choice(&mut body, required_tool);
+        // Last-moment scan: mask every text value in the fully-assembled body.
+        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        // DIAGNOSTIC: count image blocks actually present in the OUTGOING request
+        // body (top-level content blocks AND inside tool_result content arrays), so
+        // we can tell with certainty whether a screenshot reaches the wire vs being
+        // dropped before send. image_blocks_on_wire=0 with a screenshot in the
+        // conversation means the image never left bamboo.
+        let image_blocks_on_wire: usize = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|msgs| {
+                msgs.iter()
+                    .filter_map(|m| m.get("content").and_then(|c| c.as_array()))
+                    .flatten()
+                    .map(|block| {
+                        let mut n = usize::from(
+                            block.get("type").and_then(|t| t.as_str()) == Some("image"),
+                        );
+                        if let Some(inner) = block.get("content").and_then(|c| c.as_array()) {
+                            n += inner
+                                .iter()
+                                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("image"))
+                                .count();
+                        }
+                        n
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        tracing::info!(
+            "[{}] Anthropic request image_blocks_on_wire={} model='{}'",
+            session_log_id,
+            image_blocks_on_wire,
+            model
+        );
+        let mut applied_reasoning_effort = reasoning_effort;
+        let mut thinking_enabled = body.get("thinking").is_some();
+        let mut thinking_budget_tokens = body
+            .get("thinking")
+            .and_then(|thinking| thinking.get("budget_tokens"))
+            .and_then(|value| value.as_u64());
+        tracing::info!(
+            "[{}] Anthropic request model='{}' reasoning_effort={} reasoning_source={} request_reasoning_enabled={} thinking_enabled={} thinking_budget_tokens={} max_tokens={} [{}]",
+            session_log_id,
+            model,
+            applied_reasoning_effort
+                .map(ReasoningEffort::as_str)
+                .unwrap_or("none"),
+            reasoning_source,
+            applied_reasoning_effort.is_some(),
+            thinking_enabled,
+            thinking_budget_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            max_tokens,
+            request_purpose
+        );
+        let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
+        if extended_cache_ttl {
+            // 1-hour prompt cache TTL is gated behind a beta header.
+            headers.insert(
+                "anthropic-beta",
+                reqwest::header::HeaderValue::from_static("extended-cache-ttl-2025-04-11"),
+            );
+        }
+
+        // Retry the *initial* request establishment on transient failures
+        // (429/5xx, connect/timeout). The closure rebuilds a fresh request each
+        // attempt; the returned response body is unread, so streaming below is
+        // unaffected (issue #18).
+        let messages_url = format!("{}/messages", self.base_url);
+        let mut response =
+            crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
+                self.client
+                    .post(&messages_url)
+                    .headers(headers.clone())
+                    .json(&body)
+            })
+            .await
+            .map_err(LLMError::Http)?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.map_err(LLMError::Http)?;
+
+            if required_tool.is_some()
+                && looks_like_thinking_forced_tool_choice_error(status, &text)
+            {
+                tracing::warn!(
+                    "[{}] Anthropic model '{}' rejected forced named tool_choice in thinking mode; retrying activation with tool_choice=auto and parallel tool use disabled",
+                    session_log_id,
+                    model
+                );
+                let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
+                    messages,
+                    system_blocks,
+                    tools,
+                    model,
+                    max_tokens,
+                    true,
+                    None,
+                    Some(false),
+                    cache_plan,
+                    false,
+                    native_groups,
+                    capability_loading_mode,
+                );
+                request_overrides::apply_overrides_to_body(
+                    &mut fallback_body,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_MESSAGES,
+                    Some(model),
+                );
+                apply_required_tool_auto_fallback(&mut fallback_body, required_tool);
+                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                response =
+                    crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
+                        self.client
+                            .post(&messages_url)
+                            .headers(headers.clone())
+                            .json(&fallback_body)
+                    })
+                    .await
+                    .map_err(LLMError::Http)?;
+
+                if !response.status().is_success() {
+                    let fallback_status = response.status();
+                    let fallback_text = response.text().await.map_err(LLMError::Http)?;
+                    if fallback_status == 401 || fallback_status == 403 {
+                        return Err(LLMError::Auth(format!(
+                            "Anthropic authentication failed: {}. Please check your API key.",
+                            fallback_text
+                        )));
+                    }
+                    return Err(LLMError::Api(format!(
+                        "Anthropic API error after tool_choice=auto activation fallback: HTTP {}: {}",
+                        fallback_status, fallback_text
+                    )));
+                }
+            } else if reasoning_effort.is_some()
+                && Self::looks_like_reasoning_unsupported_error(status, &text)
+            {
+                tracing::warn!(
+                    "Anthropic /messages rejected reasoning for model '{}'; retrying without reasoning_effort",
+                    model
+                );
+
+                let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
+                    messages,
+                    system_blocks,
+                    tools,
+                    model,
+                    max_tokens,
+                    true,
+                    None,
+                    parallel_tool_calls,
+                    cache_plan,
+                    self.thinking_replay_always,
+                    native_groups,
+                    capability_loading_mode,
+                );
+                request_overrides::apply_overrides_to_body(
+                    &mut fallback_body,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_MESSAGES,
+                    Some(model),
+                );
+                apply_required_tool_choice(&mut fallback_body, required_tool);
+                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                applied_reasoning_effort = None;
+                thinking_enabled = false;
+                thinking_budget_tokens = None;
+                tracing::info!(
+                    "[{}] Anthropic request retry model='{}' reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_enabled=false thinking_budget_tokens=none max_tokens={} [{}]",
+                    session_log_id,
+                    model,
+                    reasoning_source,
+                    max_tokens,
+                    request_purpose
+                );
+                response =
+                    crate::retry::send_with_retry(crate::retry::global(), "Anthropic", || {
+                        self.client
+                            .post(&messages_url)
+                            .headers(headers.clone())
+                            .json(&fallback_body)
+                    })
+                    .await
+                    .map_err(LLMError::Http)?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let text = response.text().await.map_err(LLMError::Http)?;
+
+                    if status == 401 || status == 403 {
+                        return Err(LLMError::Auth(format!(
+                            "Anthropic authentication failed: {}. Please check your API key.",
+                            text
+                        )));
+                    }
+
+                    return Err(LLMError::Api(format!(
+                        "Anthropic API error: HTTP {}: {}",
+                        status, text
+                    )));
+                }
+            } else {
+                if status == 401 || status == 403 {
+                    return Err(LLMError::Auth(format!(
+                        "Anthropic authentication failed: {}. Please check your API key.",
+                        text
+                    )));
+                }
+
+                return Err(LLMError::Api(format!(
+                    "Anthropic API error: HTTP {}: {}",
+                    status, text
+                )));
+            }
+        }
+
+        // Use shared SSE adapter with Anthropic-specific parser
+        let mut state = AnthropicStreamState {
+            requested_reasoning_effort: applied_reasoning_effort,
+            request_thinking_enabled: thinking_enabled,
+            request_thinking_budget_tokens: thinking_budget_tokens,
+            ..Default::default()
+        };
+
+        let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
+            response,
+            move |event, data| parse_anthropic_sse_event_multi(&mut state, event, data),
+        );
+
+        Ok(stream)
+    }
+}
+
+/// Build an Anthropic Messages API request body from internal message/tool types.
+///
+/// This is a pure conversion helper: it does no I/O and intentionally omits internal fields
+/// like message `id`/`created_at`.
+pub fn build_anthropic_request(
+    messages: &[Message],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+) -> Value {
+    build_anthropic_request_with_cache(
+        messages,
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        None,
+    )
+}
+
+// NOTE: `build_anthropic_request` and `build_anthropic_request_with_cache` are
+// the widely-used simple entry points (production `Bodhi` proxy path + dozens
+// of tests unrelated to thinking replay); they always target real Anthropic,
+// so both hardcode `thinking_replay_always = false` inside
+// `build_anthropic_request_with_cache` below rather than growing another
+// public parameter every caller has to thread through.
+
+/// Build an Anthropic Messages API request body, placing prompt-cache
+/// breakpoints according to a provider-agnostic [`PromptCachePlan`].
+///
+/// When `cache` is `None`, falls back to caching the stable system prompt and
+/// tool definitions (always safe, since both are constant across a session).
+/// Message-level breakpoints require the engine's knowledge of which messages
+/// end a stable prefix, so they are opt-in via the plan's
+/// `breakpoint_message_ids`. The total number of `cache_control` markers is
+/// clamped to [`MAX_ANTHROPIC_CACHE_BREAKPOINTS`]; when there are more
+/// candidates than the budget, the breakpoints nearest the end of the
+/// conversation win (they cover the largest stable prefix).
+/// Delegates to [`build_anthropic_request_with_cache_blocks`] with no structured
+/// system blocks, so the system field is rendered from the `System` messages in
+/// `messages` exactly as before.
+#[allow(clippy::too_many_arguments)]
+pub fn build_anthropic_request_with_cache(
+    messages: &[Message],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+) -> Value {
+    build_anthropic_request_with_cache_blocks(
+        messages,
+        &[],
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        cache,
+        false,
+    )
+}
+
+/// Like [`build_anthropic_request_with_cache`] but renders the `system` field
+/// from Bamboo's canonical structured `system_blocks` — one Anthropic system text
+/// block per [`PromptBlock`] — when they are present. The single system
+/// `cache_control` breakpoint still lands on the last block, so caching behavior
+/// is unchanged; only the structure (N text blocks vs one joined block) differs.
+/// With empty `system_blocks` this is byte-identical to the legacy path.
+///
+/// `thinking_replay_always`: see [`AnthropicProvider::with_thinking_replay_always`]
+/// (issue #520) — when `false` (the default for real Anthropic), replay requires
+/// either Bamboo's captured provider signature or an exact validated native
+/// thinking/redacted-thinking block. When `true`, prior `reasoning` text is
+/// unconditionally re-emitted as a `thinking` block whenever the current request
+/// has thinking enabled, matching the legacy behavior some Anthropic-compatible
+/// upstreams (e.g. GLM) require.
+#[allow(clippy::too_many_arguments)]
+pub fn build_anthropic_request_with_cache_blocks(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+    thinking_replay_always: bool,
+) -> Value {
+    build_anthropic_request_with_cache_blocks_and_native(
+        messages,
+        system_blocks,
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        cache,
+        thinking_replay_always,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_anthropic_request_with_cache_blocks_and_native(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+    thinking_replay_always: bool,
+    native_groups: &[ProviderTranscriptGroup],
+) -> Value {
+    build_anthropic_request_with_cache_blocks_native_mode(
+        messages,
+        system_blocks,
+        tools,
+        model,
+        max_tokens,
+        stream,
+        reasoning_effort,
+        parallel_tool_calls,
+        cache,
+        thinking_replay_always,
+        native_groups,
+        CapabilityLoadingMode::LegacyFullCatalog,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_anthropic_request_with_cache_blocks_native_mode(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    tools: &[ToolSchema],
+    model: &str,
+    max_tokens: u32,
+    stream: bool,
+    reasoning_effort: Option<ReasoningEffort>,
+    parallel_tool_calls: Option<bool>,
+    cache: Option<&PromptCachePlan>,
+    thinking_replay_always: bool,
+    native_groups: &[ProviderTranscriptGroup],
+    capability_loading_mode: CapabilityLoadingMode,
+) -> Value {
+    let default_plan = PromptCachePlan {
+        cache_tools: true,
+        cache_system: true,
+        ..PromptCachePlan::default()
+    };
+    let plan = cache.unwrap_or(&default_plan);
+    let ttl = plan.ttl;
+
+    // Whether the CURRENT request enables extended thinking — a `thinking`
+    // block can never be replayed when it's disabled (Anthropic rejects it in
+    // that case too, issue #520).
+    let requested_thinking = anthropic_thinking_from_effort(reasoning_effort, max_tokens);
+    // Thinking-downgrade guard (#520): real Anthropic requires the final
+    // assistant turn whose tool_results this request submits to START with its
+    // original SIGNED thinking block whenever thinking is enabled. After a
+    // mid-session model switch (or a session recorded before signature capture
+    // existed) no such block can ever be produced, so the only way to submit
+    // the tool results without a 400 ("Expected `thinking` or
+    // `redacted_thinking`...") is to disable thinking for this request. An
+    // upstream on `thinking_replay_always` (GLM-style) replays the unsigned
+    // block instead, which satisfies its presence requirement.
+    let thinking_downgraded = requested_thinking.is_some()
+        && !thinking_replay_always
+        && must_downgrade_thinking_for_unsigned_tool_turn(
+            messages,
+            native_groups,
+            thinking_replay_always,
+        );
+    if thinking_downgraded {
+        let key = ("unsigned-tool-turn-thinking-downgrade", model);
+        let error = "final assistant tool_use turn lacks a signed thinking block";
+        if STATIC_WARNINGS.insert_if_new(&key, error) {
+            tracing::warn!(
+                "Anthropic request: disabling extended thinking for this request — the final \
+                 assistant tool_use turn has no signed thinking block to replay (e.g. it was \
+                 minted by another provider before a mid-session model switch, #520)"
+            );
+        } else {
+            tracing::debug!(
+                "Anthropic request: disabling extended thinking for this request — the final \
+                 assistant tool_use turn has no signed thinking block to replay (e.g. it was \
+                 minted by another provider before a mid-session model switch, #520)"
+            );
+        }
+    }
+    let thinking_enabled = requested_thinking.is_some() && !thinking_downgraded;
+
+    let (mut system, mut anthropic_messages, source_spans) = messages_to_anthropic_json(
+        messages,
+        system_blocks,
+        thinking_enabled,
+        thinking_replay_always,
+    );
+
+    // Anthropic honors at most MAX_ANTHROPIC_CACHE_BREAKPOINTS `cache_control`
+    // markers per request. Spend the budget on the most stable regions first
+    // (tools, then system), then on conversation breakpoints nearest the end.
+    let mut budget = MAX_ANTHROPIC_CACHE_BREAKPOINTS;
+
+    let mut tools_json = tools_to_anthropic_json(tools, capability_loading_mode);
+    if plan.cache_tools && budget > 0 {
+        if let Some(last_tool) = tools_json.iter_mut().rev().find_map(|tool| {
+            let object = tool.as_object_mut()?;
+            (!object
+                .get("defer_loading")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+            .then_some(object)
+        }) {
+            last_tool.insert("cache_control".to_string(), cache_control_value(ttl));
+            budget -= 1;
+        }
+    }
+
+    if plan.cache_system && budget > 0 {
+        if let Some(last_block) = system
+            .as_mut()
+            .and_then(|s| s.as_array_mut())
+            .and_then(|blocks| blocks.last_mut())
+            .and_then(|block| block.as_object_mut())
+        {
+            last_block.insert("cache_control".to_string(), cache_control_value(ttl));
+            budget -= 1;
+        }
+    }
+
+    if budget > 0 && !plan.breakpoint_message_ids.is_empty() {
+        let mut breakpoint_targets: Vec<(usize, usize)> = source_spans
+            .iter()
+            .enumerate()
+            .filter_map(|(message_idx, spans)| {
+                // When several marked sources coalesce into one output message,
+                // the last marked source closes the largest stable prefix.
+                spans
+                    .iter()
+                    .rev()
+                    .find(|span| plan.is_breakpoint(&span.id) && span.end_block > span.start_block)
+                    .map(|span| (message_idx, span.end_block - 1))
+            })
+            .collect();
+        // Keep only the breakpoints closest to the end of the conversation.
+        if breakpoint_targets.len() > budget {
+            breakpoint_targets = breakpoint_targets.split_off(breakpoint_targets.len() - budget);
+        }
+        for (message_idx, block_idx) in breakpoint_targets {
+            if let Some(message) = anthropic_messages.get_mut(message_idx) {
+                add_cache_control_to_block(message, block_idx, ttl);
+            }
+        }
+    }
+
+    apply_anthropic_native_groups(
+        &mut anthropic_messages,
+        &source_spans,
+        native_groups,
+        thinking_enabled,
+        tools,
+        capability_loading_mode,
+    );
+
+    let mut body = json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "stream": stream,
+        "messages": anthropic_messages,
+        "tools": tools_json,
+    });
+
+    if let Some(system) = system {
+        body["system"] = system;
+    }
+
+    if thinking_enabled {
+        if let Some(thinking) = requested_thinking {
+            body["thinking"] = thinking;
+        }
+    }
+
+    if !tools.is_empty() {
+        if let Some(parallel_tool_calls) = parallel_tool_calls {
+            body["tool_choice"] = json!({
+                "type": "auto",
+                "disable_parallel_tool_use": !parallel_tool_calls,
+            });
+        }
+    }
+
+    body
+}
+
+/// Replace only the normalized source contribution owned by each anchor. Cache
+/// markers are calculated first; an exact provider-owned block deliberately
+/// replaces (and therefore cannot inherit) a generated marker.
+fn apply_anthropic_native_groups(
+    messages: &mut [Value],
+    source_spans: &[Vec<SourceSpan>],
+    groups: &[ProviderTranscriptGroup],
+    thinking_enabled: bool,
+    eligible_tools: &[ToolSchema],
+    capability_loading_mode: CapabilityLoadingMode,
+) {
+    struct Replacement {
+        message_index: usize,
+        span_index: usize,
+        start: usize,
+        end: usize,
+        items: Vec<Value>,
+    }
+
+    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+        return;
+    }
+
+    let eligible_execution_names = eligible_tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            (identity.loading_class() != CapabilityLoadingClass::HostOnly)
+                .then(|| identity.execution_name().to_string())
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut groups_by_anchor: HashMap<&str, Vec<&ProviderTranscriptGroup>> = HashMap::new();
+    for group in groups.iter().filter(|group| {
+        group.family() == ProviderFamily::Anthropic
+            && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+    }) {
+        groups_by_anchor
+            .entry(group.anchor_message_id())
+            .or_default()
+            .push(group);
+    }
+
+    let mut replacements = Vec::new();
+    for (anchor, mut anchor_groups) in groups_by_anchor {
+        let Some((message_index, span_index)) =
+            source_spans
+                .iter()
+                .enumerate()
+                .find_map(|(message_index, spans)| {
+                    spans
+                        .iter()
+                        .position(|span| span.id == anchor)
+                        .map(|span_index| (message_index, span_index))
+                })
+        else {
+            continue;
+        };
+        let spans = &source_spans[message_index];
+        let span = &spans[span_index];
+        let start = span.start_block;
+        let end = span.end_block;
+
+        anchor_groups.sort_by_key(|group| group.sequence());
+        let items = anchor_groups
+            .into_iter()
+            .flat_map(|group| group.items().iter().cloned())
+            .collect::<Vec<_>>();
+        if ProviderTranscriptGroup::validate_items(&items).is_err() {
+            continue;
+        }
+        let custom_host_result = items.iter().all(|item| {
+            item.origin() == ProviderTranscriptOrigin::HostToolSearch
+                && item.kind() == ProviderTranscriptItemKind::AnthropicToolResult
+        });
+        if custom_host_result {
+            if !span.is_tool_result {
+                continue;
+            }
+        } else if !span.is_assistant {
+            continue;
+        }
+        if items
+            .iter()
+            .flat_map(anthropic_reference_names)
+            .any(|reference| !eligible_execution_names.contains(reference))
+        {
+            // Anthropic resolves the literal reference against this request's
+            // top-level catalog. Keep the normalized anchor instead of sending
+            // a native group that the provider would reject with a 400.
+            continue;
+        }
+        let thinking_positions = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                matches!(
+                    item.payload().get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let native_starts_with_thinking = thinking_positions.first() == Some(&0);
+        let normalized_starts_with_thinking = messages
+            .get(message_index)
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| content.get(start))
+            .is_some_and(|block| {
+                matches!(
+                    block.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            });
+        let invalid_thinking_replay = thinking_positions.len() > 1
+            || thinking_positions
+                .first()
+                .is_some_and(|index| *index != 0 || span_index > 0 || !thinking_enabled)
+            || (normalized_starts_with_thinking && !native_starts_with_thinking);
+        if invalid_thinking_replay {
+            // Consecutive assistant sources are coalesced to satisfy Anthropic's
+            // alternation rule, and thinking is legal only as the one leading
+            // block of a thinking-enabled assistant turn. Keep the normalized
+            // fallback for this entire anchor rather than replaying a partial
+            // or request-incompatible native group.
+            continue;
+        }
+
+        replacements.push(Replacement {
+            message_index,
+            span_index,
+            start,
+            end,
+            items: items
+                .into_iter()
+                .map(|item| item.payload().clone())
+                .collect(),
+        });
+    }
+
+    // Source spans were calculated before replacement. Apply later spans first
+    // so inserting a multi-block native group cannot shift an earlier index that
+    // another replacement still needs.
+    replacements.sort_by(|left, right| {
+        right
+            .message_index
+            .cmp(&left.message_index)
+            .then_with(|| right.span_index.cmp(&left.span_index))
+    });
+    for replacement in replacements {
+        let Some(content) = messages[replacement.message_index]
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        if replacement.start <= replacement.end && replacement.end <= content.len() {
+            content.splice(replacement.start..replacement.end, replacement.items);
+        }
+    }
+}
+
+/// Build a `cache_control` value, honoring an optional extended TTL.
+fn cache_control_value(ttl: CacheTtl) -> Value {
+    match ttl.anthropic_ttl() {
+        Some(ttl) => json!({"type": "ephemeral", "ttl": ttl}),
+        None => json!({"type": "ephemeral"}),
+    }
+}
+
+/// Add a breakpoint to a specific source-owned block. If a malformed/changed
+/// rendering makes the recorded index invalid, fall back defensively to the
+/// message's last block rather than dropping caching entirely.
+fn add_cache_control_to_block(message: &mut Value, block_idx: usize, ttl: CacheTtl) {
+    let Some(blocks) = message.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return;
+    };
+    let target = if block_idx < blocks.len() {
+        blocks.get_mut(block_idx)
+    } else {
+        blocks.last_mut()
+    };
+    if let Some(block) = target.and_then(Value::as_object_mut) {
+        block.insert("cache_control".to_string(), cache_control_value(ttl));
+    }
+}
+
+/// Whether enabling extended thinking on this request would be rejected by
+/// real Anthropic because the final assistant turn — the one whose
+/// tool_results this request submits — contains `tool_use` but no replayable
+/// SIGNED thinking block. Anthropic requires that turn to start with its
+/// original signed thinking block whenever thinking is enabled; when it was
+/// minted by another provider (mid-session model switch) or recorded before
+/// signature capture existed, no valid block can be produced, so the request
+/// must run with thinking disabled instead of 400ing (#520).
+///
+/// Turns whose reasoning text exists but whose signature was invalidated
+/// (multi-block / redacted thinking) downgrade too: a partial replay would
+/// fail verification.
+fn must_downgrade_thinking_for_unsigned_tool_turn(
+    messages: &[Message],
+    native_groups: &[ProviderTranscriptGroup],
+    thinking_replay_always: bool,
+) -> bool {
+    let Some(last_assistant_idx) = messages
+        .iter()
+        .rposition(|message| matches!(message.role, Role::Assistant))
+    else {
+        return false;
+    };
+    let last_assistant = &messages[last_assistant_idx];
+    let has_tool_use = last_assistant
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| !calls.is_empty());
+    if !has_tool_use {
+        return false;
+    }
+    // The constraint only bites when this request actually submits the
+    // tool_results for that turn (the conversation continues past it with
+    // `Role::Tool` messages).
+    let submits_tool_results = messages[last_assistant_idx + 1..]
+        .iter()
+        .any(|message| matches!(message.role, Role::Tool));
+    if !submits_tool_results {
+        return false;
+    }
+    let anchor_is_leading =
+        native_thinking_anchor_is_leading(messages, &last_assistant.id, thinking_replay_always);
+    let has_signed_thinking = anchor_is_leading
+        && last_assistant
+            .reasoning
+            .as_deref()
+            .is_some_and(|reasoning| !reasoning.is_empty())
+        && last_assistant
+            .reasoning_signature
+            .as_deref()
+            .is_some_and(|signature| !signature.is_empty());
+    let has_native_thinking =
+        has_replayable_native_thinking_prefix(&last_assistant.id, native_groups)
+            && anchor_is_leading;
+    !has_signed_thinking && !has_native_thinking
+}
+
+fn native_thinking_anchor_is_leading(
+    messages: &[Message],
+    anchor_message_id: &str,
+    thinking_replay_always: bool,
+) -> bool {
+    let (_, _, source_spans) =
+        messages_to_anthropic_json(messages, &[], true, thinking_replay_always);
+    source_spans.iter().any(|spans| {
+        spans.iter().enumerate().any(|(span_index, span)| {
+            span.id == anchor_message_id && span.is_assistant && span_index == 0
+        })
+    })
+}
+
+fn has_replayable_native_thinking_prefix(
+    anchor_message_id: &str,
+    native_groups: &[ProviderTranscriptGroup],
+) -> bool {
+    let mut groups = native_groups
+        .iter()
+        .filter(|group| {
+            group.family() == ProviderFamily::Anthropic
+                && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+                && group.anchor_message_id() == anchor_message_id
+        })
+        .collect::<Vec<_>>();
+    groups.sort_by_key(|group| group.sequence());
+    let items = groups
+        .into_iter()
+        .flat_map(|group| group.items().iter().cloned())
+        .collect::<Vec<_>>();
+    ProviderTranscriptGroup::validate_items(&items).is_ok()
+        && matches!(
+            items
+                .first()
+                .and_then(|item| item.payload().get("type"))
+                .and_then(Value::as_str),
+            Some("thinking" | "redacted_thinking")
+        )
+        && items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.payload().get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+            .count()
+            == 1
+}
+
+fn anthropic_thinking_from_effort(
+    reasoning_effort: Option<ReasoningEffort>,
+    max_tokens: u32,
+) -> Option<Value> {
+    let budget = reasoning_effort.and_then(|effort| {
+        crate::providers::common::bounded_thinking_budget(effort, Some(max_tokens))
+    })?;
+
+    Some(json!({
+        "type": "enabled",
+        "budget_tokens": budget,
+    }))
+}
+
+/// Render Bamboo's canonical structured system blocks into an Anthropic `system`
+/// value: an array with one `{ "type": "text", ... }` block per non-empty
+/// [`PromptBlock`]. Returns `None` when there are no non-empty blocks, so callers
+/// fall back to the legacy joined-text path.
+fn system_blocks_to_anthropic_value(system_blocks: &[PromptBlock]) -> Option<Value> {
+    let blocks: Vec<Value> = system_blocks
+        .iter()
+        .filter(|b| !b.text.trim().is_empty())
+        .map(|b| json!({ "type": "text", "text": b.text }))
+        .collect();
+    (!blocks.is_empty()).then_some(Value::Array(blocks))
+}
+
+/// Convert internal messages to the Anthropic wire shape.
+///
+/// Returns the optional `system` block array, the message array, and parallel
+/// source spans recording where each source message's own rendered contribution
+/// starts and ends (so anchors and breakpoints remain stable through same-role /
+/// tool-result merging, including empty assistant sources).
+///
+/// When `system_blocks` is non-empty it is the canonical, structured source for
+/// the system field (each block → its own text block); otherwise the system field
+/// is the joined `System`-message text (legacy, byte-identical).
+///
+/// `thinking_enabled`/`thinking_replay_always` gate `thinking`-block replay on
+/// assistant turns — see [`build_anthropic_request_with_cache_blocks`] (#520).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceSpan {
+    id: String,
+    is_assistant: bool,
+    is_tool_result: bool,
+    start_block: usize,
+    end_block: usize,
+}
+
+fn messages_to_anthropic_json(
+    messages: &[Message],
+    system_blocks: &[PromptBlock],
+    thinking_enabled: bool,
+    thinking_replay_always: bool,
+) -> (Option<Value>, Vec<Value>, Vec<Vec<SourceSpan>>) {
+    let mut system_parts: Vec<&str> = Vec::new();
+    let mut out: Vec<Value> = Vec::new();
+    // One entry per OUTPUT message: every source folded into it and the exact
+    // last block contributed by that source. A cache breakpoint therefore ends
+    // at the marked stable source, not at a later volatile coalesced tail.
+    let mut out_spans: Vec<Vec<SourceSpan>> = Vec::new();
+
+    // Keep only the MOST RECENT tool-result image (e.g. screenshot); older ones
+    // are dropped from the request to control context size, since a conversation
+    // can accumulate many large images. (User-attached images are untouched.)
+    let last_image_tool_idx = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m.role, Role::Tool) && message_has_image(m))
+        .map(|(i, _)| i)
+        .next_back();
+
+    for (idx, m) in messages.iter().enumerate() {
+        match m.role {
+            Role::System => system_parts.push(m.content.as_str()),
+            Role::User | Role::Assistant | Role::Tool => {
+                let keep_image = Some(idx) == last_image_tool_idx;
+                // `message_to_anthropic_json` returns `None` only for a stray
+                // System message; skip it (rather than emit a null/empty entry)
+                // so a malformed conversation never pollutes the `messages`
+                // array nor crashes the call (issue #22).
+                let Some(msg_json) = message_to_anthropic_json(
+                    m,
+                    keep_image,
+                    thinking_enabled,
+                    thinking_replay_always,
+                ) else {
+                    continue;
+                };
+                // Coalesce consecutive SAME-ROLE messages into one. Anthropic
+                // requires strict user/assistant alternation and 400s on two
+                // consecutive same-role turns, so concatenating their content
+                // blocks keeps alternation valid no matter what upstream produced
+                // (defense-in-depth, #101). This also subsumes the original
+                // tool_result merge (#29/#22): a `Tool` message serializes to a
+                // `user` message, so consecutive tool_results — and a tool_result
+                // following any user turn — fold into that same user message, with
+                // every tool_result for one assistant tool_use turn in one message
+                // as the API requires. The merged-into message keeps its original
+                // source span, so a cache breakpoint on that turn still maps to
+                // the precise block where that source contribution ends.
+                if let Some(last) = out.last_mut() {
+                    let same_role = last.get("role").and_then(|r| r.as_str())
+                        == msg_json.get("role").and_then(|r| r.as_str());
+                    if same_role {
+                        if let (Some(last_content), Some(new_content)) = (
+                            last.get_mut("content").and_then(|c| c.as_array_mut()),
+                            msg_json.get("content").and_then(|c| c.as_array()),
+                        ) {
+                            // Drop any `thinking` block from the appended content:
+                            // Anthropic requires `thinking` to be the FIRST block of
+                            // an assistant turn, so a merged-in turn's thinking would
+                            // land in an illegal interior position. (Two consecutive
+                            // assistant turns don't occur in a well-formed
+                            // conversation, but coalescing must not itself produce an
+                            // invalid block order. User merges carry no thinking
+                            // blocks, so this is a no-op there.) #101.
+                            let appended: Vec<Value> = new_content
+                                .iter()
+                                .filter(|block| {
+                                    block.get("type").and_then(|t| t.as_str()) != Some("thinking")
+                                })
+                                .cloned()
+                                .collect();
+                            let start_block = last_content.len();
+                            last_content.extend(appended);
+                            // Record exactly where this source's contribution
+                            // starts and ends, not merely which merged output owns
+                            // it. An empty assistant source therefore owns the
+                            // valid insertion span `n..n` instead of aliasing the
+                            // preceding block.
+                            if let Some(last_spans) = out_spans.last_mut() {
+                                last_spans.push(SourceSpan {
+                                    id: m.id.clone(),
+                                    is_assistant: matches!(m.role, Role::Assistant),
+                                    is_tool_result: matches!(m.role, Role::Tool),
+                                    start_block,
+                                    end_block: last_content.len(),
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                }
+                let end_block = msg_json
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0);
+                out.push(msg_json);
+                out_spans.push(vec![SourceSpan {
+                    id: m.id.clone(),
+                    is_assistant: matches!(m.role, Role::Assistant),
+                    is_tool_result: matches!(m.role, Role::Tool),
+                    start_block: 0,
+                    end_block,
+                }]);
+            }
+        }
+    }
+
+    // The system prompt's cache breakpoint is applied by the caller based on the
+    // cache plan, since whether the system prompt is stable enough to cache is a
+    // policy decision, not a serialization detail.
+    // Structured `system_blocks` (the canonical content-block form) supersede the
+    // joined System-message text when present: each block renders as its own
+    // Anthropic system text block, so the provider consumes Bamboo's block array
+    // structurally. With no blocks, fall back to the legacy join (byte-identical).
+    let system = system_blocks_to_anthropic_value(system_blocks).or_else(|| {
+        (!system_parts.is_empty())
+            .then(|| json!([{ "type": "text", "text": system_parts.join("\n\n") }]))
+    });
+
+    (system, out, out_spans)
+}
+
+/// Whether a message carries at least one image in its content parts.
+fn message_has_image(message: &Message) -> bool {
+    message.content_parts.as_ref().is_some_and(|parts| {
+        parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::ImageUrl { .. }))
+    })
+}
+
+/// `keep_image`: when false, a tool result's images are dropped (replaced by a
+/// short note) so only the most recent screenshot is sent — see
+/// `messages_to_anthropic_json`.
+///
+/// Returns `None` for a stray `System` message (which should have been routed
+/// into the top-level `system` field by the caller). Skipping it — rather than
+/// panicking — keeps a malformed/legacy conversation from crashing the process
+/// during an LLM call (issue #22). Callers consume this with `filter_map` /
+/// `let-else` so a skipped message is omitted entirely, never turned into a
+/// `null`/empty entry in the `messages` array.
+///
+/// `thinking_enabled`/`thinking_replay_always` gate whether `message.reasoning`
+/// is replayed as a `thinking` content block — see
+/// [`build_anthropic_request_with_cache_blocks`] (#520).
+fn message_to_anthropic_json(
+    message: &Message,
+    keep_image: bool,
+    thinking_enabled: bool,
+    thinking_replay_always: bool,
+) -> Option<Value> {
+    match message.role {
+        // A System message belongs in the top-level `system` field, not the
+        // `messages` array; the caller (`messages_to_anthropic_json`) routes it
+        // there. But a malformed/legacy session loaded from storage, or a future
+        // bug in system extraction, could surface one here — so log and skip it
+        // instead of bringing down the whole process mid-call (issue #22).
+        Role::System => {
+            tracing::warn!(
+                "Anthropic conversion received a System message in the conversation array; \
+                 skipping it (system messages belong in the top-level `system` field)"
+            );
+            None
+        }
+        Role::User => Some(json!({
+            "role": "user",
+            "content": user_content_to_anthropic_blocks(message),
+        })),
+        Role::Assistant => {
+            let mut blocks: Vec<Value> = Vec::new();
+
+            // Replay `message.reasoning` as a `thinking` content block ONLY
+            // when the current request has thinking enabled AND either:
+            // - the turn carries the provider-minted `signature` captured at
+            //   stream time (`reasoning_signature`), which real Anthropic
+            //   verifies covers this exact text — the case that keeps
+            //   pure-Claude extended-thinking tool loops working (#520); or
+            // - the upstream is explicitly known to require the block
+            //   unconditionally and not validate signatures
+            //   (`thinking_replay_always`, e.g. a GLM-style anthropic-compat
+            //   upstream).
+            //
+            // An UNSIGNED block is otherwise never replayed: it is either
+            // foreign (minted by a different provider after a mid-session
+            // model switch, #520) or a copy of Claude's own prior turn whose
+            // signature was not captured. Real Anthropic 400s on both, and
+            // also 400s if a thinking block is sent while thinking is disabled
+            // for the current request. Anthropic does not require prior-turn
+            // thinking to continue a plain conversation, so the safe default
+            // is to omit it entirely (the final tool_use turn is handled by
+            // the thinking-downgrade guard in the request builder).
+            if thinking_enabled {
+                if let Some(reasoning) = &message.reasoning {
+                    if !reasoning.is_empty() {
+                        if let Some(signature) = message
+                            .reasoning_signature
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                        {
+                            blocks.push(json!({
+                                "type": "thinking",
+                                "thinking": reasoning,
+                                "signature": signature,
+                            }));
+                        } else if thinking_replay_always {
+                            blocks.push(json!({
+                                "type": "thinking",
+                                "thinking": reasoning,
+                            }));
+                        }
+                    }
+                }
+            }
+
+            if !message.content.is_empty() {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": message.content,
+                }));
+            }
+
+            if let Some(tool_calls) = &message.tool_calls {
+                for tc in tool_calls {
+                    blocks.push(tool_call_to_tool_use_block(tc));
+                }
+            }
+
+            Some(json!({
+                "role": "assistant",
+                "content": blocks,
+            }))
+        }
+        Role::Tool => {
+            let Some(tool_use_id) = message.tool_call_id.as_deref() else {
+                tracing::warn!(
+                    "Anthropic conversion received tool message without tool_call_id; emitting plain text block"
+                );
+                return Some(json!({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": message.content,
+                        }
+                    ],
+                }));
+            };
+
+            // Tool results that carry images (e.g. an MCP `screenshot`) embed the
+            // picture as blocks; Anthropic's tool_result `content` accepts an
+            // array of text + image blocks. Only the most recent screenshot is
+            // kept (keep_image); older ones are dropped to control context size.
+            let image_blocks: Vec<Value> = if keep_image {
+                message
+                    .content_parts
+                    .as_ref()
+                    .map(|parts| {
+                        parts
+                            .iter()
+                            .filter(|p| matches!(p, MessagePart::ImageUrl { .. }))
+                            .filter_map(content_part_to_anthropic_block)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            let tool_result_content = if !image_blocks.is_empty() {
+                let mut blocks = Vec::with_capacity(image_blocks.len() + 1);
+                if !message.content.is_empty() {
+                    blocks.push(json!({ "type": "text", "text": message.content }));
+                }
+                blocks.extend(image_blocks);
+                json!(blocks)
+            } else if !keep_image && message_has_image(message) {
+                // This tool result had a screenshot we dropped — note it.
+                json!(format!(
+                    "{}\n[earlier screenshot omitted to save context; take a new one if needed]",
+                    message.content
+                ))
+            } else {
+                json!(message.content)
+            };
+
+            Some(json!({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_result_content,
+                    }
+                ],
+            }))
+        }
+    }
+}
+
+fn user_content_to_anthropic_blocks(message: &Message) -> Vec<Value> {
+    if let Some(parts) = message.content_parts.as_ref() {
+        let mut blocks = Vec::new();
+        for part in parts {
+            if let Some(block) = content_part_to_anthropic_block(part) {
+                blocks.push(block);
+            }
+        }
+        if blocks.is_empty() {
+            blocks.push(json!({
+                "type": "text",
+                "text": message.content,
+            }));
+        }
+        return blocks;
+    }
+
+    vec![json!({
+        "type": "text",
+        "text": message.content,
+    })]
+}
+
+fn content_part_to_anthropic_block(part: &MessagePart) -> Option<Value> {
+    match part {
+        MessagePart::Text { text } => Some(json!({
+            "type": "text",
+            "text": text,
+        })),
+        MessagePart::ImageUrl { image_url } => image_url_to_anthropic_block(&image_url.url),
+    }
+}
+
+fn image_url_to_anthropic_block(url: &str) -> Option<Value> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((media_type, data)) = parse_data_url_base64(trimmed) {
+        return Some(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            }
+        }));
+    }
+
+    Some(json!({
+        "type": "image",
+        "source": {
+            "type": "url",
+            "url": trimmed,
+        }
+    }))
+}
+
+fn parse_data_url_base64(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let data = data.trim();
+    if data.is_empty() {
+        return None;
+    }
+
+    let mut media_type = "application/octet-stream";
+    let mut is_base64 = false;
+
+    for (idx, seg) in meta.split(';').enumerate() {
+        let segment = seg.trim();
+        if idx == 0 && !segment.is_empty() && !segment.eq_ignore_ascii_case("base64") {
+            media_type = segment;
+        }
+        if segment.eq_ignore_ascii_case("base64") {
+            is_base64 = true;
+        }
+    }
+
+    if !is_base64 {
+        return None;
+    }
+
+    Some((media_type.to_string(), data.to_string()))
+}
+
+/// Convert a tool-call `arguments` string into an Anthropic `tool_use.input`.
+///
+/// Anthropic requires `input` to be a JSON **object**, so anything that is not
+/// one maps to `{ "_raw": <original> }`: empty/whitespace (a zero-argument tool
+/// call → `{}`), invalid JSON, or valid-but-non-object JSON (`"5"`, `[1,2]`,
+/// `true`, `"str"`). A non-object `input` is rejected with 400
+/// `invalid_request_error` and — because the `tool_use` is persisted in
+/// conversation history — then poisons every subsequent request in the session.
+///
+/// Shared by the outbound request builder (`tool_call_to_tool_use_block`) and
+/// the response conversion (`conversion::convert_messages_response`) so the two
+/// sites cannot drift.
+pub(super) fn tool_arguments_to_input(arguments: &str) -> Value {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return json!({});
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => {
+            tracing::warn!(
+                "Anthropic tool_use input fallback to _raw object: arguments are valid JSON but not an object, args_len={}",
+                trimmed.len(),
+            );
+            json!({ "_raw": arguments })
+        }
+        Err(error) => {
+            tracing::warn!(
+                "Anthropic tool_use input fallback to _raw object: invalid JSON arguments, args_len={}, error={}",
+                trimmed.len(),
+                error
+            );
+            json!({ "_raw": arguments })
+        }
+    }
+}
+
+fn tool_call_to_tool_use_block(tool_call: &bamboo_domain::ToolCall) -> Value {
+    json!({
+        "type": "tool_use",
+        "id": tool_call.id,
+        "name": tool_call.function.name,
+        "input": tool_arguments_to_input(&tool_call.function.arguments),
+    })
+}
+
+fn tool_to_anthropic_json(tool: &ToolSchema) -> Value {
+    json!({
+        "name": tool.function.name,
+        "description": tool.function.description,
+        "input_schema": crate::providers::common::tool_schema::canonicalize_json_value(&tool.function.parameters),
+    })
+}
+
+pub(crate) fn tools_to_anthropic_json(
+    tools: &[ToolSchema],
+    capability_loading_mode: CapabilityLoadingMode,
+) -> Vec<Value> {
+    if capability_loading_mode == CapabilityLoadingMode::LegacyFullCatalog {
+        return tools.iter().map(tool_to_anthropic_json).collect();
+    }
+
+    let mut rendered = tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            if identity.loading_class() == CapabilityLoadingClass::HostOnly {
+                return None;
+            }
+            let mut value = tool_to_anthropic_json(tool);
+            if identity.loading_class() == CapabilityLoadingClass::Deferred {
+                value["defer_loading"] = Value::Bool(true);
+            }
+            Some(value)
+        })
+        .collect::<Vec<_>>();
+
+    rendered.push(json!({
+        "type": ANTHROPIC_TOOL_SEARCH_TYPE,
+        "name": ANTHROPIC_TOOL_SEARCH_NAME,
+    }));
+    rendered
+}
+
+fn anthropic_reference_names(item: &ProviderTranscriptItem) -> Vec<&str> {
+    match item.kind() {
+        ProviderTranscriptItemKind::AnthropicToolSearchToolResult => item
+            .payload()
+            .get("content")
+            .and_then(|content| content.get("tool_references"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference.get("tool_name").and_then(Value::as_str))
+            .collect(),
+        ProviderTranscriptItemKind::AnthropicToolResult => item
+            .payload()
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| reference.get("tool_name").and_then(Value::as_str))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Extract provider-loaded tool identities from already typed Anthropic history.
+///
+/// Only references that name an exact definition in this request's eligible
+/// catalog are returned. This keeps the top-level `tools` array authoritative:
+/// an unknown, removed, disabled, HostOnly, or alias-only reference cannot make
+/// a function callable or produce an upstream missing-definition error.
+pub fn validated_anthropic_loaded_tool_names<'a>(
+    groups: impl IntoIterator<Item = &'a ProviderTranscriptGroup>,
+    eligible_tools: &[ToolSchema],
+) -> Vec<String> {
+    let catalog = eligible_tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            (identity.loading_class() != CapabilityLoadingClass::HostOnly)
+                .then(|| identity.execution_name().to_string())
+        })
+        .collect::<BTreeSet<_>>();
+    let mut loaded = BTreeSet::new();
+
+    for group in groups.into_iter().filter(|group| {
+        group.family() == ProviderFamily::Anthropic
+            && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+            && ProviderTranscriptGroup::validate_items(group.items()).is_ok()
+    }) {
+        for reference in group.items().iter().flat_map(anthropic_reference_names) {
+            let Some(execution_name) =
+                resolve_tool_reference_name(reference, |name| catalog.contains(name))
+            else {
+                continue;
+            };
+            // Anthropic expands the literal `tool_name` by looking it up in the
+            // top-level array. Keep only exact request identities; aliases must
+            // be canonicalized before a custom typed result is persisted.
+            if execution_name == reference {
+                loaded.insert(execution_name);
+            }
+        }
+    }
+
+    loaded.into_iter().collect()
+}
+
+/// Resolve every model-visible Anthropic reference occurrence, in transcript
+/// order, to the exact complete definition from this request's frozen catalog.
+/// Repeated references remain repeated because each one is expanded at a
+/// distinct history position by the provider.
+fn validated_anthropic_reference_definitions_in_order<'a>(
+    groups: impl IntoIterator<Item = &'a ProviderTranscriptGroup>,
+    eligible_tools: &[ToolSchema],
+) -> Result<Vec<Value>> {
+    let catalog = eligible_tools
+        .iter()
+        .filter_map(|tool| {
+            let identity = ClassifiedToolIdentity::from_schema_name(&tool.function.name)?;
+            (identity.loading_class() != CapabilityLoadingClass::HostOnly)
+                .then_some((identity.execution_name().to_string(), tool))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut definitions = Vec::new();
+
+    for group in groups.into_iter().filter(|group| {
+        group.family() == ProviderFamily::Anthropic
+            && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
+            && ProviderTranscriptGroup::validate_items(group.items()).is_ok()
+    }) {
+        for reference in group.items().iter().flat_map(anthropic_reference_names) {
+            let tool = catalog.get(reference).ok_or_else(|| {
+                LLMError::Api(format!(
+                    "Anthropic tool reference '{reference}' was not offered in the eligible catalog"
+                ))
+            })?;
+            definitions.push(tool_to_anthropic_json(tool));
+        }
+    }
+
+    Ok(definitions)
+}
+
+/// Stateful parser for Anthropic SSE streaming events.
+///
+/// Tracks tool_use blocks by index so we can emit partial ToolCall chunks with correct id/name.
+#[derive(Default)]
+pub struct AnthropicStreamState {
+    tool_uses_by_index: HashMap<usize, (String, String)>, // (id, name)
+    thinking_blocks_by_index: HashSet<usize>,
+    thinking_blocks_started: usize,
+    /// `redacted_thinking` blocks started (also counted in
+    /// `thinking_blocks_started`). Their content is encrypted and cannot be
+    /// replayed from `Message.reasoning`, so their presence invalidates the
+    /// captured signature (#520).
+    redacted_thinking_blocks_started: usize,
+    /// Accumulated `signature_delta` payload for the turn's thinking block.
+    thinking_signature: String,
+    /// Set once a [`LLMChunk::ReasoningSignature`] has been emitted, so a later
+    /// extra thinking/redacted block can retract it with an empty-string
+    /// invalidation marker.
+    thinking_signature_emitted: bool,
+    thinking_chars_streamed: usize,
+    saw_thinking_signal: bool,
+    requested_reasoning_effort: Option<ReasoningEffort>,
+    request_thinking_enabled: bool,
+    request_thinking_budget_tokens: Option<u64>,
+    native_blocks_by_index: HashMap<usize, Value>,
+    native_input_json_by_index: HashMap<usize, String>,
+    /// Thinking blocks that have received a signature delta. This ordering
+    /// guard intentionally outlives native transcript invalidation so the
+    /// normalized reasoning lane still rejects deltas after a signature.
+    thinking_signature_indices: HashSet<usize>,
+    invalid_thinking_signature_indices: HashSet<usize>,
+    native_open_indices: HashSet<usize>,
+    native_capture_bytes: usize,
+    native_capture_invalid: bool,
+}
+
+impl AnthropicStreamState {
+    /// A captured signature is replayable only when the turn produced exactly
+    /// ONE `thinking` block and no `redacted_thinking`: `Message.reasoning`
+    /// concatenates every block's text, and a signature covers only its own
+    /// block's exact bytes — replaying a merged text under any single
+    /// signature would fail Anthropic's verification (#520).
+    fn thinking_signature_replayable(&self) -> bool {
+        self.thinking_blocks_started == 1 && self.redacted_thinking_blocks_started == 0
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AnthropicNativeCaptureLimit {
+    BlockCount,
+    TextBytes,
+    ThinkingBytes,
+    InputJsonBytes,
+    TotalBytes,
+}
+
+impl AnthropicNativeCaptureLimit {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockCount => "block_count",
+            Self::TextBytes => "text_bytes",
+            Self::ThinkingBytes => "thinking_bytes",
+            Self::InputJsonBytes => "input_json_bytes",
+            Self::TotalBytes => "total_bytes",
+        }
+    }
+}
+
+fn invalidate_anthropic_native_capture_for_limit(
+    state: &mut AnthropicStreamState,
+    limit: AnthropicNativeCaptureLimit,
+    observed_count: usize,
+    observed_bytes: usize,
+) {
+    // This structured event doubles as the operational metric source. Keep it
+    // strictly cardinality-safe and payload-free: no fragments, paths, tool
+    // arguments, schemas, thinking, or provider output belong here.
+    tracing::warn!(
+        metric = "anthropic_native_capture_limit_exceeded",
+        limit_kind = limit.as_str(),
+        observed_count,
+        observed_bytes,
+        "Anthropic native transcript capture exceeded its resource budget"
+    );
+    state.native_capture_invalid = true;
+    state.native_blocks_by_index.clear();
+    state.native_input_json_by_index.clear();
+    state.native_open_indices.clear();
+    state.native_capture_bytes = 0;
+}
+
+fn reserve_anthropic_native_capture_bytes(
+    state: &mut AnthropicStreamState,
+    additional_bytes: usize,
+    observed_count: usize,
+) -> bool {
+    let Some(observed_bytes) = state.native_capture_bytes.checked_add(additional_bytes) else {
+        invalidate_anthropic_native_capture_for_limit(
+            state,
+            AnthropicNativeCaptureLimit::TotalBytes,
+            observed_count,
+            usize::MAX,
+        );
+        return false;
+    };
+    if observed_bytes > ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES {
+        invalidate_anthropic_native_capture_for_limit(
+            state,
+            AnthropicNativeCaptureLimit::TotalBytes,
+            observed_count,
+            observed_bytes,
+        );
+        return false;
+    }
+    state.native_capture_bytes = observed_bytes;
+    true
+}
+
+fn append_anthropic_native_string_field(block: &mut Value, field: &str, fragment: &str) -> bool {
+    let Some(object) = block.as_object_mut() else {
+        return false;
+    };
+    let value = object
+        .entry(field.to_string())
+        .or_insert_with(|| Value::String(String::new()));
+    let Value::String(current) = value else {
+        return false;
+    };
+    current.push_str(fragment);
+    true
+}
+
+fn capture_anthropic_native_event(state: &mut AnthropicStreamState, event_type: &str, data: &str) {
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        if matches!(
+            event_type,
+            "content_block_start" | "content_block_delta" | "content_block_stop"
+        ) {
+            state.native_capture_invalid = true;
+        }
+        return;
+    };
+    let index = value
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok());
+
+    // Signature ordering protects normalized reasoning replay as well as the
+    // optional native transcript. Keep tracking this small control-plane state
+    // even after the native lane has exceeded a resource limit.
+    if event_type == "content_block_delta" {
+        if let Some(index) = index {
+            if state.thinking_signature_indices.contains(&index) {
+                state.native_capture_invalid = true;
+                state.invalid_thinking_signature_indices.insert(index);
+                state.thinking_signature.clear();
+                return;
+            }
+            if value
+                .get("delta")
+                .and_then(|delta| delta.get("type"))
+                .and_then(Value::as_str)
+                == Some("signature_delta")
+                && state.thinking_blocks_by_index.contains(&index)
+            {
+                state.thinking_signature_indices.insert(index);
+            }
+        }
+    } else if event_type == "content_block_stop" {
+        if let Some(index) = index {
+            state.thinking_signature_indices.remove(&index);
+        }
+    }
+
+    if state.native_capture_invalid {
+        return;
+    }
+    match event_type {
+        "content_block_start" => {
+            let Some((index, block)) = index.zip(value.get("content_block")) else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            if !state.native_open_indices.insert(index) {
+                state.native_capture_invalid = true;
+            }
+            let supported = matches!(
+                block.get("type").and_then(Value::as_str),
+                Some(
+                    "text"
+                        | "thinking"
+                        | "redacted_thinking"
+                        | "server_tool_use"
+                        | "tool_search_tool_result"
+                        | "tool_use"
+                )
+            );
+            if !supported {
+                state.native_capture_invalid = true;
+                return;
+            }
+            let observed_count = state.native_blocks_by_index.len().saturating_add(1);
+            if observed_count > ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS {
+                invalidate_anthropic_native_capture_for_limit(
+                    state,
+                    AnthropicNativeCaptureLimit::BlockCount,
+                    observed_count,
+                    state.native_capture_bytes,
+                );
+                return;
+            }
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let initial_field_bytes = match block_type {
+                "text" => block.get("text").and_then(Value::as_str).map(str::len),
+                "thinking" => block.get("thinking").and_then(Value::as_str).map(str::len),
+                _ => None,
+            };
+            let field_limit = match block_type {
+                "text" => Some((
+                    AnthropicNativeCaptureLimit::TextBytes,
+                    ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK,
+                )),
+                "thinking" => Some((
+                    AnthropicNativeCaptureLimit::ThinkingBytes,
+                    ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK,
+                )),
+                _ => None,
+            };
+            if let (Some(observed_bytes), Some((limit, max_bytes))) =
+                (initial_field_bytes, field_limit)
+            {
+                if observed_bytes > max_bytes {
+                    invalidate_anthropic_native_capture_for_limit(
+                        state,
+                        limit,
+                        observed_count,
+                        observed_bytes,
+                    );
+                    return;
+                }
+            }
+            let block_bytes = serde_json::to_vec(block)
+                .map(|encoded| encoded.len())
+                .unwrap_or(usize::MAX);
+            if !reserve_anthropic_native_capture_bytes(state, block_bytes, observed_count) {
+                return;
+            }
+            if state
+                .native_blocks_by_index
+                .insert(index, block.clone())
+                .is_some()
+            {
+                state.native_capture_invalid = true;
+            }
+        }
+        "content_block_delta" => {
+            let Some((index, delta)) = index.zip(value.get("delta")) else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            if !state.native_open_indices.contains(&index) {
+                state.native_capture_invalid = true;
+                return;
+            }
+            let Some(block_type) = state
+                .native_blocks_by_index
+                .get(&index)
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") if block_type == "text" => {
+                    let Some(fragment) = delta.get("text").and_then(Value::as_str) else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    let current_bytes = state
+                        .native_blocks_by_index
+                        .get(&index)
+                        .and_then(|block| block.get("text"))
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    let observed_bytes = current_bytes.saturating_add(fragment.len());
+                    if observed_bytes > ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK {
+                        invalidate_anthropic_native_capture_for_limit(
+                            state,
+                            AnthropicNativeCaptureLimit::TextBytes,
+                            state.native_blocks_by_index.len(),
+                            observed_bytes,
+                        );
+                        return;
+                    }
+                    if !reserve_anthropic_native_capture_bytes(
+                        state,
+                        fragment.len(),
+                        state.native_blocks_by_index.len(),
+                    ) {
+                        return;
+                    }
+                    if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                        if !append_anthropic_native_string_field(block, "text", fragment) {
+                            state.native_capture_invalid = true;
+                        }
+                    }
+                }
+                Some("thinking_delta") if block_type == "thinking" => {
+                    let Some(fragment) = delta
+                        .get("thinking")
+                        .or_else(|| delta.get("text"))
+                        .and_then(Value::as_str)
+                    else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    let current_bytes = state
+                        .native_blocks_by_index
+                        .get(&index)
+                        .and_then(|block| block.get("thinking"))
+                        .and_then(Value::as_str)
+                        .map(str::len)
+                        .unwrap_or(0);
+                    let observed_bytes = current_bytes.saturating_add(fragment.len());
+                    if observed_bytes > ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK {
+                        invalidate_anthropic_native_capture_for_limit(
+                            state,
+                            AnthropicNativeCaptureLimit::ThinkingBytes,
+                            state.native_blocks_by_index.len(),
+                            observed_bytes,
+                        );
+                        return;
+                    }
+                    if !reserve_anthropic_native_capture_bytes(
+                        state,
+                        fragment.len(),
+                        state.native_blocks_by_index.len(),
+                    ) {
+                        return;
+                    }
+                    if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                        if !append_anthropic_native_string_field(block, "thinking", fragment) {
+                            state.native_capture_invalid = true;
+                        }
+                    }
+                }
+                Some("signature_delta") if block_type == "thinking" => {
+                    let Some(fragment) = delta.get("signature").and_then(Value::as_str) else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    if !reserve_anthropic_native_capture_bytes(
+                        state,
+                        fragment.len(),
+                        state.native_blocks_by_index.len(),
+                    ) {
+                        return;
+                    }
+                    if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                        if !append_anthropic_native_string_field(block, "signature", fragment) {
+                            state.native_capture_invalid = true;
+                        }
+                    }
+                }
+                Some("input_json_delta")
+                    if matches!(block_type.as_str(), "server_tool_use" | "tool_use") =>
+                {
+                    let Some(fragment) = delta.get("partial_json").and_then(Value::as_str) else {
+                        state.native_capture_invalid = true;
+                        return;
+                    };
+                    let current_bytes = state
+                        .native_input_json_by_index
+                        .get(&index)
+                        .map(String::len)
+                        .unwrap_or(0);
+                    let observed_bytes = current_bytes.saturating_add(fragment.len());
+                    if observed_bytes > ANTHROPIC_NATIVE_CAPTURE_MAX_INPUT_JSON_BYTES_PER_BLOCK {
+                        invalidate_anthropic_native_capture_for_limit(
+                            state,
+                            AnthropicNativeCaptureLimit::InputJsonBytes,
+                            state.native_blocks_by_index.len(),
+                            observed_bytes,
+                        );
+                        return;
+                    }
+                    if !reserve_anthropic_native_capture_bytes(
+                        state,
+                        fragment.len(),
+                        state.native_blocks_by_index.len(),
+                    ) {
+                        return;
+                    }
+                    state
+                        .native_input_json_by_index
+                        .entry(index)
+                        .or_default()
+                        .push_str(fragment);
+                }
+                _ => state.native_capture_invalid = true,
+            }
+        }
+        "content_block_stop" => {
+            let Some(index) = index else {
+                state.native_capture_invalid = true;
+                return;
+            };
+            if !state.native_open_indices.remove(&index) {
+                state.native_capture_invalid = true;
+            }
+            if let Some(input) = state.native_input_json_by_index.remove(&index) {
+                match serde_json::from_str::<Value>(&input) {
+                    Ok(input) if input.is_object() => {
+                        if let Some(block) = state.native_blocks_by_index.get_mut(&index) {
+                            block["input"] = input;
+                        } else {
+                            state.native_capture_invalid = true;
+                        }
+                    }
+                    _ => state.native_capture_invalid = true,
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn take_anthropic_provider_transcript_items(state: &mut AnthropicStreamState) -> Vec<LLMChunk> {
+    let mut blocks = std::mem::take(&mut state.native_blocks_by_index)
+        .into_iter()
+        .collect::<Vec<_>>();
+    blocks.sort_by_key(|(index, _)| *index);
+    let invalid = std::mem::take(&mut state.native_capture_invalid)
+        || !state.native_open_indices.is_empty()
+        || !state.native_input_json_by_index.is_empty();
+    state.native_open_indices.clear();
+    state.native_input_json_by_index.clear();
+    state.thinking_signature_indices.clear();
+    state.invalid_thinking_signature_indices.clear();
+    state.native_capture_bytes = 0;
+    if invalid
+        || !blocks.iter().any(|(_, block)| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("server_tool_use" | "tool_search_tool_result")
+            )
+        })
+    {
+        return Vec::new();
+    }
+    let mut items = Vec::with_capacity(blocks.len());
+    for (_, payload) in blocks {
+        let author = match payload.get("type").and_then(Value::as_str) {
+            Some("tool_search_tool_result") => ProviderTranscriptAuthor::ToolResult,
+            _ => ProviderTranscriptAuthor::Model,
+        };
+        let Ok(item) = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::Anthropic,
+            ProviderProtocol::AnthropicMessages2023_06_01,
+            ProviderTranscriptOrigin::Provider,
+            author,
+            payload,
+        ) else {
+            tracing::warn!("Anthropic discovery transcript failed closed during validation");
+            return Vec::new();
+        };
+        items.push(item);
+    }
+    if ProviderTranscriptGroup::validate_items(&items).is_err() {
+        tracing::warn!("Anthropic discovery transcript failed closed during group validation");
+        return Vec::new();
+    }
+    items
+        .into_iter()
+        .map(LLMChunk::ProviderTranscriptItem)
+        .collect()
+}
+
+fn parse_anthropic_sse_event_multi(
+    state: &mut AnthropicStreamState,
+    event_type: &str,
+    data: &str,
+) -> Result<Vec<LLMChunk>> {
+    capture_anthropic_native_event(state, event_type, data);
+    let normalized = parse_anthropic_sse_event(state, event_type, data)?;
+    let mut chunks = if event_type == "message_stop" {
+        take_anthropic_provider_transcript_items(state)
+    } else {
+        Vec::new()
+    };
+    chunks.extend(normalized);
+    Ok(chunks)
+}
+
+/// Parse a single Anthropic SSE event into an optional [`LLMChunk`].
+///
+/// Returns:
+/// - `Ok(Some(chunk))` for content-bearing events (text deltas, tool calls, message_stop)
+/// - `Ok(None)` for non-content events (message_start, pings, etc.)
+/// - `Err(_)` for malformed JSON or unexpected shapes
+pub fn parse_anthropic_sse_event(
+    state: &mut AnthropicStreamState,
+    event_type: &str,
+    data: &str,
+) -> Result<Option<LLMChunk>> {
+    match event_type {
+        "ping" => Ok(None),
+        "message_start" => {
+            if !data.is_empty() {
+                if let Ok(v) = serde_json::from_str::<Value>(data) {
+                    if let Some(usage) = v
+                        .get("message")
+                        .and_then(|m| m.get("usage"))
+                        .or_else(|| v.get("usage"))
+                        .and_then(|u| u.as_object())
+                    {
+                        let cache_creation = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        let cache_read = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        // Non-cached fresh input — reported once, here in
+                        // message_start. Disjoint from the two cache counts.
+                        let input_tokens = usage
+                            .get("input_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if cache_creation > 0 || cache_read > 0 || input_tokens > 0 {
+                            tracing::info!(
+                                "Anthropic stream message_start input={} cache_creation={} cache_read={}",
+                                input_tokens,
+                                cache_creation,
+                                cache_read,
+                            );
+                            return Ok(Some(LLMChunk::CacheUsage {
+                                cache_creation_input_tokens: cache_creation,
+                                cache_read_input_tokens: cache_read,
+                                input_tokens,
+                            }));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        }
+        "message_delta" => {
+            if !data.is_empty() {
+                match serde_json::from_str::<Value>(data) {
+                    Ok(v) => {
+                        if let Some(stop_reason) = v
+                            .get("delta")
+                            .and_then(|delta| delta.get("stop_reason"))
+                            .and_then(|reason| reason.as_str())
+                        {
+                            if stop_reason == "max_tokens" {
+                                tracing::warn!(
+                                    "Anthropic stream stop_reason=max_tokens; response may be truncated"
+                                );
+                            } else {
+                                tracing::debug!("Anthropic stream stop_reason={stop_reason}");
+                            }
+                        }
+
+                        if let Some(usage) = v.get("usage").and_then(|u| u.as_object()) {
+                            let output_tokens =
+                                usage.get("output_tokens").and_then(|value| value.as_u64());
+                            let thinking_tokens = usage
+                                .get("thinking_tokens")
+                                .and_then(|value| value.as_u64())
+                                .or_else(|| {
+                                    usage
+                                        .get("reasoning_tokens")
+                                        .and_then(|value| value.as_u64())
+                                });
+                            let cache_creation = usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0);
+                            let cache_read = usage
+                                .get("cache_read_input_tokens")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0);
+                            let input_tokens = usage
+                                .get("input_tokens")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0);
+
+                            if let Some(thinking_tokens) = thinking_tokens {
+                                state.saw_thinking_signal = true;
+                                tracing::info!(
+                                    "Anthropic stream usage output_tokens={} thinking_tokens={}",
+                                    output_tokens.unwrap_or(0),
+                                    thinking_tokens
+                                );
+                            } else if let Some(output_tokens) = output_tokens {
+                                tracing::debug!(
+                                    "Anthropic stream usage output_tokens={output_tokens}"
+                                );
+                            }
+
+                            // Emit CacheUsage if any cache activity. input_tokens
+                            // is normally only present in message_start; pass it
+                            // through if a delta echoes it (the handler de-dups).
+                            if cache_creation > 0 || cache_read > 0 {
+                                return Ok(Some(LLMChunk::CacheUsage {
+                                    cache_creation_input_tokens: cache_creation,
+                                    cache_read_input_tokens: cache_read,
+                                    input_tokens,
+                                }));
+                            }
+
+                            // Emit UsageSummary with output/thinking tokens.
+                            if let Some(output_tokens) = output_tokens {
+                                return Ok(Some(LLMChunk::UsageSummary {
+                                    output_tokens,
+                                    thinking_tokens: thinking_tokens.unwrap_or(0),
+                                }));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "Failed to parse Anthropic message_delta payload for logging: {} (payload_len={})",
+                            error,
+                            data.len()
+                        );
+                    }
+                }
+            }
+            Ok(None)
+        }
+        "message_stop" => {
+            if state.request_thinking_enabled || state.saw_thinking_signal {
+                tracing::info!(
+                    "Anthropic reasoning summary: requested_effort={} request_thinking_enabled={} request_thinking_budget_tokens={} observed_thinking_signal={} thinking_blocks_started={} thinking_chars_streamed={}",
+                    state
+                        .requested_reasoning_effort
+                        .map(ReasoningEffort::as_str)
+                        .unwrap_or("none"),
+                    state.request_thinking_enabled,
+                    state
+                        .request_thinking_budget_tokens
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    state.saw_thinking_signal,
+                    state.thinking_blocks_started,
+                    state.thinking_chars_streamed
+                );
+            }
+
+            if !state.tool_uses_by_index.is_empty() {
+                let open_blocks: Vec<String> = state
+                    .tool_uses_by_index
+                    .iter()
+                    .map(|(index, (id, name))| format!("{index}:{name}:{id}"))
+                    .collect();
+                tracing::warn!(
+                    "Anthropic message_stop received with {} open tool_use blocks (possible incomplete tool arguments): {}",
+                    open_blocks.len(),
+                    open_blocks.join(", ")
+                );
+                state.tool_uses_by_index.clear();
+            }
+
+            state.thinking_blocks_by_index.clear();
+            Ok(Some(LLMChunk::Done))
+        }
+        "error" => Err(LLMError::Api(format!("Anthropic error event: {data}"))),
+        "content_block_start" => {
+            if data.is_empty() {
+                return Ok(None);
+            }
+
+            let v: Value = serde_json::from_str(data)?;
+            // Tolerate benign shape deviations (common with Anthropic→OpenAI
+            // aggregators): skip the malformed event instead of returning a
+            // stream error, which would discard the whole already-streamed
+            // assistant turn. (#237)
+            let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
+                tracing::warn!(
+                    "Anthropic content_block_start missing index; skipping payload_len={}",
+                    data.len()
+                );
+                return Ok(None);
+            };
+            let Some(content_block) = v.get("content_block") else {
+                tracing::warn!(
+                    "Anthropic content_block_start missing content_block; skipping index={} payload_len={}",
+                    index,
+                    data.len()
+                );
+                return Ok(None);
+            };
+
+            let block_type = content_block
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
+
+            if block_type == "thinking" || block_type == "redacted_thinking" {
+                let index = index as usize;
+                state.saw_thinking_signal = true;
+                state.thinking_blocks_started = state.thinking_blocks_started.saturating_add(1);
+                if block_type == "redacted_thinking" {
+                    state.redacted_thinking_blocks_started =
+                        state.redacted_thinking_blocks_started.saturating_add(1);
+                }
+                state.thinking_blocks_by_index.insert(index);
+                tracing::info!(
+                    "Anthropic thinking block started: index={} type={}",
+                    index,
+                    block_type
+                );
+                // A second thinking block (or any redacted one) means no single
+                // signature can cover the accumulated reasoning text; if one was
+                // already emitted for an earlier block, retract it with the
+                // empty-string invalidation marker (#520).
+                if state.thinking_signature_emitted && !state.thinking_signature_replayable() {
+                    state.thinking_signature_emitted = false;
+                    state.thinking_signature.clear();
+                    return Ok(Some(LLMChunk::ReasoningSignature(String::new())));
+                }
+                return Ok(None);
+            }
+
+            if block_type != "tool_use" {
+                return Ok(None);
+            }
+
+            let Some(id) = content_block.get("id").and_then(|s| s.as_str()) else {
+                tracing::warn!(
+                    "Anthropic tool_use content_block missing id; skipping index={} payload_len={}",
+                    index,
+                    data.len()
+                );
+                return Ok(None);
+            };
+            let Some(name) = content_block.get("name").and_then(|s| s.as_str()) else {
+                tracing::warn!(
+                    "Anthropic tool_use content_block missing name; skipping index={} payload_len={}",
+                    index,
+                    data.len()
+                );
+                return Ok(None);
+            };
+
+            let index = index as usize;
+            state
+                .tool_uses_by_index
+                .insert(index, (id.to_string(), name.to_string()));
+            tracing::debug!(
+                "Anthropic tool_use started: index={}, tool_call_id={}, tool_name={}",
+                index,
+                id,
+                name
+            );
+
+            Ok(Some(LLMChunk::ToolCalls(vec![bamboo_domain::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: bamboo_domain::FunctionCall {
+                    name: name.to_string(),
+                    arguments: String::new(),
+                },
+            }])))
+        }
+        "content_block_delta" => {
+            if data.is_empty() {
+                return Ok(None);
+            }
+
+            let v: Value = serde_json::from_str(data)?;
+            let Some(delta) = v.get("delta") else {
+                return Ok(None);
+            };
+
+            let delta_type = delta
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
+
+            match delta_type {
+                "text_delta" => {
+                    let text = delta
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default();
+                    Ok(Some(LLMChunk::Token(text.to_string())))
+                }
+                "input_json_delta" => {
+                    // Skip (don't abort the turn) on benign deviations — e.g. an
+                    // aggregator streaming an input_json_delta for an index it
+                    // never announced via content_block_start. (#237)
+                    let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
+                        tracing::warn!(
+                            "Anthropic input_json_delta missing index; skipping payload_len={} partial_len={}",
+                            data.len(),
+                            delta
+                                .get("partial_json")
+                                .and_then(|value| value.as_str())
+                                .map(str::len)
+                                .unwrap_or(0)
+                        );
+                        return Ok(None);
+                    };
+                    let partial = delta
+                        .get("partial_json")
+                        .and_then(|p| p.as_str())
+                        .unwrap_or_default();
+
+                    let index = index as usize;
+                    if state
+                        .native_blocks_by_index
+                        .get(&index)
+                        .and_then(|block| block.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("server_tool_use")
+                    {
+                        // Tool-search server calls are persisted through the
+                        // native lane, not normalized into an executable host
+                        // ToolCall. Their partial arguments may contain paths or
+                        // search terms, so do not route them through the legacy
+                        // "unannounced tool_use" warning that prints raw data.
+                        return Ok(None);
+                    }
+                    let Some((id, name)) = state.tool_uses_by_index.get(&index) else {
+                        tracing::warn!(
+                            "Anthropic input_json_delta for unannounced tool_use index {index}; skipping payload_len={} partial_len={}",
+                            data.len(),
+                            partial.len()
+                        );
+                        return Ok(None);
+                    };
+                    tracing::trace!(
+                        "Anthropic tool_use input_json_delta: index={}, tool_call_id={}, tool_name={}, chunk_len={}",
+                        index,
+                        id,
+                        name,
+                        partial.len()
+                    );
+
+                    Ok(Some(LLMChunk::ToolCalls(vec![bamboo_domain::ToolCall {
+                        id: id.clone(),
+                        tool_type: "function".to_string(),
+                        function: bamboo_domain::FunctionCall {
+                            name: name.clone(),
+                            arguments: partial.to_string(),
+                        },
+                    }])))
+                }
+                "thinking_delta" => {
+                    let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
+                        return Ok(None);
+                    };
+                    let index = index as usize;
+
+                    if state.thinking_blocks_by_index.contains(&index) {
+                        state.saw_thinking_signal = true;
+                        let delta_len = delta
+                            .get("thinking")
+                            .and_then(|value| value.as_str())
+                            .map(str::len)
+                            .or_else(|| {
+                                delta
+                                    .get("text")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::len)
+                            })
+                            .unwrap_or(0);
+                        state.thinking_chars_streamed =
+                            state.thinking_chars_streamed.saturating_add(delta_len);
+                        tracing::trace!(
+                            "Anthropic thinking_delta: index={}, chunk_len={}",
+                            index,
+                            delta_len
+                        );
+
+                        let reasoning_chunk = delta
+                            .get("thinking")
+                            .and_then(|value| value.as_str())
+                            .or_else(|| delta.get("text").and_then(|value| value.as_str()))
+                            .unwrap_or("");
+                        if !reasoning_chunk.is_empty() {
+                            return Ok(Some(LLMChunk::ReasoningToken(reasoning_chunk.to_string())));
+                        }
+                    }
+                    Ok(None)
+                }
+                "signature_delta" => {
+                    // Provider-minted signature over the thinking block's exact
+                    // text — required to replay the block to real Anthropic
+                    // (#520). Accumulate defensively (the real API delivers it
+                    // in one delta); emitted at this block's content_block_stop.
+                    let Some(index) = v.get("index").and_then(|i| i.as_u64()) else {
+                        return Ok(None);
+                    };
+                    let index = index as usize;
+                    if state.invalid_thinking_signature_indices.contains(&index) {
+                        state.thinking_signature.clear();
+                        return Ok(None);
+                    }
+                    if state.thinking_blocks_by_index.contains(&index) {
+                        if let Some(signature) = delta.get("signature").and_then(|s| s.as_str()) {
+                            state.thinking_signature.push_str(signature);
+                        }
+                    }
+                    Ok(None)
+                }
+                _ => Ok(None),
+            }
+        }
+        "content_block_stop" => {
+            // Keep memory bounded: once a content block is complete, we don't need its id/name.
+            if data.is_empty() {
+                return Ok(None);
+            }
+
+            let v: Value = serde_json::from_str(data)?;
+            if let Some(index) = v.get("index").and_then(|i| i.as_u64()) {
+                let index = index as usize;
+                state.tool_uses_by_index.remove(&index);
+                let was_thinking_block = state.thinking_blocks_by_index.remove(&index);
+                if state.invalid_thinking_signature_indices.remove(&index) {
+                    let signature_was_emitted = state.thinking_signature_emitted;
+                    state.thinking_signature_emitted = false;
+                    state.thinking_signature.clear();
+                    return Ok(
+                        signature_was_emitted.then(|| LLMChunk::ReasoningSignature(String::new()))
+                    );
+                }
+                // The turn's single thinking block just closed with a captured
+                // signature → surface it so the engine can persist it alongside
+                // the accumulated reasoning text (#520). Multi-block/redacted
+                // turns never emit (and retract on the extra block's start).
+                if was_thinking_block
+                    && !state.thinking_signature_emitted
+                    && !state.thinking_signature.is_empty()
+                    && state.thinking_signature_replayable()
+                {
+                    state.thinking_signature_emitted = true;
+                    return Ok(Some(LLMChunk::ReasoningSignature(
+                        state.thinking_signature.clone(),
+                    )));
+                }
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod anthropic_request_building {
+    use crate::models::{ContentPart, ImageUrl};
+    use crate::prompt_ir::{PromptIR, Segment, SegmentRole};
+    use crate::provider::{LLMProvider, ProviderVisibleToolSegmentKind};
+    use bamboo_domain::Message;
+    use bamboo_domain::{FunctionCall, ToolCall};
+    use bamboo_domain::{FunctionSchema, ToolSchema};
+    use serde_json::{json, Value};
+
+    const TEST_PROVIDER_BOUNDARY: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn tool_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: name.to_string(),
+                description: format!("{name} description"),
+                parameters: json!({"type":"object"}),
+            },
+        }
+    }
+
+    fn native_item(
+        author: super::ProviderTranscriptAuthor,
+        payload: Value,
+    ) -> super::ProviderTranscriptItem {
+        super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::Provider,
+            author,
+            payload,
+        )
+        .unwrap()
+    }
+
+    fn discovery_items() -> Vec<super::ProviderTranscriptItem> {
+        vec![
+            native_item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_1",
+                    "name":"tool_search_tool_regex","input":{"pattern":"weather"}
+                }),
+            ),
+            native_item(
+                super::ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_1",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_weather"}
+                    ]}
+                }),
+            ),
+            native_item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_use","id":"tool_1","name":"get_weather","input":{}
+                }),
+            ),
+        ]
+    }
+
+    fn host_reference_item(
+        tool_use_id: &str,
+        references: &[&str],
+    ) -> super::ProviderTranscriptItem {
+        super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::HostToolSearch,
+            super::ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_result",
+                "tool_use_id":tool_use_id,
+                "is_error":false,
+                "content":references.iter().map(|name| {
+                    json!({"type":"tool_reference","tool_name":name})
+                }).collect::<Vec<_>>()
+            }),
+        )
+        .unwrap()
+    }
+
+    fn anthropic_ir_with_reference_groups(groups: &[(&str, &[&str])]) -> PromptIR {
+        let mut session = bamboo_domain::Session::new("footprint-references", "claude");
+        activate_native_route(&mut session);
+        for (tool_use_id, references) in groups {
+            let result = Message::tool_result(*tool_use_id, "normalized reference result");
+            let anchor = result.id.clone();
+            session.add_message(result);
+            session
+                .append_provider_transcript_group(
+                    &anchor,
+                    None,
+                    vec![host_reference_item(tool_use_id, references)],
+                )
+                .unwrap();
+        }
+        PromptIR {
+            segments: vec![Segment::new(
+                SegmentRole::Conversation,
+                session.messages.clone(),
+            )],
+            provider_transcript_groups: session.provider_transcript.groups().to_vec(),
+            ..PromptIR::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn progressive_footprint_keeps_initial_array_and_each_reference_occurrence_ordered() {
+        let tools = vec![
+            tool_schema("Read"),
+            tool_schema("alpha_tool"),
+            tool_schema("beta_tool"),
+            tool_schema("Workspace"),
+        ];
+        let ir = anthropic_ir_with_reference_groups(&[
+            ("search_1", &["beta_tool", "Read", "alpha_tool"]),
+            ("search_2", &["beta_tool"]),
+        ]);
+        let footprint = super::AnthropicProvider::new("k")
+            .provider_visible_tool_footprint(&ir, &tools, "claude-sonnet-4-6", None)
+            .await
+            .unwrap();
+
+        assert_eq!(footprint.segments.len(), 6);
+        assert_eq!(
+            footprint.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        let initial: Value = serde_json::from_str(&footprint.segments[0].serialized).unwrap();
+        assert_eq!(initial.as_array().unwrap().len(), 2, "Read + search");
+        assert_eq!(initial[0]["name"], "Read");
+        assert_eq!(initial[1]["type"], super::ANTHROPIC_TOOL_SEARCH_TYPE);
+        assert!(initial.as_array().unwrap().iter().all(|tool| {
+            tool["name"] != "alpha_tool"
+                && tool["name"] != "beta_tool"
+                && tool["name"] != "Workspace"
+        }));
+        assert_eq!(
+            footprint.segments[1].kind,
+            ProviderVisibleToolSegmentKind::ProviderLateBound
+        );
+        assert!(footprint.segments[1].serialized.is_empty());
+
+        let expanded = footprint.segments[2..]
+            .iter()
+            .map(|segment| {
+                assert_eq!(
+                    segment.kind,
+                    ProviderVisibleToolSegmentKind::AnthropicToolReferenceExpansion
+                );
+                serde_json::from_str::<Value>(&segment.serialized).unwrap()["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expanded,
+            vec!["beta_tool", "Read", "alpha_tool", "beta_tool"]
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_footprint_rejects_a_reference_missing_from_the_frozen_catalog() {
+        let ir = anthropic_ir_with_reference_groups(&[("search_missing", &["missing_tool"])]);
+        let error = super::AnthropicProvider::new("k")
+            .provider_visible_tool_footprint(&ir, &[tool_schema("Read")], "claude-sonnet-4-6", None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("missing_tool"));
+        assert!(error.to_string().contains("eligible catalog"));
+    }
+
+    #[tokio::test]
+    async fn unreferenced_deferred_tools_do_not_change_the_initial_footprint() {
+        let provider = super::AnthropicProvider::new("k");
+        let baseline_tools = vec![tool_schema("Read")];
+        let baseline = provider
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &baseline_tools,
+                "claude-sonnet-4-6",
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut expanded_tools = baseline_tools.clone();
+        expanded_tools.extend((0..100).map(|index| {
+            let mut tool = tool_schema(&format!("deferred_tool_{index}"));
+            tool.function.parameters = json!({
+                "type": "object",
+                "description": "hidden".repeat(1_000),
+            });
+            tool
+        }));
+        let expanded = provider
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &expanded_tools,
+                "claude-sonnet-4-6",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(expanded.segments, baseline.segments);
+        let baseline_transport = super::tools_to_anthropic_json(
+            &baseline_tools,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        let expanded_transport = super::tools_to_anthropic_json(
+            &expanded_tools,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(expanded_transport.len(), baseline_transport.len() + 100);
+        assert_eq!(
+            expanded_transport
+                .iter()
+                .filter(|tool| tool["defer_loading"] == true)
+                .count(),
+            100
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_footprint_matches_the_complete_anthropic_tools_lowering() {
+        let tools = vec![tool_schema("Read"), tool_schema("Glob")];
+        let footprint = super::AnthropicProvider::new("k")
+            .provider_visible_tool_footprint(
+                &PromptIR::default(),
+                &tools,
+                "claude-sonnet-4-6",
+                Some("Read"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(footprint.segments.len(), 1);
+        assert_eq!(
+            footprint.segments[0].kind,
+            ProviderVisibleToolSegmentKind::InitialFullDefinition
+        );
+        assert_eq!(
+            footprint.segments[0].serialized,
+            serde_json::to_string(&super::tools_to_anthropic_json(
+                &tools,
+                super::CapabilityLoadingMode::LegacyFullCatalog,
+            ))
+            .unwrap()
+        );
+    }
+
+    fn activate_native_route(session: &mut bamboo_domain::Session) {
+        session
+            .activate_provider_transcript_route(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .unwrap();
+    }
+
+    fn replayable_native_groups(
+        session: &bamboo_domain::Session,
+    ) -> Vec<super::ProviderTranscriptGroup> {
+        session
+            .provider_transcript
+            .replayable_groups(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    fn parse_native_events(events: &[(&str, Value)]) -> Vec<super::LLMChunk> {
+        let mut state = super::AnthropicStreamState::default();
+        events
+            .iter()
+            .flat_map(|(event, payload)| {
+                super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn valid_discovery_events_from(first_index: usize) -> Vec<(&'static str, Value)> {
+        vec![
+            (
+                "content_block_start",
+                json!({"index":first_index,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":first_index,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"weather\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":first_index})),
+            (
+                "content_block_start",
+                json!({"index":first_index + 1,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":first_index + 1})),
+            (
+                "content_block_start",
+                json!({"index":first_index + 2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            ("content_block_stop", json!({"index":first_index + 2})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ]
+    }
+
+    fn valid_discovery_events() -> Vec<(&'static str, Value)> {
+        valid_discovery_events_from(0)
+    }
+
+    fn json_object_with_exact_bytes(target_bytes: usize) -> String {
+        const PREFIX: &str = "{\"value\":\"";
+        const SUFFIX: &str = "\"}";
+        assert!(target_bytes >= PREFIX.len() + SUFFIX.len());
+        let value = format!(
+            "{PREFIX}{}{SUFFIX}",
+            "x".repeat(target_bytes - PREFIX.len() - SUFFIX.len())
+        );
+        assert_eq!(value.len(), target_bytes);
+        value
+    }
+
+    fn redacted_thinking_block_with_exact_bytes(target_bytes: usize) -> Value {
+        let empty = json!({"type":"redacted_thinking","data":""});
+        let overhead = serde_json::to_vec(&empty).unwrap().len();
+        assert!(target_bytes >= overhead);
+        let block = json!({
+            "type":"redacted_thinking",
+            "data":"x".repeat(target_bytes - overhead),
+        });
+        assert_eq!(serde_json::to_vec(&block).unwrap().len(), target_bytes);
+        block
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCapture {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    static EVENT_CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl tracing::Subscriber for EventCapture {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut self.0, "{}={value:?};", field.name());
+                }
+            }
+
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(visitor.0);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn discovery_blocks_are_reassembled_and_replayed_at_their_message_anchor() {
+        let mut state = super::AnthropicStreamState::default();
+        let events = [
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"weather\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":2,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+        let mut items = Vec::new();
+        for (event, payload) in events {
+            items.extend(
+                super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                    .unwrap()
+                    .into_iter()
+                    .filter_map(|chunk| match chunk {
+                        super::LLMChunk::ProviderTranscriptItem(item) => Some(item),
+                        _ => None,
+                    }),
+            );
+        }
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].payload()["input"]["pattern"], "weather");
+        assert_eq!(items[2].payload()["input"]["city"], "Paris");
+
+        let expected = items
+            .iter()
+            .map(|item| item.payload().clone())
+            .collect::<Vec<_>>();
+        let mut session = bamboo_domain::Session::new("native-anthropic", "claude");
+        session.add_message(Message::user("weather"));
+        let assistant = Message::assistant("normalized", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session
+            .activate_provider_transcript_route(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, items)
+            .unwrap();
+        let session: bamboo_domain::Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        let groups = session
+            .provider_transcript
+            .replayable_groups(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let tools = vec![tool_schema("get_weather")];
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn progressive_tools_keep_full_catalog_defer_only_non_core_and_cache_search() {
+        let tools = [
+            "Bash",
+            "Read",
+            "Glob",
+            "bash",
+            "Workspace",
+            "discover_capabilities",
+        ]
+        .into_iter()
+        .map(tool_schema)
+        .collect::<Vec<_>>();
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &[Message::user("inspect")],
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &[],
+            super::CapabilityLoadingMode::Progressive,
+        );
+        let rendered = body["tools"].as_array().unwrap();
+        assert_eq!(
+            rendered.len(),
+            5,
+            "HostOnly is replaced by one search entry"
+        );
+        assert_eq!(rendered[0]["name"], "Bash");
+        assert_eq!(rendered[1]["name"], "Read");
+        assert_eq!(rendered[2]["name"], "Glob");
+        assert_eq!(rendered[2]["defer_loading"], true);
+        assert_eq!(rendered[3]["name"], "bash");
+        assert_eq!(
+            rendered[3]["defer_loading"], true,
+            "a custom exact lowercase alias must not inherit Core policy"
+        );
+        assert!(rendered[0].get("defer_loading").is_none());
+        assert!(rendered[1].get("defer_loading").is_none());
+        assert!(rendered[2].get("cache_control").is_none());
+        assert!(rendered[3].get("cache_control").is_none());
+        assert_eq!(rendered[4]["type"], super::ANTHROPIC_TOOL_SEARCH_TYPE);
+        assert_eq!(rendered[4]["name"], super::ANTHROPIC_TOOL_SEARCH_NAME);
+        assert!(rendered[4].get("defer_loading").is_none());
+        assert_eq!(rendered[4]["cache_control"]["type"], "ephemeral");
+
+        let legacy = super::build_anthropic_request(
+            &[Message::user("inspect")],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+        );
+        assert_eq!(legacy["tools"].as_array().unwrap().len(), tools.len());
+        assert_eq!(legacy["tools"][5]["name"], "discover_capabilities");
+        assert!(legacy.to_string().find("defer_loading").is_none());
+        assert!(legacy
+            .to_string()
+            .find(super::ANTHROPIC_TOOL_SEARCH_TYPE)
+            .is_none());
+    }
+
+    #[test]
+    fn progressive_cache_can_be_disabled_without_changing_deferred_catalog() {
+        let tools = vec![tool_schema("Bash"), tool_schema("Glob")];
+        let plan = crate::cache::PromptCachePlan {
+            cache_tools: false,
+            ..Default::default()
+        };
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &[Message::user("inspect")],
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            Some(&plan),
+            false,
+            &[],
+            super::CapabilityLoadingMode::Progressive,
+        );
+        let rendered = body["tools"].as_array().unwrap();
+        assert_eq!(rendered[1]["defer_loading"], true);
+        assert!(rendered
+            .iter()
+            .all(|tool| tool.get("cache_control").is_none()));
+    }
+
+    #[test]
+    fn custom_tool_reference_replays_at_tool_result_anchor_and_loads_exact_name() {
+        let tools = vec![tool_schema("custom_search"), tool_schema("get_weather")];
+        let mut session = bamboo_domain::Session::new("custom-search", "claude");
+        session.add_message(Message::user("weather"));
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "toolu_search".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "custom_search".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        ));
+        let normalized_result = Message::tool_result("toolu_search", "normalized search result");
+        let anchor = normalized_result.id.clone();
+        session.add_message(normalized_result);
+        activate_native_route(&mut session);
+        let item = super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::HostToolSearch,
+            super::ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_result","tool_use_id":"toolu_search","is_error":false,
+                "content":[{"type":"tool_reference","tool_name":"get_weather"}]
+            }),
+        )
+        .unwrap();
+        let expected = item.payload().clone();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![item])
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+
+        assert_eq!(
+            super::validated_anthropic_loaded_tool_names(groups.iter(), &tools),
+            vec!["get_weather"]
+        );
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(body["messages"][2]["content"], json!([expected]));
+        assert!(!body.to_string().contains("normalized search result"));
+    }
+
+    #[test]
+    fn missing_custom_reference_is_not_loaded_or_replayed() {
+        let tools = vec![tool_schema("custom_search")];
+        let mut session = bamboo_domain::Session::new("missing-custom-search", "claude");
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "toolu_search".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "custom_search".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        ));
+        let normalized_result = Message::tool_result("toolu_search", "normalized missing result");
+        let anchor = normalized_result.id.clone();
+        session.add_message(normalized_result);
+        activate_native_route(&mut session);
+        let item = super::ProviderTranscriptItem::try_from_payload(
+            super::ProviderFamily::Anthropic,
+            super::ProviderProtocol::AnthropicMessages2023_06_01,
+            super::ProviderTranscriptOrigin::HostToolSearch,
+            super::ProviderTranscriptAuthor::ToolResult,
+            json!({
+                "type":"tool_result","tool_use_id":"toolu_search",
+                "content":[{"type":"tool_reference","tool_name":"missing_tool"}]
+            }),
+        )
+        .unwrap();
+        session
+            .append_provider_transcript_group(&anchor, None, vec![item])
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+        assert!(super::validated_anthropic_loaded_tool_names(groups.iter(), &tools).is_empty());
+
+        for mode in [
+            super::CapabilityLoadingMode::Progressive,
+            super::CapabilityLoadingMode::LegacyFullCatalog,
+        ] {
+            let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+                &session.messages,
+                &[],
+                &tools,
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &groups,
+                mode,
+            );
+            assert!(body.to_string().contains("normalized missing result"));
+            assert!(!body.to_string().contains("missing_tool"));
+        }
+    }
+
+    #[test]
+    fn native_replacements_run_back_to_front_across_coalesced_assistant_sources() {
+        let item = |author, payload| {
+            super::ProviderTranscriptItem::try_from_payload(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                super::ProviderTranscriptOrigin::Provider,
+                author,
+                payload,
+            )
+            .unwrap()
+        };
+        let first_items = vec![
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({"type":"text","text":"first preamble"}),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_1",
+                    "name":"tool_search_tool_regex","input":{"pattern":"first"}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_1",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_first"}
+                    ]}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_use","id":"tool_1","name":"get_first","input":{}
+                }),
+            ),
+        ];
+        let second_items = vec![
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({"type":"text","text":"second preamble"}),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"server_tool_use","id":"srv_2",
+                    "name":"tool_search_tool_regex","input":{"pattern":"second"}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::ToolResult,
+                json!({
+                    "type":"tool_search_tool_result","tool_use_id":"srv_2",
+                    "content":{"type":"tool_search_tool_search_result","tool_references":[
+                        {"type":"tool_reference","tool_name":"get_second"}
+                    ]}
+                }),
+            ),
+            item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({
+                    "type":"tool_use","id":"tool_2","name":"get_second","input":{}
+                }),
+            ),
+        ];
+        let expected = first_items
+            .iter()
+            .chain(second_items.iter())
+            .map(|item| item.payload().clone())
+            .collect::<Vec<_>>();
+
+        let mut session = bamboo_domain::Session::new("native-coalesced", "claude");
+        session.add_message(Message::user("search twice"));
+        let first = Message::assistant("normalized first", None);
+        let first_anchor = first.id.clone();
+        session.add_message(first);
+        let second = Message::assistant("normalized second", None);
+        let second_anchor = second.id.clone();
+        session.add_message(second);
+        session
+            .activate_provider_transcript_route(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .unwrap();
+        session
+            .append_provider_transcript_group(&first_anchor, None, first_items)
+            .unwrap();
+        session
+            .append_provider_transcript_group(&second_anchor, None, second_items)
+            .unwrap();
+        let groups = session
+            .provider_transcript
+            .replayable_groups(
+                super::ProviderFamily::Anthropic,
+                super::ProviderProtocol::AnthropicMessages2023_06_01,
+                TEST_PROVIDER_BOUNDARY,
+            )
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let tools = vec![tool_schema("get_first"), tool_schema("get_second")];
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn native_capture_bounds_text_bytes_without_changing_normalized_chunks() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = |text: String| {
+            let mut events = vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"text","text":""}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"text_delta","text":text}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+            ];
+            events.extend(valid_discovery_events_from(1));
+            parse_native_events(&events)
+        };
+
+        let exact = run("x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK));
+        assert_eq!(
+            exact
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            4
+        );
+
+        let over = run("x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1));
+        assert!(over
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+        assert_eq!(
+            over.iter()
+                .filter_map(|chunk| match chunk {
+                    super::LLMChunk::Token(fragment) => Some(fragment.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1
+        );
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::ToolCalls(_))));
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::Done)));
+    }
+
+    #[test]
+    fn native_capture_bounds_thinking_bytes_without_breaking_signature_fallback() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = |thinking: String| {
+            let mut events = vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"thinking_delta","thinking":thinking}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"signature_delta","signature":"signed"}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+            ];
+            events.extend(valid_discovery_events_from(1));
+            parse_native_events(&events)
+        };
+
+        let exact = run("x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK));
+        assert_eq!(
+            exact
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            4
+        );
+        assert!(exact.iter().any(|chunk| matches!(
+            chunk,
+            super::LLMChunk::ReasoningSignature(signature) if signature == "signed"
+        )));
+
+        let over =
+            run("x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK + 1));
+        assert!(over
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+        assert_eq!(
+            over.iter()
+                .filter_map(|chunk| match chunk {
+                    super::LLMChunk::ReasoningToken(fragment) => Some(fragment.len()),
+                    _ => None,
+                })
+                .sum::<usize>(),
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_THINKING_BYTES_PER_BLOCK + 1
+        );
+        assert!(over.iter().any(|chunk| matches!(
+            chunk,
+            super::LLMChunk::ReasoningSignature(signature) if signature == "signed"
+        )));
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::Done)));
+    }
+
+    #[test]
+    fn native_capture_limit_keeps_normalized_signature_ordering_safe() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let oversized = "x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1);
+        let events = vec![
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"text_delta","text":oversized}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":1,"delta":{"type":"thinking_delta","thinking":"reason"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":1,"delta":{"type":"signature_delta","signature":"signed"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":1,"delta":{"type":"thinking_delta","thinking":"tampered"}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+
+        let chunks = parse_native_events(&events);
+        assert!(chunks
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+        assert!(chunks.iter().all(|chunk| !matches!(
+            chunk,
+            super::LLMChunk::ReasoningSignature(signature) if !signature.is_empty()
+        )));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    super::LLMChunk::ReasoningToken(fragment) => Some(fragment.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "reasontampered"
+        );
+        assert!(chunks
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::Done)));
+    }
+
+    #[test]
+    fn native_capture_bounds_fragmented_partial_input_json() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let run = |input: String| {
+            let split = input.len() / 2;
+            let (first, second) = input.split_at(split);
+            let mut events = vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"tool_use","id":"tool_large","name":"unrelated_tool","input":{}}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"input_json_delta","partial_json":first}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"input_json_delta","partial_json":second}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+            ];
+            events.extend(valid_discovery_events_from(1));
+            parse_native_events(&events)
+        };
+
+        let exact = run(json_object_with_exact_bytes(
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_INPUT_JSON_BYTES_PER_BLOCK,
+        ));
+        assert_eq!(
+            exact
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            4
+        );
+
+        let over = run(json_object_with_exact_bytes(
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_INPUT_JSON_BYTES_PER_BLOCK + 1,
+        ));
+        assert!(over
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::ToolCalls(_))));
+        assert!(over
+            .iter()
+            .any(|chunk| matches!(chunk, super::LLMChunk::Done)));
+    }
+
+    #[test]
+    fn native_capture_enforces_exact_block_and_total_byte_boundaries() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut block_state = super::AnthropicStreamState::default();
+        for index in 0..super::ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS {
+            super::capture_anthropic_native_event(
+                &mut block_state,
+                "content_block_start",
+                &json!({"index":index,"content_block":{"type":"text","text":""}}).to_string(),
+            );
+            super::capture_anthropic_native_event(
+                &mut block_state,
+                "content_block_stop",
+                &json!({"index":index}).to_string(),
+            );
+        }
+        assert!(!block_state.native_capture_invalid);
+        assert_eq!(
+            block_state.native_blocks_by_index.len(),
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS
+        );
+        super::capture_anthropic_native_event(
+            &mut block_state,
+            "content_block_start",
+            &json!({
+                "index":super::ANTHROPIC_NATIVE_CAPTURE_MAX_BLOCKS,
+                "content_block":{"type":"text","text":""}
+            })
+            .to_string(),
+        );
+        assert!(block_state.native_capture_invalid);
+        assert!(block_state.native_blocks_by_index.is_empty());
+
+        let mut exact_total_state = super::AnthropicStreamState::default();
+        super::capture_anthropic_native_event(
+            &mut exact_total_state,
+            "content_block_start",
+            &json!({
+                "index":0,
+                "content_block":redacted_thinking_block_with_exact_bytes(
+                    super::ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES
+                )
+            })
+            .to_string(),
+        );
+        assert!(!exact_total_state.native_capture_invalid);
+        assert_eq!(
+            exact_total_state.native_capture_bytes,
+            super::ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES
+        );
+
+        let mut over_total_state = super::AnthropicStreamState::default();
+        super::capture_anthropic_native_event(
+            &mut over_total_state,
+            "content_block_start",
+            &json!({
+                "index":0,
+                "content_block":redacted_thinking_block_with_exact_bytes(
+                    super::ANTHROPIC_NATIVE_CAPTURE_MAX_TOTAL_BYTES + 1
+                )
+            })
+            .to_string(),
+        );
+        assert!(over_total_state.native_capture_invalid);
+        assert_eq!(over_total_state.native_capture_bytes, 0);
+        assert!(over_total_state.native_blocks_by_index.is_empty());
+    }
+
+    #[test]
+    fn native_capture_limit_state_resets_after_message_stop() {
+        let _limit_log_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = super::AnthropicStreamState::default();
+        let oversized = "x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1);
+        for (event, payload) in [
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"text","text":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"text_delta","text":oversized}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ] {
+            super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                .unwrap();
+        }
+        assert!(!state.native_capture_invalid);
+        assert_eq!(state.native_capture_bytes, 0);
+
+        let recovered = valid_discovery_events()
+            .into_iter()
+            .flat_map(|(event, payload)| {
+                super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovered
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn native_capture_limit_diagnostic_is_payload_free() {
+        const SENTINEL: &str = "LIMIT_SENTINEL_/private/tool-argument.json";
+        let _capture_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capture = EventCapture::default();
+        let events = capture.events.clone();
+        let _guard = tracing::subscriber::set_default(capture);
+        tracing::callsite::rebuild_interest_cache();
+        let mut state = super::AnthropicStreamState::default();
+        let mut oversized = SENTINEL.to_string();
+        oversized
+            .push_str(&"x".repeat(super::ANTHROPIC_NATIVE_CAPTURE_MAX_TEXT_BYTES_PER_BLOCK + 1));
+
+        super::parse_anthropic_sse_event_multi(
+            &mut state,
+            "content_block_start",
+            &json!({"index":0,"content_block":{"type":"text","text":""}}).to_string(),
+        )
+        .unwrap();
+        super::parse_anthropic_sse_event_multi(
+            &mut state,
+            "content_block_delta",
+            &json!({"index":0,"delta":{"type":"text_delta","text":oversized}}).to_string(),
+        )
+        .unwrap();
+
+        let logs = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .join("\n");
+        assert!(!logs.contains(SENTINEL));
+        assert!(
+            logs.contains("anthropic_native_capture_limit_exceeded"),
+            "captured diagnostic: {logs}"
+        );
+        assert!(logs.contains("limit_kind"));
+        assert!(logs.contains("observed_count"));
+        assert!(logs.contains("observed_bytes"));
+    }
+
+    #[test]
+    fn native_capture_fails_closed_for_unknown_or_incomplete_blocks() {
+        let run = |events: Vec<(&str, Value)>| {
+            let mut state = super::AnthropicStreamState::default();
+            events
+                .into_iter()
+                .flat_map(|(event, payload)| {
+                    super::parse_anthropic_sse_event_multi(&mut state, event, &payload.to_string())
+                        .unwrap()
+                })
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count()
+        };
+
+        assert_eq!(
+            run(vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+                ),
+                ("content_block_stop", json!({"index":0})),
+                (
+                    "content_block_start",
+                    json!({"index":1,"content_block":{"type":"future_block","data":"opaque"}}),
+                ),
+                ("content_block_stop", json!({"index":1})),
+                ("message_stop", json!({"type":"message_stop"})),
+            ]),
+            0
+        );
+        assert_eq!(
+            run(vec![
+                (
+                    "content_block_start",
+                    json!({"index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{}}}),
+                ),
+                (
+                    "content_block_delta",
+                    json!({"index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"weather\"}"}}),
+                ),
+                ("message_stop", json!({"type":"message_stop"})),
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn native_capture_validates_the_complete_discovery_group_atomically() {
+        let events = vec![
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{"pattern":"weather"}}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+
+        assert!(parse_native_events(&events)
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+    }
+
+    #[test]
+    fn native_capture_rejects_every_invalid_content_block_lifecycle() {
+        let native_count = |events: &[(&str, Value)]| {
+            parse_native_events(events)
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count()
+        };
+        let valid = valid_discovery_events();
+        assert_eq!(native_count(&valid), 3);
+
+        let mut delta_before_start = valid.clone();
+        delta_before_start.insert(0, valid[1].clone());
+        let mut stop_before_start = valid.clone();
+        stop_before_start.insert(0, valid[2].clone());
+        let mut duplicate_start = valid.clone();
+        duplicate_start.insert(1, valid[0].clone());
+        let mut delta_after_stop = valid.clone();
+        delta_after_stop.insert(3, valid[1].clone());
+        let mut duplicate_stop = valid.clone();
+        duplicate_stop.insert(3, valid[2].clone());
+        let mut message_stop_while_open = valid[..2].to_vec();
+        message_stop_while_open.push(("message_stop", json!({"type":"message_stop"})));
+
+        for invalid in [
+            delta_before_start,
+            stop_before_start,
+            duplicate_start,
+            delta_after_stop,
+            duplicate_stop,
+            message_stop_while_open,
+        ] {
+            assert_eq!(native_count(&invalid), 0);
+        }
+    }
+
+    #[test]
+    fn native_capture_rejects_thinking_after_or_repeated_signature_delta() {
+        let valid = vec![
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"thinking_delta","thinking":"private"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"signature_delta","signature":"signed"}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{"pattern":"weather"}}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_1","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            (
+                "content_block_start",
+                json!({"index":3,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            ("content_block_stop", json!({"index":3})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+        assert_eq!(
+            parse_native_events(&valid)
+                .iter()
+                .filter(|chunk| matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_)))
+                .count(),
+            4
+        );
+
+        let assert_fails_closed = |events: &[(&str, Value)]| {
+            let chunks = parse_native_events(events);
+            assert!(chunks
+                .iter()
+                .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+            assert!(chunks.iter().all(|chunk| !matches!(
+                chunk,
+                super::LLMChunk::ReasoningSignature(signature) if !signature.is_empty()
+            )));
+
+            let reasoning = chunks
+                .iter()
+                .filter_map(|chunk| match chunk {
+                    super::LLMChunk::ReasoningToken(fragment) => Some(fragment.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert!(!reasoning.is_empty());
+            let mut assistant = Message::assistant(
+                "normalized",
+                Some(vec![ToolCall {
+                    id: "tool_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "get_weather".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            );
+            assistant.reasoning = Some(reasoning);
+            assistant.reasoning_signature = chunks.iter().find_map(|chunk| match chunk {
+                super::LLMChunk::ReasoningSignature(signature) if !signature.is_empty() => {
+                    Some(signature.clone())
+                }
+                _ => None,
+            });
+            let messages = vec![
+                Message::user("search"),
+                assistant,
+                Message::tool_result("tool_1", "sunny"),
+            ];
+            let next_request = super::build_anthropic_request_with_cache_blocks_and_native(
+                &messages,
+                &[],
+                &[],
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                Some(bamboo_domain::ReasoningEffort::Medium),
+                None,
+                None,
+                false,
+                &[],
+            );
+            assert!(next_request.get("thinking").is_none());
+            assert!(next_request["messages"][1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block.get("type").and_then(Value::as_str) != Some("thinking")));
+        };
+
+        let mut thinking_after_signature = valid.clone();
+        thinking_after_signature.insert(
+            3,
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"thinking_delta","thinking":"tampered"}}),
+            ),
+        );
+        assert_fails_closed(&thinking_after_signature);
+
+        let mut repeated_signature = valid;
+        repeated_signature.insert(
+            3,
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"signature_delta","signature":"duplicate"}}),
+            ),
+        );
+        assert_fails_closed(&repeated_signature);
+    }
+
+    #[test]
+    fn invalid_native_group_preserves_the_complete_normalized_fallback() {
+        let events = vec![
+            (
+                "content_block_start",
+                json!({"index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"thinking_delta","thinking":"reason"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":0,"delta":{"type":"signature_delta","signature":"signed"}}),
+            ),
+            ("content_block_stop", json!({"index":0})),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"text","text":""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":1,"delta":{"type":"text_delta","text":"hello"}}),
+            ),
+            ("content_block_stop", json!({"index":1})),
+            (
+                "content_block_start",
+                json!({"index":2,"content_block":{"type":"server_tool_use","id":"srv_1","name":"tool_search_tool_regex","input":{"pattern":"weather"}}}),
+            ),
+            ("content_block_stop", json!({"index":2})),
+            (
+                "content_block_start",
+                json!({"index":3,"content_block":{"type":"tool_search_tool_result","tool_use_id":"srv_missing","content":{"type":"tool_search_tool_search_result","tool_references":[{"type":"tool_reference","tool_name":"get_weather"}]}}}),
+            ),
+            ("content_block_stop", json!({"index":3})),
+            (
+                "content_block_start",
+                json!({"index":4,"content_block":{"type":"tool_use","id":"tool_1","name":"get_weather","input":{}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":4,"delta":{"type":"input_json_delta","partial_json":"{\"city\":\"Paris\"}"}}),
+            ),
+            ("content_block_stop", json!({"index":4})),
+            ("message_stop", json!({"type":"message_stop"})),
+        ];
+        let native = parse_native_events(&events);
+        assert!(native
+            .iter()
+            .all(|chunk| !matches!(chunk, super::LLMChunk::ProviderTranscriptItem(_))));
+
+        let mut normalized_state = super::AnthropicStreamState::default();
+        let normalized = events
+            .iter()
+            .filter_map(|(event, payload)| {
+                super::parse_anthropic_sse_event(&mut normalized_state, event, &payload.to_string())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(format!("{native:?}"), format!("{normalized:?}"));
+        let diagnostic = format!("{native:?}");
+        assert!(diagnostic.contains("ReasoningToken(\"reason\")"));
+        assert!(diagnostic.contains("Token(\"hello\")"));
+        assert!(diagnostic.contains("ToolCalls"));
+        assert!(diagnostic.contains("Done"));
+    }
+
+    #[test]
+    fn native_replay_is_assistant_only_and_supports_empty_assistant_anchors() {
+        for anchored in [
+            Message::user("normalized user"),
+            Message::tool_result("tool_1", "normalized tool result"),
+            Message::system("normalized system"),
+        ] {
+            let anchor = anchored.id.clone();
+            let expected_role = anchored.role.clone();
+            let mut session = bamboo_domain::Session::new("native-role-boundary", "claude");
+            session.add_message(anchored.clone());
+            activate_native_route(&mut session);
+            session
+                .append_provider_transcript_group(&anchor, None, discovery_items())
+                .unwrap();
+            let groups = replayable_native_groups(&session);
+            let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+                &session.messages,
+                &[],
+                &[],
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &groups,
+                super::CapabilityLoadingMode::Progressive,
+            );
+            let serialized = body.to_string();
+            assert!(!serialized.contains("server_tool_use"));
+            assert!(!serialized.contains("tool_search_tool_result"));
+            assert_eq!(session.messages[0].role, expected_role);
+            assert!(serialized.contains(&anchored.content));
+        }
+
+        let mut session = bamboo_domain::Session::new("native-empty-assistant", "claude");
+        session.add_message(Message::user("search"));
+        let assistant = Message::assistant("", None);
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        activate_native_route(&mut session);
+        let items = discovery_items();
+        let expected = items
+            .iter()
+            .map(|item| item.payload().clone())
+            .collect::<Vec<_>>();
+        session
+            .append_provider_transcript_group(&anchor, None, items)
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+        let tools = vec![tool_schema("get_weather")];
+        let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert_eq!(body["messages"][1]["content"], json!(expected));
+    }
+
+    #[test]
+    fn coalesced_empty_native_anchors_keep_source_order() {
+        let search_items = |suffix: &str| {
+            let server_id = format!("srv_{suffix}");
+            vec![
+                native_item(
+                    super::ProviderTranscriptAuthor::Model,
+                    json!({
+                        "type":"server_tool_use","id":server_id.clone(),
+                        "name":"tool_search_tool_regex","input":{"pattern":suffix}
+                    }),
+                ),
+                native_item(
+                    super::ProviderTranscriptAuthor::ToolResult,
+                    json!({
+                        "type":"tool_search_tool_result","tool_use_id":server_id,
+                        "content":{"type":"tool_search_tool_search_result","tool_references":[]}
+                    }),
+                ),
+            ]
+        };
+
+        for second_content in ["normalized second", ""] {
+            let mut session = bamboo_domain::Session::new("native-coalesced-empty", "claude");
+            session.add_message(Message::user("search"));
+            let first = Message::assistant("", None);
+            let first_anchor = first.id.clone();
+            session.add_message(first);
+            let second = Message::assistant(second_content, None);
+            let second_anchor = second.id.clone();
+            session.add_message(second);
+            activate_native_route(&mut session);
+
+            let first_items = search_items("first");
+            let second_items = search_items("second");
+            let expected = first_items
+                .iter()
+                .chain(&second_items)
+                .map(|item| item.payload().clone())
+                .collect::<Vec<_>>();
+            session
+                .append_provider_transcript_group(&first_anchor, None, first_items)
+                .unwrap();
+            session
+                .append_provider_transcript_group(&second_anchor, None, second_items)
+                .unwrap();
+            let groups = replayable_native_groups(&session);
+            let body = super::build_anthropic_request_with_cache_blocks_native_mode(
+                &session.messages,
+                &[],
+                &[],
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &groups,
+                super::CapabilityLoadingMode::Progressive,
+            );
+
+            assert_eq!(body["messages"][1]["content"], json!(expected));
+        }
+    }
+
+    #[test]
+    fn native_thinking_replay_obeys_current_mode_and_prevents_false_downgrade() {
+        let mut items = vec![native_item(
+            super::ProviderTranscriptAuthor::Model,
+            json!({"type":"thinking","thinking":"private","signature":"signed"}),
+        )];
+        items.extend(discovery_items());
+
+        let mut session = bamboo_domain::Session::new("native-thinking", "claude");
+        session.add_message(Message::user("search"));
+        let assistant = Message::assistant(
+            "normalized",
+            Some(vec![ToolCall {
+                id: "tool_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        );
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session.add_message(Message::tool_result("tool_1", "sunny"));
+        activate_native_route(&mut session);
+        session
+            .append_provider_transcript_group(&anchor, None, items)
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+
+        let tools = vec![tool_schema("get_weather")];
+        let enabled = super::build_anthropic_request_with_cache_blocks_native_mode(
+            &session.messages,
+            &[],
+            &tools,
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+            &groups,
+            super::CapabilityLoadingMode::Progressive,
+        );
+        assert!(enabled.get("thinking").is_some());
+        assert_eq!(enabled["messages"][1]["content"][0]["type"], "thinking");
+        assert_eq!(
+            enabled["messages"][1]["content"][1]["type"],
+            "server_tool_use"
+        );
+
+        let disabled = super::build_anthropic_request_with_cache_blocks_and_native(
+            &session.messages,
+            &[],
+            &[],
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            None,
+            None,
+            None,
+            false,
+            &groups,
+        );
+        assert!(disabled.get("thinking").is_none());
+        assert!(disabled["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| !matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking" | "server_tool_use")
+            )));
+    }
+
+    #[test]
+    fn interior_native_thinking_cannot_suppress_the_required_downgrade() {
+        for prior_has_native_group in [false, true] {
+            let mut items = vec![native_item(
+                super::ProviderTranscriptAuthor::Model,
+                json!({"type":"thinking","thinking":"private","signature":"signed"}),
+            )];
+            items.extend(discovery_items());
+
+            let mut session = bamboo_domain::Session::new("native-interior-thinking", "claude");
+            session.add_message(Message::user("search"));
+            let prior = Message::assistant("", None);
+            let prior_anchor = prior.id.clone();
+            session.add_message(prior);
+            let mut assistant = Message::assistant(
+                "normalized",
+                Some(vec![ToolCall {
+                    id: "tool_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "get_weather".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+            );
+            assistant.reasoning = Some("normalized private".to_string());
+            assistant.reasoning_signature = Some("normalized signed".to_string());
+            let anchor = assistant.id.clone();
+            session.add_message(assistant);
+            session.add_message(Message::tool_result("tool_1", "sunny"));
+            activate_native_route(&mut session);
+            if prior_has_native_group {
+                session
+                    .append_provider_transcript_group(
+                        &prior_anchor,
+                        None,
+                        vec![
+                            native_item(
+                                super::ProviderTranscriptAuthor::Model,
+                                json!({"type":"server_tool_use","id":"srv_prior","name":"tool_search_tool_regex","input":{"pattern":"prior"}}),
+                            ),
+                            native_item(
+                                super::ProviderTranscriptAuthor::ToolResult,
+                                json!({"type":"tool_search_tool_result","tool_use_id":"srv_prior","content":{"type":"tool_search_tool_search_result","tool_references":[]}}),
+                            ),
+                        ],
+                    )
+                    .unwrap();
+            }
+            session
+                .append_provider_transcript_group(&anchor, None, items)
+                .unwrap();
+            let groups = replayable_native_groups(&session);
+
+            let body = super::build_anthropic_request_with_cache_blocks_and_native(
+                &session.messages,
+                &[],
+                &[],
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                Some(bamboo_domain::ReasoningEffort::Medium),
+                None,
+                None,
+                false,
+                &groups,
+            );
+            assert!(body.get("thinking").is_none());
+            let content = body["messages"][1]["content"].as_array().unwrap();
+            assert!(content.iter().all(|block| !matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking" | "redacted_thinking")
+            )));
+            assert!(content
+                .iter()
+                .all(|block| block.get("id").and_then(Value::as_str) != Some("srv_1")));
+            assert!(body.to_string().contains("normalized"));
+        }
+    }
+
+    #[test]
+    fn native_replay_cannot_remove_normalized_signed_thinking() {
+        let mut session = bamboo_domain::Session::new("native-preserve-thinking", "claude");
+        session.add_message(Message::user("search"));
+        let mut assistant = Message::assistant(
+            "normalized",
+            Some(vec![ToolCall {
+                id: "tool_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "get_weather".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+        );
+        assistant.reasoning = Some("normalized private".to_string());
+        assistant.reasoning_signature = Some("normalized signed".to_string());
+        let anchor = assistant.id.clone();
+        session.add_message(assistant);
+        session.add_message(Message::tool_result("tool_1", "sunny"));
+        activate_native_route(&mut session);
+        session
+            .append_provider_transcript_group(&anchor, None, discovery_items())
+            .unwrap();
+        let groups = replayable_native_groups(&session);
+
+        let body = super::build_anthropic_request_with_cache_blocks_and_native(
+            &session.messages,
+            &[],
+            &[],
+            "claude-sonnet-4-6",
+            4096,
+            true,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+            &groups,
+        );
+
+        assert!(body.get("thinking").is_some());
+        assert_eq!(body["messages"][1]["content"][0]["type"], "thinking");
+        assert_eq!(
+            body["messages"][1]["content"][0]["thinking"],
+            "normalized private"
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["signature"],
+            "normalized signed"
+        );
+        assert!(body["messages"][1]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block.get("type").and_then(Value::as_str) != Some("server_tool_use")));
+    }
+
+    #[test]
+    fn malformed_stream_warnings_never_include_raw_provider_payloads() {
+        const SENTINEL: &str = "LOG_SENTINEL_/private/credential.json";
+        let _capture_lock = EVENT_CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capture = EventCapture::default();
+        let events = capture.events.clone();
+        let _guard = tracing::subscriber::set_default(capture);
+        tracing::callsite::rebuild_interest_cache();
+        let mut state = super::AnthropicStreamState::default();
+
+        for (event, payload) in [
+            (
+                "content_block_start",
+                json!({"content_block":{"type":"server_tool_use","input":{"pattern":SENTINEL}}}),
+            ),
+            (
+                "content_block_start",
+                json!({"index":1,"content_block":{"type":"tool_use","name":"unsafe","input":{"credential":SENTINEL}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"delta":{"type":"input_json_delta","partial_json":SENTINEL}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index":99,"delta":{"type":"input_json_delta","partial_json":SENTINEL}}),
+            ),
+        ] {
+            super::parse_anthropic_sse_event(&mut state, event, &payload.to_string()).unwrap();
+        }
+        super::parse_anthropic_sse_event(
+            &mut state,
+            "message_delta",
+            &format!("{{\"secret\":\"{SENTINEL}\""),
+        )
+        .unwrap();
+        let _ = super::tool_arguments_to_input(SENTINEL);
+        let _ = super::tool_arguments_to_input(&json!(SENTINEL).to_string());
+
+        let logs = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .join("\n");
+        assert!(!logs.contains(SENTINEL));
+        assert!(logs.contains("payload_len"));
+    }
+
+    #[test]
+    fn max_reasoning_uses_a_distinct_larger_thinking_budget() {
+        let xhigh = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Xhigh),
+            32_000,
+        )
+        .expect("xhigh enables thinking");
+        let max = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Max),
+            32_000,
+        )
+        .expect("max enables thinking");
+
+        assert_eq!(xhigh["budget_tokens"], 8192);
+        assert_eq!(max["budget_tokens"], 16384);
+
+        let xhigh_at_default = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Xhigh),
+            16_384,
+        )
+        .expect("xhigh fits the common 16K output limit");
+        let max_at_default = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Max),
+            16_384,
+        )
+        .expect("max fits while reserving visible output");
+        assert_eq!(xhigh_at_default["budget_tokens"], 8_192);
+        assert_eq!(max_at_default["budget_tokens"], 12_288);
+
+        let xhigh_at_tight = super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Xhigh),
+            8_320,
+        )
+        .expect("xhigh scales under a tight limit");
+        let max_at_tight =
+            super::anthropic_thinking_from_effort(Some(bamboo_domain::ReasoningEffort::Max), 8_320)
+                .expect("max remains distinct under a tight limit");
+        assert_eq!(xhigh_at_tight["budget_tokens"], 4_160);
+        assert_eq!(max_at_tight["budget_tokens"], 6_240);
+
+        assert!(super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Max),
+            2_048,
+        )
+        .is_none());
+        assert!(super::anthropic_thinking_from_effort(
+            Some(bamboo_domain::ReasoningEffort::Max),
+            1_024,
+        )
+        .is_none());
+
+        let request = super::build_anthropic_request(
+            &[bamboo_domain::Message::user("hello")],
+            &[],
+            "claude-sonnet-4-5",
+            16_384,
+            true,
+            Some(bamboo_domain::ReasoningEffort::Max),
+            None,
+        );
+        assert_eq!(request["max_tokens"], 16_384);
+        assert_eq!(request["thinking"]["budget_tokens"], 12_288);
+
+        let impossible = super::build_anthropic_request(
+            &[bamboo_domain::Message::user("hello")],
+            &[],
+            "claude-sonnet-4-5",
+            1_024,
+            true,
+            Some(bamboo_domain::ReasoningEffort::Max),
+            None,
+        );
+        assert!(impossible.get("thinking").is_none());
+    }
+
+    #[test]
+    fn system_messages_are_extracted_into_blocks_with_cache_control() {
+        let messages = vec![
+            Message::system("You are helpful."),
+            Message::user("Hi"),
+            Message::system("Be concise."),
+            Message::assistant("Hello!", None),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let system = out["system"]
+            .as_array()
+            .expect("system should be an array of blocks");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "You are helpful.\n\nBe concise.");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(out["messages"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn system_field_absent_when_no_system_messages() {
+        let messages = vec![Message::user("Hi")];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        assert!(out.get("system").is_none());
+    }
+
+    #[test]
+    fn structured_system_blocks_render_as_discrete_blocks_with_terminal_cache_control() {
+        use bamboo_domain::{ContextBlockType, PromptBlock};
+        // The canonical structured system field: three blocks in, three Anthropic
+        // system text blocks out — the provider consumes Bamboo's block array
+        // structurally instead of a pre-joined string.
+        let system_blocks = vec![
+            PromptBlock::new("base", ContextBlockType::Base, "BASE identity"),
+            PromptBlock::new(
+                "core_directives",
+                ContextBlockType::CoreDirectives,
+                "CORE rules",
+            ),
+            PromptBlock::new("env", ContextBlockType::EnvSnapshot, "ENV snapshot"),
+        ];
+        let messages = vec![Message::user("Hi")];
+
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &system_blocks,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            None,
+            false,
+        );
+
+        let system = out["system"].as_array().expect("system is a block array");
+        assert_eq!(system.len(), 3, "one wire block per PromptBlock");
+        assert_eq!(system[0]["text"], "BASE identity");
+        assert_eq!(system[1]["text"], "CORE rules");
+        assert_eq!(system[2]["text"], "ENV snapshot");
+        assert!(system.iter().all(|b| b["type"] == "text"));
+        // Exactly ONE system cache breakpoint, on the LAST block (the default plan
+        // caches the system) — identical caching to the single-joined-block form.
+        assert!(system[0].get("cache_control").is_none());
+        assert!(system[1].get("cache_control").is_none());
+        assert_eq!(system[2]["cache_control"]["type"], "ephemeral");
+        // The user turn is untouched in the message array.
+        assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_system_blocks_fall_back_to_joined_system_messages() {
+        use bamboo_domain::PromptBlock;
+        // With no structured blocks, the system comes from the `System` messages,
+        // byte-identical to the legacy path (multiple messages join into one block).
+        let messages = vec![
+            Message::system("You are helpful."),
+            Message::system("Be concise."),
+            Message::user("Hi"),
+        ];
+        let no_blocks: Vec<PromptBlock> = Vec::new();
+
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &no_blocks,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            None,
+            false,
+        );
+        let system = out["system"].as_array().expect("system array");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["text"], "You are helpful.\n\nBe concise.");
+    }
+
+    #[test]
+    fn tool_result_with_image_emits_text_and_image_blocks() {
+        // An MCP screenshot result: text note + one image.
+        let msg = Message::tool_result_with_images(
+            "toolu_1",
+            "screenshot 1280x536",
+            true,
+            vec![bamboo_domain::ToolResultImage {
+                mime_type: "image/jpeg".to_string(),
+                data: "AAAA".to_string(),
+            }],
+        );
+        let v = super::message_to_anthropic_json(&msg, true, false, false)
+            .expect("tool message should serialize");
+        let block = &v["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "toolu_1");
+        let arr = block["content"]
+            .as_array()
+            .expect("tool_result content should be an array when images are present");
+        assert!(arr
+            .iter()
+            .any(|b| b["type"] == "text" && b["text"] == "screenshot 1280x536"));
+        let img = arr
+            .iter()
+            .find(|b| b["type"] == "image")
+            .expect("an image block");
+        assert_eq!(img["source"]["type"], "base64");
+        assert_eq!(img["source"]["media_type"], "image/jpeg");
+        assert_eq!(img["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn tool_result_without_image_stays_plain_string() {
+        // Regression: text-only tool results keep the cheap string form.
+        let msg = Message::tool_result("toolu_2", "plain text");
+        let v = super::message_to_anthropic_json(&msg, true, false, false)
+            .expect("tool message should serialize");
+        assert_eq!(v["content"][0]["type"], "tool_result");
+        assert_eq!(v["content"][0]["content"], "plain text");
+    }
+
+    #[test]
+    fn older_tool_image_is_dropped_keeping_only_latest() {
+        // With keep_image=false, an image-bearing tool result drops the image and
+        // notes the omission (only the most recent screenshot is sent).
+        let msg = Message::tool_result_with_images(
+            "toolu_old",
+            "screenshot 1",
+            true,
+            vec![bamboo_domain::ToolResultImage {
+                mime_type: "image/jpeg".to_string(),
+                data: "OLD".to_string(),
+            }],
+        );
+        let v = super::message_to_anthropic_json(&msg, false, false, false)
+            .expect("tool message should serialize");
+        let content = &v["content"][0]["content"];
+        // No image block — content is a plain string with the omission note.
+        assert!(content.is_string(), "dropped image should leave a string");
+        assert!(content.as_str().unwrap().contains("omitted"));
+    }
+
+    #[test]
+    fn stray_system_message_is_skipped_not_panicked() {
+        // Regression for issue #22: a System message reaching the per-message
+        // serializer (a malformed/legacy session loaded from storage, or a future
+        // bug in system extraction) must NOT panic the process. It is logged and
+        // dropped (None), and the surrounding User/Assistant messages survive
+        // intact in the resulting Anthropic `messages` array.
+        use serde_json::Value;
+
+        // (a) Direct: a System message serializes to None instead of panicking.
+        let system_msg = Message::system("You are a robot.");
+        assert!(
+            super::message_to_anthropic_json(&system_msg, true, false, false).is_none(),
+            "a System message must serialize to None (skipped), not panic"
+        );
+
+        // (b) In context: the conversation array is consumed the way an
+        // Option-returning serializer should be — None entries are filtered out
+        // (filter_map), the rest survive. Reaching these assertions also proves
+        // the System message did NOT panic.
+        let conversation = [
+            Message::system("You are a robot."),
+            Message::user("Hello"),
+            Message::assistant("Hi there!", None),
+        ];
+        let serialized: Vec<Value> = conversation
+            .iter()
+            .filter_map(|m| super::message_to_anthropic_json(m, true, false, false))
+            .collect();
+
+        // The System message is omitted; User + Assistant survive, in order.
+        assert_eq!(
+            serialized.len(),
+            2,
+            "system message must be skipped, leaving user + assistant"
+        );
+        assert_eq!(serialized[0]["role"], "user");
+        assert_eq!(serialized[0]["content"][0]["text"], "Hello");
+        assert_eq!(serialized[1]["role"], "assistant");
+        // No null/placeholder entry sneaks in for the skipped system message.
+        assert!(
+            serialized.iter().all(|m| !m.is_null()),
+            "a skipped system message must be omitted, not emitted as null"
+        );
+    }
+
+    #[test]
+    fn messages_to_anthropic_json_skips_stray_system_on_production_path() {
+        // Regression for issue #22, but exercising the REAL production path.
+        // `messages_to_anthropic_json` is the function `build_anthropic_request`
+        // actually calls; unlike the synthetic `filter_map` consumer in
+        // `stray_system_message_is_skipped_not_panicked`, this runs the
+        // provider's own System-routing arm (→ top-level `system` field) AND
+        // the let-else skip + out_ids population, so it catches regressions in
+        // how the two are wired together.
+        let system = Message::system("You are a robot.");
+        let user = Message::user("Hello");
+        let assistant = Message::assistant("Hi there!", None);
+
+        // Capture the originating ids so we can assert out_ids tracks them
+        // exactly — the System message's id must NOT appear in out_ids.
+        let user_id = user.id.clone();
+        let assistant_id = assistant.id.clone();
+
+        let messages = [system, user, assistant];
+        let (system_val, out, out_ids) =
+            super::messages_to_anthropic_json(&messages, &[], false, false);
+
+        // (a) The System message is routed into the top-level `system` field.
+        let system_value =
+            system_val.expect("the System message must populate the top-level `system` field");
+        let system_arr = system_value
+            .as_array()
+            .expect("`system` should be an array of text blocks");
+        assert_eq!(system_arr.len(), 1);
+        assert_eq!(system_arr[0]["type"], "text");
+        assert_eq!(system_arr[0]["text"], "You are a robot.");
+
+        // (b) The `messages` array omits the System message entirely — no null
+        // entry, order preserved, User then Assistant.
+        assert_eq!(
+            out.len(),
+            2,
+            "system message must be skipped, leaving user + assistant"
+        );
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[0]["content"][0]["type"], "text");
+        assert_eq!(out[0]["content"][0]["text"], "Hello");
+        assert_eq!(out[1]["role"], "assistant");
+        assert!(
+            out.iter().all(|m| !m.is_null()),
+            "a skipped system message must be omitted, not emitted as null"
+        );
+
+        // (c) out_ids mirrors the surviving messages 1:1 — the System message's
+        // id is absent, the User/Assistant ids are present in order. Each output
+        // message carries its source id(s); here no same-role coalescing occurs so
+        // each slot holds exactly one id.
+        assert_eq!(out_ids.len(), 2);
+        assert_eq!(out_ids[0][0].id, user_id);
+        assert_eq!(out_ids[1][0].id, assistant_id);
+
+        // (d) KEY INVARIANT: the parallel id vector stays in lockstep with the
+        // messages array, so cache-breakpoint placement by id never desyncs.
+        assert_eq!(
+            out.len(),
+            out_ids.len(),
+            "out_ids must stay parallel to the messages array"
+        );
+    }
+
+    #[test]
+    fn messages_to_anthropic_json_skips_multiple_stray_system_messages() {
+        // Every stray System message is routed to the top-level `system` field;
+        // none survives into the `messages` array, no matter how many appear.
+        let messages = [
+            Message::system("Rule one."),
+            Message::system("Rule two."),
+            Message::user("Hello"),
+            Message::assistant("Hi!", None),
+        ];
+        let (system_val, out, out_ids) =
+            super::messages_to_anthropic_json(&messages, &[], false, false);
+
+        // Both system messages are joined into the system field.
+        let system_value =
+            system_val.expect("system messages must populate the top-level `system` field");
+        let system_arr = system_value
+            .as_array()
+            .expect("`system` should be an array of text blocks");
+        assert_eq!(system_arr.len(), 1);
+        assert_eq!(system_arr[0]["text"], "Rule one.\n\nRule two.");
+
+        // Only User + Assistant survive in the messages array.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(out[1]["role"], "assistant");
+        assert!(
+            out.iter().all(|m| !m.is_null()),
+            "skipped system messages must be omitted, not emitted as null"
+        );
+
+        // Parity invariant holds with multiple skipped messages.
+        assert_eq!(
+            out.len(),
+            out_ids.len(),
+            "out_ids must stay parallel to the messages array"
+        );
+    }
+
+    #[test]
+    fn tool_arguments_to_input_always_yields_an_object() {
+        use super::tool_arguments_to_input;
+        // Anthropic requires `tool_use.input` to be a JSON object; a non-object
+        // input is a 400 `invalid_request_error` that then poisons every
+        // subsequent request in the session (the reported session-brick).
+
+        // empty / whitespace-only (a zero-argument tool call) -> {}
+        assert_eq!(tool_arguments_to_input(""), serde_json::json!({}));
+        assert_eq!(tool_arguments_to_input("   "), serde_json::json!({}));
+
+        // a real object passes through unchanged
+        assert_eq!(
+            tool_arguments_to_input(r#"{"q":"rust"}"#),
+            serde_json::json!({ "q": "rust" })
+        );
+
+        // valid-but-non-object JSON must NOT pass through -> `_raw` object
+        for non_object in ["42", "true", "null", "[1,2,3]", "\"a string\""] {
+            let v = tool_arguments_to_input(non_object);
+            assert!(
+                v.is_object(),
+                "{non_object:?} must map to an object, got {v}"
+            );
+            assert_eq!(v["_raw"], non_object);
+        }
+
+        // invalid JSON -> `_raw` object
+        let v = tool_arguments_to_input("not json");
+        assert!(v.is_object());
+        assert_eq!(v["_raw"], "not json");
+    }
+
+    #[test]
+    fn messages_to_anthropic_json_skips_system_between_tool_use_and_result() {
+        // A stray System message wedged between an assistant tool_use and its
+        // tool_result must be routed to `system` and NOT break the pairing:
+        // tool_use and tool_result stay adjacent in the messages array.
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"rust"}"#.to_string(),
+            },
+        };
+        let messages = [
+            Message::assistant("", Some(vec![tool_call])),
+            Message::system("mid-conversation system"),
+            Message::tool_result("call_1", "found it"),
+        ];
+        let (system_val, out, out_ids) =
+            super::messages_to_anthropic_json(&messages, &[], false, false);
+
+        // The wedged System message is routed to the system field, not dropped.
+        assert!(
+            system_val.is_some(),
+            "the mid-conversation System message must populate the `system` field"
+        );
+
+        // Two messages survive, adjacent and paired: assistant tool_use then
+        // user tool_result referencing the same tool_use_id.
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"][0]["type"], "tool_use");
+        assert_eq!(out[0]["content"][0]["id"], "call_1");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"][0]["type"], "tool_result");
+        assert_eq!(out[1]["content"][0]["tool_use_id"], "call_1");
+        assert!(
+            out.iter().all(|m| !m.is_null()),
+            "skipped system message must be omitted, not emitted as null"
+        );
+
+        // Parity invariant holds even with the interleaved System message.
+        assert_eq!(
+            out.len(),
+            out_ids.len(),
+            "out_ids must stay parallel to the messages array"
+        );
+    }
+
+    #[test]
+    fn messages_keep_only_the_most_recent_tool_image() {
+        let img = |d: &str| bamboo_domain::ToolResultImage {
+            mime_type: "image/jpeg".to_string(),
+            data: d.to_string(),
+        };
+        let messages = vec![
+            Message::user("look"),
+            Message::tool_result_with_images("t1", "shot1", true, vec![img("FIRST")]),
+            Message::tool_result_with_images("t2", "shot2", true, vec![img("LAST")]),
+        ];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let dumped = out.to_string();
+        // The most recent image survives; the older one is dropped.
+        assert!(dumped.contains("LAST"), "latest screenshot must be sent");
+        assert!(
+            !dumped.contains("FIRST"),
+            "older screenshot must be dropped"
+        );
+    }
+
+    #[test]
+    fn tool_messages_become_tool_result_blocks() {
+        let messages = vec![Message::tool_result("call_1", "OK")];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(out["messages"][0]["role"], "user");
+        assert_eq!(out["messages"][0]["content"][0]["type"], "tool_result");
+        assert_eq!(out["messages"][0]["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(out["messages"][0]["content"][0]["content"], "OK");
+    }
+
+    #[test]
+    fn assistant_tool_calls_become_tool_use_blocks_with_parsed_json_input() {
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"test"}"#.to_string(),
+            },
+        };
+
+        let messages = vec![Message::assistant("", Some(vec![tool_call]))];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        assert_eq!(out["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(out["messages"][0]["role"], "assistant");
+        assert_eq!(out["messages"][0]["content"][0]["type"], "tool_use");
+        assert_eq!(out["messages"][0]["content"][0]["id"], "call_1");
+        assert_eq!(out["messages"][0]["content"][0]["name"], "search");
+        assert_eq!(out["messages"][0]["content"][0]["input"]["q"], "test");
+    }
+
+    #[test]
+    fn user_message_with_data_url_image_becomes_anthropic_image_block() {
+        let messages = vec![Message::user_with_parts(
+            "describe",
+            vec![
+                ContentPart::Text {
+                    text: "describe".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,AAAABBBB".to_string(),
+                        detail: None,
+                    },
+                },
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        )];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        assert_eq!(out["messages"][0]["content"][1]["type"], "image");
+        assert_eq!(out["messages"][0]["content"][1]["source"]["type"], "base64");
+        assert_eq!(
+            out["messages"][0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(
+            out["messages"][0]["content"][1]["source"]["data"],
+            "AAAABBBB"
+        );
+    }
+
+    #[test]
+    fn user_message_with_remote_image_uses_url_source() {
+        let messages = vec![Message::user_with_parts(
+            "describe",
+            vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/cat.png".to_string(),
+                    detail: None,
+                },
+            }]
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        )];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        assert_eq!(out["messages"][0]["content"][0]["type"], "image");
+        assert_eq!(out["messages"][0]["content"][0]["source"]["type"], "url");
+        assert_eq!(
+            out["messages"][0]["content"][0]["source"]["url"],
+            "https://example.com/cat.png"
+        );
+    }
+
+    fn sample_tools() -> Vec<ToolSchema> {
+        vec![ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "search".to_string(),
+                description: "Search".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "q": {"type": "string"}
+                    },
+                    "required": ["q"]
+                }),
+            },
+        }]
+    }
+
+    #[test]
+    fn last_tool_definition_has_cache_control() {
+        let messages = vec![Message::user("Hi")];
+        let tools = vec![
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "read".to_string(),
+                    description: "Read a file".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+            },
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "write".to_string(),
+                    description: "Write a file".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                },
+            },
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &tools, "claude-test", 64, false, None, None);
+
+        let tools_arr = out["tools"].as_array().unwrap();
+        assert_eq!(tools_arr.len(), 2);
+        // First tool has no cache_control.
+        assert!(
+            tools_arr[0].get("cache_control").is_none(),
+            "first tool should not have cache_control"
+        );
+        // Last tool has cache_control.
+        assert_eq!(tools_arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn plan_places_cache_breakpoint_on_message_by_id() {
+        let flagged = Message::user("Old context here");
+        let flagged_id = flagged.id.clone();
+        let messages = vec![
+            Message::user("Hi"),
+            flagged,
+            Message::assistant("Got it", None),
+        ];
+        let plan = crate::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![flagged_id],
+            ..Default::default()
+        };
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        let msgs = out["messages"].as_array().unwrap();
+        // "Hi" and the flagged "Old context here" are consecutive user turns, so
+        // they coalesce into ONE user message (#101). The flagged id was folded in,
+        // so its breakpoint lands on that merged message's LAST block (the flagged
+        // content), not on a separate message.
+        assert_eq!(msgs.len(), 2, "the two consecutive user turns coalesced");
+        let merged_user = msgs[0]["content"].as_array().unwrap();
+        assert!(
+            merged_user[0].get("cache_control").is_none(),
+            "the leading 'Hi' block is not the breakpoint"
+        );
+        assert_eq!(
+            merged_user[1]["cache_control"]["type"], "ephemeral",
+            "the breakpoint lands on the flagged content (the last block)"
+        );
+        assert!(msgs[1]["content"].as_array().unwrap()[0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn breakpoint_stays_before_volatile_same_role_tail() {
+        let stable = Message::user("stable conversation prefix");
+        let stable_id = stable.id.clone();
+        let messages = vec![stable, Message::user("volatile task list / memory / goal")];
+        let plan = crate::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![stable_id],
+            ttl: crate::cache::CacheTtl::Extended,
+            ..Default::default()
+        };
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+        let blocks = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[0]["cache_control"]["ttl"], "1h");
+        assert!(blocks[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn multi_block_source_span_ends_on_its_own_last_block() {
+        let stable = Message::user_with_parts(
+            "",
+            vec![
+                bamboo_domain::MessagePart::Text { text: "one".into() },
+                bamboo_domain::MessagePart::Text { text: "two".into() },
+            ],
+        );
+        let stable_id = stable.id.clone();
+        let messages = vec![stable, Message::user("volatile")];
+        let plan = crate::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![stable_id],
+            ..Default::default()
+        };
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+        let blocks = out["messages"][0]["content"].as_array().unwrap();
+        assert!(blocks[0].get("cache_control").is_none());
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[2].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn last_marked_span_wins_inside_one_coalesced_message() {
+        let first = Message::user("stable one");
+        let second = Message::user("stable two");
+        let plan = crate::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![first.id.clone(), second.id.clone()],
+            ..Default::default()
+        };
+        let out = super::build_anthropic_request_with_cache(
+            &[first, second, Message::user("volatile")],
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+        let blocks = out["messages"][0]["content"].as_array().unwrap();
+        assert!(blocks[0].get("cache_control").is_none());
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[2].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn out_of_range_source_span_falls_back_to_last_block() {
+        let mut message = serde_json::json!({"role":"user","content":[{"type":"text","text":"x"}]});
+        super::add_cache_control_to_block(
+            &mut message,
+            usize::MAX,
+            crate::cache::CacheTtl::Default,
+        );
+        assert_eq!(message["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn stable_prefix_caches_system_and_relocated_tool_guide() {
+        // Mirrors a prompt-lanes request: a static system identity, the relocated
+        // tool/server guide as its own fixed prefix message, then the
+        // conversation. The cacheable PREFIX (system + guide) and the rolling
+        // conversation tail must each carry a `cache_control` marker; the middle
+        // turns must not. This is the prefix-prompt-cache guarantee of the
+        // tool-guide relocation.
+        let guide = Message::user("Tool & Connected-Server Guide: nova targeting workflow");
+        let guide_id = guide.id.clone();
+        let tail = Message::user("the current ask");
+        let tail_id = tail.id.clone();
+        let messages = vec![
+            Message::system("BASE_IDENTITY"),
+            guide,
+            Message::user("earlier turn"),
+            Message::assistant("ok", None),
+            tail,
+        ];
+        let plan = crate::cache::PromptCachePlan {
+            cache_system: true,
+            cache_tools: true,
+            breakpoint_message_ids: vec![guide_id, tail_id],
+            ..Default::default()
+        };
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        // Static system identity is cached (top of the stable prefix).
+        let system = out["system"].as_array().expect("system blocks");
+        assert_eq!(
+            system.last().unwrap()["cache_control"]["type"],
+            "ephemeral",
+            "static system identity must be cached"
+        );
+
+        // Guide + earlier user turn coalesce. The guide's marker must stay on
+        // its own block, before the later conversation content.
+        let msgs = out["messages"].as_array().unwrap();
+        let cc = |m: &serde_json::Value| -> bool {
+            m["content"]
+                .as_array()
+                .and_then(|b| b.last())
+                .map(|b| b.get("cache_control").is_some())
+                .unwrap_or(false)
+        };
+        // The relocated guide closes the stable prefix and is cached.
+        let prefix_blocks = msgs[0]["content"].as_array().unwrap();
+        assert!(
+            prefix_blocks[0].get("cache_control").is_some(),
+            "relocated tool guide must be cached"
+        );
+        assert!(
+            prefix_blocks[1].get("cache_control").is_none(),
+            "volatile conversation content must remain outside the stable prefix"
+        );
+        // The rolling conversation tail is cached.
+        assert!(cc(msgs.last().unwrap()), "conversation tail must be cached");
+    }
+
+    #[test]
+    fn breakpoint_survives_tool_result_merge_by_id() {
+        // The first tool result of a turn creates a user message; subsequent
+        // tool results merge into it (keeping the first result's id). A
+        // breakpoint placed on that turn's id must still land on the merged
+        // message even though it now holds multiple tool_result blocks.
+        let assistant = Message::assistant(
+            "",
+            Some(vec![
+                ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "f".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+                ToolCall {
+                    id: "call_2".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "g".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                },
+            ]),
+        );
+        let first_result = Message::tool_result("call_1", "output one");
+        let first_result_id = first_result.id.clone();
+        let messages = vec![
+            assistant,
+            first_result,
+            Message::tool_result("call_2", "output two"),
+        ];
+        let plan = crate::cache::PromptCachePlan {
+            breakpoint_message_ids: vec![first_result_id],
+            ..Default::default()
+        };
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            2,
+            "both tool results merge into one user message"
+        );
+        let user = &msgs[1];
+        assert_eq!(user["role"], "user");
+        let blocks = user["content"].as_array().unwrap();
+        assert_eq!(
+            blocks.len(),
+            2,
+            "both tool results present in merged message"
+        );
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert!(blocks[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn extended_ttl_emits_one_hour_cache_control() {
+        let plan = crate::cache::PromptCachePlan {
+            cache_system: true,
+            ttl: crate::cache::CacheTtl::Extended,
+            ..Default::default()
+        };
+        let messages = vec![Message::system("Stable prompt"), Message::user("Hi")];
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &[],
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        assert_eq!(out["system"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(out["system"][0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn cache_breakpoints_are_clamped_to_provider_budget() {
+        // tools + system + 6 flagged messages, but only 4 breakpoints are
+        // allowed, so 2 messages (the last two) keep their markers.
+        let mut messages = vec![Message::system("Stable prompt")];
+        let mut flagged_ids = Vec::new();
+        for i in 0..6 {
+            // Alternate roles so the 6 flagged turns stay DISTINCT output messages
+            // (consecutive same-role turns would coalesce, #101); the point here is
+            // breakpoint CLAMPING, which needs more candidate messages than budget.
+            let m = if i % 2 == 0 {
+                Message::user(format!("turn {i}"))
+            } else {
+                Message::assistant(format!("turn {i}"), None)
+            };
+            flagged_ids.push(m.id.clone());
+            messages.push(m);
+        }
+        let plan = crate::cache::PromptCachePlan {
+            cache_tools: true,
+            cache_system: true,
+            breakpoint_message_ids: flagged_ids,
+            ..Default::default()
+        };
+
+        let out = super::build_anthropic_request_with_cache(
+            &messages,
+            &sample_tools(),
+            "claude-test",
+            64,
+            false,
+            None,
+            None,
+            Some(&plan),
+        );
+
+        let tool_breaks = out["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t.get("cache_control").is_some())
+            .count();
+        let system_breaks = out["system"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        let message_breaks = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_array()
+                    .and_then(|blocks| blocks.last())
+                    .map(|b| b.get("cache_control").is_some())
+                    .unwrap_or(false)
+            })
+            .count();
+
+        assert_eq!(tool_breaks, 1);
+        assert_eq!(system_breaks, 1);
+        assert_eq!(
+            message_breaks, 2,
+            "only the remaining budget of 2 message breakpoints"
+        );
+        assert!(
+            tool_breaks + system_breaks + message_breaks <= super::MAX_ANTHROPIC_CACHE_BREAKPOINTS
+        );
+    }
+
+    #[test]
+    fn non_summary_messages_do_not_get_cache_control() {
+        let messages = vec![
+            Message::user("Hello"),
+            Message::assistant("Hi there", None),
+            Message::user("How are you?"),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        for msg in out["messages"].as_array().unwrap() {
+            if let Some(blocks) = msg["content"].as_array() {
+                for block in blocks {
+                    assert!(
+                        block.get("cache_control").is_none(),
+                        "non-summary message should not have cache_control"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn consecutive_tool_results_merge_into_single_user_tool_result_message() {
+        let messages = vec![
+            Message::assistant(
+                "calling tools",
+                Some(vec![
+                    ToolCall {
+                        id: "call_1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "search".to_string(),
+                            arguments: r#"{"q":"alpha"}"#.to_string(),
+                        },
+                    },
+                    ToolCall {
+                        id: "call_2".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read".to_string(),
+                            arguments: r#"{"path":"/tmp/x"}"#.to_string(),
+                        },
+                    },
+                ]),
+            ),
+            Message::tool_result("call_1", "alpha"),
+            Message::tool_result("call_2", "beta"),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let built_messages = out["messages"].as_array().expect("messages array");
+        assert_eq!(built_messages.len(), 2);
+        assert_eq!(built_messages[0]["role"], "assistant");
+        assert_eq!(built_messages[1]["role"], "user");
+        let tool_result_blocks = built_messages[1]["content"]
+            .as_array()
+            .expect("content array");
+        assert_eq!(tool_result_blocks.len(), 2);
+        assert_eq!(tool_result_blocks[0]["type"], "tool_result");
+        assert_eq!(tool_result_blocks[0]["tool_use_id"], "call_1");
+        assert_eq!(tool_result_blocks[1]["type"], "tool_result");
+        assert_eq!(tool_result_blocks[1]["tool_use_id"], "call_2");
+    }
+
+    #[test]
+    fn tool_result_coalesces_with_adjacent_user_turn_for_alternation() {
+        // A `Tool` message serializes to a `user` message, so a tool_result
+        // adjacent to another user turn coalesces into ONE user message — Anthropic
+        // requires strict user/assistant alternation and 400s on consecutive
+        // same-role turns (#101). (This particular input is degenerate — a
+        // tool_result with no preceding tool_use — but coalescing is still the
+        // alternation-valid outcome, and the realistic [tool_use, tool_result,
+        // user] case is what this prevents 400-ing.)
+        let messages = vec![
+            Message::user("normal user text"),
+            Message::tool_result("call_1", "OK"),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let built_messages = out["messages"].as_array().expect("messages array");
+        assert_eq!(
+            built_messages.len(),
+            1,
+            "consecutive user-role turns coalesce into one message"
+        );
+        assert_eq!(built_messages[0]["role"], "user");
+        assert_eq!(built_messages[0]["content"][0]["text"], "normal user text");
+        assert_eq!(built_messages[0]["content"][1]["type"], "tool_result");
+        assert_eq!(built_messages[0]["content"][1]["tool_use_id"], "call_1");
+    }
+
+    #[test]
+    fn consecutive_same_role_turns_coalesce_into_strict_alternation() {
+        // The acceptance case (#101): [user, user, assistant, assistant] must
+        // become a strictly alternating [user, assistant] with content concatenated
+        // in order, so Anthropic never 400s on consecutive same-role turns.
+        let messages = vec![
+            Message::user("u1"),
+            Message::user("u2"),
+            Message::assistant("a1", None),
+            Message::assistant("a2", None),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        let built = out["messages"].as_array().expect("messages array");
+
+        assert_eq!(
+            built.len(),
+            2,
+            "two same-role pairs collapse to two messages"
+        );
+        assert_eq!(built[0]["role"], "user");
+        assert_eq!(built[0]["content"][0]["text"], "u1");
+        assert_eq!(built[0]["content"][1]["text"], "u2");
+        assert_eq!(built[1]["role"], "assistant");
+        assert_eq!(built[1]["content"][0]["text"], "a1");
+        assert_eq!(built[1]["content"][1]["text"], "a2");
+
+        // Strict alternation invariant: no two adjacent messages share a role.
+        for pair in built.windows(2) {
+            assert_ne!(
+                pair[0]["role"], pair[1]["role"],
+                "adjacent messages must alternate role"
+            );
+        }
+    }
+
+    #[test]
+    fn assistant_coalesce_drops_interior_thinking_block() {
+        // Two consecutive assistant turns, each carrying reasoning. After
+        // coalescing, the merged turn must keep only ONE leading `thinking` block —
+        // Anthropic rejects a `thinking` block in any non-first position, so the
+        // merged-in turn's thinking is dropped. (#101 invariant: coalescing never
+        // produces an illegal block order, even for the assistant role.)
+        //
+        // This exercises the compat (`thinking_replay_always`) path directly —
+        // see `build_anthropic_request_with_cache_blocks` (#520) — since that's
+        // the only mode that still emits `thinking` blocks from history at all;
+        // the invariant under test (coalescing never produces an illegal block
+        // order) is orthogonal to that replay policy.
+        let messages = vec![
+            Message::assistant_with_reasoning("a1", None, Some("reason one".into())),
+            Message::assistant_with_reasoning("a2", None, Some("reason two".into())),
+        ];
+
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            true,
+        );
+        let built = out["messages"].as_array().expect("messages array");
+        assert_eq!(built.len(), 1, "the two assistant turns coalesced");
+
+        let content = built[0]["content"].as_array().unwrap();
+        let thinking_positions: Vec<usize> = content
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            thinking_positions,
+            vec![0],
+            "exactly one thinking block, in the first position"
+        );
+
+        let texts: Vec<&str> = content
+            .iter()
+            .filter_map(|b| {
+                (b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                    .then(|| b.get("text").and_then(|t| t.as_str()))
+                    .flatten()
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["a1", "a2"],
+            "both turns' text survives the merge"
+        );
+    }
+
+    #[test]
+    fn anthropic_request_preserves_non_system_message_order() {
+        let messages = vec![
+            Message::system("stable system"),
+            Message::user("dynamic context block"),
+            Message::user("conversation turn"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "tool output"),
+            Message::user("latest user turn"),
+        ];
+
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        assert_eq!(out["system"][0]["text"], "stable system");
+        let built_messages = out["messages"].as_array().expect("messages array");
+        // Order is preserved, but consecutive same-role turns coalesce (#101):
+        // the two leading user turns merge; the tool_result (a user message) and the
+        // trailing user turn merge. Result: user / assistant / user, strictly
+        // alternating, with content blocks in original order.
+        assert_eq!(built_messages.len(), 3);
+        assert_eq!(built_messages[0]["role"], "user");
+        assert_eq!(
+            built_messages[0]["content"][0]["text"],
+            "dynamic context block"
+        );
+        assert_eq!(built_messages[0]["content"][1]["text"], "conversation turn");
+        assert_eq!(built_messages[1]["role"], "assistant");
+        assert_eq!(built_messages[1]["content"][0]["text"], "calling tool");
+        assert_eq!(built_messages[2]["role"], "user");
+        assert_eq!(built_messages[2]["content"][0]["type"], "tool_result");
+        assert_eq!(built_messages[2]["content"][0]["tool_use_id"], "call_1");
+        assert_eq!(built_messages[2]["content"][1]["text"], "latest user turn");
+    }
+
+    #[test]
+    fn parallel_tool_calls_true_enables_parallel_tool_use() {
+        let messages = vec![Message::user("Hello")];
+        let tools = sample_tools();
+
+        let out = super::build_anthropic_request(
+            &messages,
+            &tools,
+            "claude-test",
+            64,
+            false,
+            None,
+            Some(true),
+        );
+
+        assert_eq!(out["tool_choice"]["type"], "auto");
+        assert_eq!(out["tool_choice"]["disable_parallel_tool_use"], false);
+    }
+
+    #[test]
+    fn required_tool_choice_uses_anthropic_named_tool_shape() {
+        assert_eq!(
+            super::reasoning_effort_for_required_tool(
+                Some(bamboo_domain::ReasoningEffort::High),
+                Some("load_skill"),
+            ),
+            None
+        );
+        let messages = vec![Message::user("activate")];
+        let tools = sample_tools();
+        let mut body = super::build_anthropic_request(
+            &messages,
+            &tools,
+            "deepseek-v4-pro",
+            8192,
+            false,
+            Some(bamboo_domain::ReasoningEffort::High),
+            Some(false),
+        );
+        assert!(body.get("thinking").is_some(), "test precondition");
+        super::apply_required_tool_choice(&mut body, Some("load_skill"));
+        assert!(
+            body.get("thinking").is_none(),
+            "forced named-tool request must disable thinking"
+        );
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({
+                "type": "tool",
+                "name": "load_skill",
+                "disable_parallel_tool_use": true
+            })
+        );
+    }
+
+    #[test]
+    fn thinking_forced_tool_error_detector_is_exact() {
+        assert!(super::looks_like_thinking_forced_tool_choice_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#,
+        ));
+        assert!(!super::looks_like_thinking_forced_tool_choice_error(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "Thinking mode does not support this tool_choice",
+        ));
+        assert!(!super::looks_like_thinking_forced_tool_choice_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            "tool_choice is invalid for this request",
+        ));
+    }
+
+    #[test]
+    fn thinking_forced_tool_fallback_uses_auto_and_disables_parallel() {
+        let mut body = serde_json::json!({
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "tool_choice": {"type": "tool", "name": "overridden"}
+        });
+        super::apply_required_tool_auto_fallback(&mut body, Some("load_skill"));
+
+        assert!(body.get("thinking").is_none());
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({
+                "type": "auto",
+                "disable_parallel_tool_use": true
+            })
+        );
+    }
+
+    #[test]
+    fn normal_anthropic_request_keeps_configured_thinking() {
+        assert_eq!(
+            super::reasoning_effort_for_required_tool(
+                Some(bamboo_domain::ReasoningEffort::High),
+                None,
+            ),
+            Some(bamboo_domain::ReasoningEffort::High)
+        );
+        let body = super::build_anthropic_request(
+            &[Message::user("answer normally")],
+            &sample_tools(),
+            "deepseek-v4-pro",
+            8192,
+            false,
+            Some(bamboo_domain::ReasoningEffort::High),
+            Some(true),
+        );
+
+        assert!(body.get("thinking").is_some());
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
+    }
+
+    #[test]
+    fn parallel_tool_calls_false_disables_parallel_tool_use() {
+        let messages = vec![Message::user("Hello")];
+        let tools = sample_tools();
+
+        let out = super::build_anthropic_request(
+            &messages,
+            &tools,
+            "claude-test",
+            64,
+            false,
+            None,
+            Some(false),
+        );
+
+        assert_eq!(out["tool_choice"]["type"], "auto");
+        assert_eq!(out["tool_choice"]["disable_parallel_tool_use"], true);
+    }
+}
+
+#[cfg(test)]
+mod anthropic_stream_parse {
+    use crate::types::LLMChunk;
+
+    #[test]
+    fn message_start_is_ignored() {
+        let mut state = super::AnthropicStreamState::default();
+        let data = r#"{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[]}}"#;
+
+        let chunk = super::parse_anthropic_sse_event(&mut state, "message_start", data).unwrap();
+
+        assert!(chunk.is_none());
+    }
+
+    #[test]
+    fn message_stop_yields_done() {
+        let mut state = super::AnthropicStreamState::default();
+        let data = r#"{"type":"message_stop"}"#;
+
+        let chunk = super::parse_anthropic_sse_event(&mut state, "message_stop", data)
+            .unwrap()
+            .expect("chunk");
+
+        match chunk {
+            LLMChunk::Done => {}
+            other => panic!("expected LLMChunk::Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_delta_yields_token() {
+        let mut state = super::AnthropicStreamState::default();
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
+
+        let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_delta", data)
+            .unwrap()
+            .expect("chunk");
+
+        match chunk {
+            LLMChunk::Token(token) => assert_eq!(token, "Hello"),
+            other => panic!("expected LLMChunk::Token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_use_start_and_input_json_delta_yield_tool_call_parts() {
+        let mut state = super::AnthropicStreamState::default();
+
+        let start = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"search","input":{}}}"#;
+        let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_start", start)
+            .unwrap()
+            .expect("chunk");
+
+        match chunk {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "toolu_1");
+                assert_eq!(calls[0].function.name, "search");
+                assert!(calls[0].function.arguments.is_empty());
+            }
+            other => panic!("expected LLMChunk::ToolCalls, got {other:?}"),
+        }
+
+        let delta1 = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"te"}}"#;
+        let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_delta", delta1)
+            .unwrap()
+            .expect("chunk");
+
+        match chunk {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "toolu_1");
+                assert_eq!(calls[0].function.name, "search");
+                assert_eq!(calls[0].function.arguments, r#"{"q":"te"#);
+            }
+            other => panic!("expected LLMChunk::ToolCalls, got {other:?}"),
+        }
+
+        let delta2 = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"st\"}"}}"#;
+        let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_delta", delta2)
+            .unwrap()
+            .expect("chunk");
+
+        match chunk {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "toolu_1");
+                assert_eq!(calls[0].function.name, "search");
+                assert_eq!(calls[0].function.arguments, "st\"}");
+            }
+            other => panic!("expected LLMChunk::ToolCalls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_data_returns_none() {
+        let mut state = super::AnthropicStreamState::default();
+        let chunk = super::parse_anthropic_sse_event(&mut state, "", "").unwrap();
+        assert!(chunk.is_none());
+    }
+
+    #[test]
+    fn invalid_json_returns_error() {
+        let mut state = super::AnthropicStreamState::default();
+        let result =
+            super::parse_anthropic_sse_event(&mut state, "content_block_delta", "{invalid}");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn unknown_event_type_returns_none() {
+        let mut state = super::AnthropicStreamState::default();
+        let data = r#"{"type":"unknown_event"}"#;
+        let chunk = super::parse_anthropic_sse_event(&mut state, "unknown_event", data).unwrap();
+        assert!(chunk.is_none());
+    }
+
+    #[test]
+    fn text_delta_with_empty_text_returns_empty_token() {
+        let mut state = super::AnthropicStreamState::default();
+        let data =
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}"#;
+
+        let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_delta", data)
+            .unwrap()
+            .expect("chunk");
+
+        match chunk {
+            LLMChunk::Token(token) => assert!(token.is_empty()),
+            other => panic!("expected LLMChunk::Token, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_tool_uses_tracked_independently() {
+        let mut state = super::AnthropicStreamState::default();
+
+        // First tool
+        let start1 = r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"search","input":{}}}"#;
+        let chunk1 = super::parse_anthropic_sse_event(&mut state, "content_block_start", start1)
+            .unwrap()
+            .expect("chunk1");
+
+        match chunk1 {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls[0].id, "toolu_1");
+                assert_eq!(calls[0].function.name, "search");
+            }
+            other => panic!("expected LLMChunk::ToolCalls, got {other:?}"),
+        }
+
+        // Second tool
+        let start2 = r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_2","name":"read","input":{}}}"#;
+        let chunk2 = super::parse_anthropic_sse_event(&mut state, "content_block_start", start2)
+            .unwrap()
+            .expect("chunk2");
+
+        match chunk2 {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls[0].id, "toolu_2");
+                assert_eq!(calls[0].function.name, "read");
+            }
+            other => panic!("expected LLMChunk::ToolCalls, got {other:?}"),
+        }
+
+        // Delta for first tool
+        let delta1 = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"test\"}"}}"#;
+        let chunk3 = super::parse_anthropic_sse_event(&mut state, "content_block_delta", delta1)
+            .unwrap()
+            .expect("chunk3");
+
+        match chunk3 {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls[0].id, "toolu_1");
+                assert_eq!(calls[0].function.name, "search");
+                assert_eq!(calls[0].function.arguments, r#"{"q":"test"}"#);
+            }
+            other => panic!("expected LLMChunk::ToolCalls, got {other:?}"),
+        }
+
+        // Delta for second tool
+        let delta2 = r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file\":\"test.txt\"}"}}"#;
+        let chunk4 = super::parse_anthropic_sse_event(&mut state, "content_block_delta", delta2)
+            .unwrap()
+            .expect("chunk4");
+
+        match chunk4 {
+            LLMChunk::ToolCalls(calls) => {
+                assert_eq!(calls[0].id, "toolu_2");
+                assert_eq!(calls[0].function.name, "read");
+                assert_eq!(calls[0].function.arguments, r#"{"file":"test.txt"}"#);
+            }
+            other => panic!("expected LLMChunk::ToolCalls, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn content_block_start_without_tool_use_returns_none() {
+        let mut state = super::AnthropicStreamState::default();
+        let data = r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"Hello"}}"#;
+
+        let chunk =
+            super::parse_anthropic_sse_event(&mut state, "content_block_start", data).unwrap();
+        assert!(chunk.is_none());
+    }
+
+    #[test]
+    fn input_json_delta_without_prior_tool_start_is_skipped_not_aborted() {
+        // #237: an input_json_delta for an index never announced via
+        // content_block_start (common with Anthropic→OpenAI aggregators) must be
+        // SKIPPED, not turned into a stream error that discards the whole
+        // already-streamed assistant turn.
+        let mut state = super::AnthropicStreamState::default();
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"q\":\"test\"}"}}"#;
+
+        let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_delta", data)
+            .expect("benign deviation must not abort the stream");
+        assert!(chunk.is_none(), "unannounced input_json_delta is skipped");
+    }
+
+    #[test]
+    fn malformed_content_block_start_events_are_skipped_not_aborted() {
+        // Missing index, missing content_block, and tool_use missing id/name all
+        // skip (Ok(None)) rather than erroring out the stream. (#237)
+        for data in [
+            r#"{"type":"content_block_start","content_block":{"type":"text"}}"#, // no index
+            r#"{"type":"content_block_start","index":0}"#,                       // no content_block
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"x"}}"#, // no id
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1"}}"#, // no name
+        ] {
+            let mut state = super::AnthropicStreamState::default();
+            let chunk = super::parse_anthropic_sse_event(&mut state, "content_block_start", data)
+                .unwrap_or_else(|e| panic!("must not abort on: {data} (got {e:?})"));
+            assert!(
+                chunk.is_none(),
+                "malformed content_block_start skipped: {data}"
+            );
+        }
+    }
+
+    /// Drive one SSE event and return the parsed chunk (panicking on error).
+    fn drive(state: &mut super::AnthropicStreamState, event: &str, data: &str) -> Option<LLMChunk> {
+        super::parse_anthropic_sse_event(state, event, data).expect("event parses")
+    }
+
+    /// #520: a single thinking block's `signature_delta` is captured and
+    /// surfaced as `ReasoningSignature` when the block closes, alongside the
+    /// streamed reasoning text.
+    #[test]
+    fn single_thinking_block_signature_is_captured_and_emitted_on_block_stop() {
+        let mut state = super::AnthropicStreamState::default();
+        assert!(drive(
+            &mut state,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        )
+        .is_none());
+        match drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think."}}"#,
+        ) {
+            Some(LLMChunk::ReasoningToken(text)) => assert_eq!(text, "Let me think."),
+            other => panic!("expected reasoning token, got {other:?}"),
+        }
+        assert!(drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_xyz"}}"#,
+        )
+        .is_none());
+        match drive(
+            &mut state,
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ) {
+            Some(LLMChunk::ReasoningSignature(signature)) => assert_eq!(signature, "sig_xyz"),
+            other => panic!("expected reasoning signature, got {other:?}"),
+        }
+    }
+
+    /// A second thinking block makes the accumulated reasoning text span two
+    /// blocks, so no single signature covers it: the already-emitted signature
+    /// is retracted with the empty-string invalidation marker and the second
+    /// block's stop emits nothing.
+    #[test]
+    fn second_thinking_block_retracts_the_emitted_signature() {
+        let mut state = super::AnthropicStreamState::default();
+        drive(
+            &mut state,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        );
+        drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_first"}}"#,
+        );
+        match drive(
+            &mut state,
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ) {
+            Some(LLMChunk::ReasoningSignature(signature)) => assert_eq!(signature, "sig_first"),
+            other => panic!("expected first signature, got {other:?}"),
+        }
+
+        match drive(
+            &mut state,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"thinking","thinking":""}}"#,
+        ) {
+            Some(LLMChunk::ReasoningSignature(signature)) => {
+                assert!(
+                    signature.is_empty(),
+                    "second block retracts via empty marker"
+                )
+            }
+            other => panic!("expected invalidation marker, got {other:?}"),
+        }
+        assert!(
+            drive(
+                &mut state,
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":2}"#,
+            )
+            .is_none(),
+            "no signature is re-emitted for a multi-block turn"
+        );
+    }
+
+    /// `redacted_thinking` content is encrypted and not represented in
+    /// `Message.reasoning`, so a turn containing one never emits a signature.
+    #[test]
+    fn redacted_thinking_block_never_emits_a_signature() {
+        let mut state = super::AnthropicStreamState::default();
+        drive(
+            &mut state,
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque"}}"#,
+        );
+        drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_redacted"}}"#,
+        );
+        assert!(
+            drive(
+                &mut state,
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":0}"#,
+            )
+            .is_none(),
+            "a redacted turn's signature must not be surfaced"
+        );
+    }
+
+    /// A signature for a block index that was never announced as thinking is
+    /// ignored (aggregator deviations must not fabricate a signature).
+    #[test]
+    fn signature_delta_for_unannounced_index_is_ignored() {
+        let mut state = super::AnthropicStreamState::default();
+        drive(
+            &mut state,
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":5,"delta":{"type":"signature_delta","signature":"sig_stray"}}"#,
+        );
+        assert!(
+            drive(
+                &mut state,
+                "content_block_stop",
+                r#"{"type":"content_block_stop","index":5}"#,
+            )
+            .is_none(),
+            "stray signature_delta must not produce a chunk"
+        );
+    }
+}
+
+#[cfg(test)]
+mod anthropic_request_building_edge_cases {
+    use bamboo_domain::Message;
+
+    #[test]
+    fn empty_messages_list() {
+        let messages: Vec<Message> = vec![];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        assert!(out["system"].is_null());
+        assert_eq!(out["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn only_system_messages() {
+        let messages = vec![Message::system("Be helpful")];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let system = out["system"].as_array().expect("system should be blocks");
+        assert_eq!(system[0]["text"], "Be helpful");
+        assert_eq!(out["messages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn multiple_system_messages_joined() {
+        let messages = vec![
+            Message::system("Be helpful"),
+            Message::system("Be concise"),
+            Message::system("Be safe"),
+        ];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let system = out["system"].as_array().expect("system should be blocks");
+        assert_eq!(system[0]["text"], "Be helpful\n\nBe concise\n\nBe safe");
+    }
+
+    #[test]
+    fn assistant_message_with_both_content_and_tool_calls() {
+        use bamboo_domain::{FunctionCall, ToolCall};
+
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"test"}"#.to_string(),
+            },
+        };
+
+        let messages = vec![Message::assistant(
+            "Let me search for that.",
+            Some(vec![tool_call]),
+        )];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        assert_eq!(out["messages"][0]["role"], "assistant");
+        assert_eq!(out["messages"][0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(out["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(
+            out["messages"][0]["content"][0]["text"],
+            "Let me search for that."
+        );
+        assert_eq!(out["messages"][0]["content"][1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn tool_call_with_invalid_json_arguments_falls_back_to_object() {
+        use bamboo_domain::{FunctionCall, ToolCall};
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: "not valid json".to_string(),
+            },
+        };
+
+        let messages = vec![Message::assistant("", Some(vec![tool_call]))];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        // Invalid JSON must fall back to an OBJECT, not a bare string: Anthropic
+        // requires `tool_use.input` to be an object and 400s a string input,
+        // which would then poison every subsequent request in the session.
+        let input = &out["messages"][0]["content"][0]["input"];
+        assert!(input.is_object(), "input must be an object, got {input}");
+        assert_eq!(input["_raw"], "not valid json");
+    }
+
+    #[test]
+    fn stream_parameter_set_correctly() {
+        let messages = vec![Message::user("Hello")];
+
+        let out_stream_true =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, true, None, None);
+        assert_eq!(out_stream_true["stream"], true);
+
+        let out_stream_false =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+        assert_eq!(out_stream_false["stream"], false);
+    }
+
+    #[test]
+    fn max_tokens_included_in_request() {
+        let messages = vec![Message::user("Hello")];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 2048, false, None, None);
+
+        assert_eq!(out["max_tokens"], 2048);
+    }
+
+    /// Issue #520: by default (real Anthropic, `thinking_replay_always = false`)
+    /// a `thinking` block is NEVER replayed from history, even when the current
+    /// request has thinking enabled and the reasoning text is non-empty — bamboo
+    /// never captures the signature Anthropic requires on a replayed `thinking`
+    /// block, so sending one back unconditionally 400s. This is the direct
+    /// regression test for root cause 1's "pure-Anthropic multi-round" variant.
+    #[test]
+    fn assistant_reasoning_omitted_by_default_even_with_thinking_enabled() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false, // thinking_replay_always = false: the real-Anthropic default
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content.len(),
+            1,
+            "no thinking block is replayed without a captured signature"
+        );
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Here is the answer.");
+    }
+
+    /// Issue #520's named repro: history containing reasoning minted by a
+    /// DIFFERENT provider (e.g. a GPT Responses reasoning summary, persisted
+    /// into the same `Message.reasoning` field bamboo uses for every provider)
+    /// must never be replayed as an Anthropic `thinking` block after a
+    /// mid-session model switch to Claude — that block would carry text
+    /// Anthropic never signed, and real Anthropic 400s on it.
+    #[test]
+    fn foreign_reasoning_never_replayed_as_thinking_block_after_provider_switch() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Done reading the repo.",
+            None,
+            Some("GPT's own reasoning summary text.".to_string()),
+        )];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert!(
+            content
+                .iter()
+                .all(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking")),
+            "foreign reasoning must never surface as a `thinking` block: {content:?}"
+        );
+    }
+
+    /// Compat upstreams (e.g. GLM's anthropic-compat endpoint) require the
+    /// `thinking` block to be present unconditionally and don't validate its
+    /// signature — `thinking_replay_always = true` preserves that legacy
+    /// behavior for them.
+    #[test]
+    fn assistant_reasoning_included_as_thinking_block_in_compat_mode() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            true, // thinking_replay_always = true: compat mode
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        // Thinking block must come first
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "I thought about it.");
+        // Followed by the text block
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "Here is the answer.");
+    }
+
+    #[test]
+    fn assistant_reasoning_included_with_tool_calls_in_compat_mode() {
+        use bamboo_domain::{FunctionCall, ToolCall};
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "search".to_string(),
+                arguments: r#"{"q":"test"}"#.to_string(),
+            },
+        };
+        let messages = vec![Message::assistant_with_reasoning(
+            "",
+            Some(vec![tool_call]),
+            Some("Planning the search.".to_string()),
+        )];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            true, // thinking_replay_always = true: compat mode
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        // Thinking block first
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "Planning the search.");
+        // Tool use block second (no text because content is empty)
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    /// Even in compat mode, a thinking block must never be sent when the
+    /// CURRENT request has thinking disabled — Anthropic (and Anthropic-style
+    /// upstreams) reject a thinking block in that case too (#520).
+    #[test]
+    fn assistant_reasoning_omitted_in_compat_mode_when_thinking_disabled() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-test",
+            64,
+            false,
+            None, // reasoning_effort = None -> thinking disabled for this request
+            None,
+            None,
+            true, // thinking_replay_always = true
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content.len(),
+            1,
+            "thinking disabled for this request always wins over compat mode"
+        );
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn assistant_empty_reasoning_omits_thinking_block() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Hello",
+            None,
+            Some(String::new()),
+        )];
+        let out =
+            super::build_anthropic_request(&messages, &[], "claude-test", 64, false, None, None);
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        // Only text block, no thinking block for empty reasoning
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    #[test]
+    fn model_included_in_request() {
+        let messages = vec![Message::user("Hello")];
+        let out = super::build_anthropic_request(
+            &messages,
+            &[],
+            "claude-3-opus-20240229",
+            64,
+            false,
+            None,
+            None,
+        );
+
+        assert_eq!(out["model"], "claude-3-opus-20240229");
+    }
+
+    /// #520 follow-up: a turn whose thinking was captured WITH its
+    /// provider-minted signature is replayed as a fully signed `thinking`
+    /// block — this is what keeps pure-Claude extended-thinking tool loops
+    /// working under the signed-only default.
+    #[test]
+    fn signed_reasoning_replayed_as_signed_thinking_block() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )
+        .with_reasoning_signature(Some("sig_abc123".to_string()))];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false, // signed-only default: the signature makes it replayable
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "I thought about it.");
+        assert_eq!(content[0]["signature"], "sig_abc123");
+        assert_eq!(content[1]["type"], "text");
+    }
+
+    /// A signed block must still never be sent when the CURRENT request has
+    /// thinking disabled — Anthropic rejects thinking blocks in that case.
+    #[test]
+    fn signed_reasoning_omitted_when_thinking_disabled() {
+        let messages = vec![Message::assistant_with_reasoning(
+            "Here is the answer.",
+            None,
+            Some("I thought about it.".to_string()),
+        )
+        .with_reasoning_signature(Some("sig_abc123".to_string()))];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-fable-5",
+            64,
+            false,
+            None, // thinking disabled for this request
+            None,
+            None,
+            false,
+        );
+
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+    }
+
+    fn tool_loop_messages(signature: Option<&str>) -> Vec<Message> {
+        use bamboo_domain::{FunctionCall, ToolCall};
+        vec![
+            Message::user("run a tool"),
+            Message::assistant_with_reasoning(
+                "",
+                Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "search".to_string(),
+                        arguments: r#"{"q":"test"}"#.to_string(),
+                    },
+                }]),
+                Some("Planning the search.".to_string()),
+            )
+            .with_reasoning_signature(signature.map(str::to_string)),
+            Message::tool_result("call_1", r#"{"ok":true}"#),
+        ]
+    }
+
+    /// #520 thinking-downgrade guard: submitting tool_results for a final
+    /// assistant tool_use turn that has NO signed thinking block (e.g. it was
+    /// minted by GPT before a mid-session switch to Claude) must DISABLE
+    /// thinking for the request — with thinking on, real Anthropic 400s
+    /// ("Expected `thinking` or `redacted_thinking`, but found `tool_use`").
+    #[test]
+    fn thinking_downgraded_when_final_tool_turn_has_no_signed_thinking() {
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &tool_loop_messages(None),
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+        );
+
+        assert!(
+            out.get("thinking").is_none(),
+            "thinking must be downgraded for an unsigned final tool_use turn: {out}"
+        );
+        // And no unsigned thinking block leaks into the turn either.
+        let content = out["messages"][1]["content"].as_array().unwrap();
+        assert!(content
+            .iter()
+            .all(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking")));
+    }
+
+    /// With the signature captured, the same tool loop keeps thinking enabled
+    /// and replays the signed block — no downgrade.
+    #[test]
+    fn thinking_kept_when_final_tool_turn_has_signed_thinking() {
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &tool_loop_messages(Some("sig_tool_turn")),
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(out["thinking"]["type"], "enabled");
+        let content = out["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["signature"], "sig_tool_turn");
+        assert_eq!(content[1]["type"], "tool_use");
+    }
+
+    /// Compat upstreams (`thinking_replay_always`) replay the unsigned block,
+    /// which satisfies their presence requirement — no downgrade there.
+    #[test]
+    fn thinking_kept_in_compat_mode_even_without_signature() {
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &tool_loop_messages(None),
+            &[],
+            &[],
+            "glm-x",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            true, // compat mode
+        );
+
+        assert_eq!(out["thinking"]["type"], "enabled");
+        let content = out["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "thinking");
+        assert!(content[0].get("signature").is_none());
+    }
+
+    /// The guard only bites when tool_results are actually being submitted:
+    /// a plain conversation continuing past a final ANSWER turn (no tool_use)
+    /// keeps thinking enabled even though history has unsigned reasoning.
+    #[test]
+    fn thinking_kept_when_final_assistant_turn_has_no_tool_use() {
+        let messages = vec![
+            Message::user("hello"),
+            Message::assistant_with_reasoning(
+                "Answer.",
+                None,
+                Some("Foreign reasoning.".to_string()),
+            ),
+            Message::user("follow-up question"),
+        ];
+        let out = super::build_anthropic_request_with_cache_blocks(
+            &messages,
+            &[],
+            &[],
+            "claude-fable-5",
+            2048,
+            false,
+            Some(bamboo_domain::ReasoningEffort::Medium),
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(out["thinking"]["type"], "enabled");
+    }
+}
+
+#[cfg(test)]
+mod anthropic_provider_tests {
+    use super::*;
+    use bamboo_domain::{FunctionSchema, ToolSchema};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    const THINKING_TOOL_CHOICE_ERROR: &str =
+        r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#;
+    const ANTHROPIC_SSE_OK: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    struct ThinkingToolChoiceResponder;
+
+    impl Respond for ThinkingToolChoiceResponder {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: Value = serde_json::from_slice(&request.body).expect("JSON request body");
+            if body["tool_choice"]["type"] == "tool" {
+                ResponseTemplate::new(400).set_body_string(THINKING_TOOL_CHOICE_ERROR)
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK)
+            }
+        }
+    }
+
+    fn load_skill_tool() -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".to_string(),
+            function: FunctionSchema {
+                name: "load_skill".to_string(),
+                description: "Load one skill".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn progressive_loading_requires_official_endpoint_supported_model_and_no_required_tool() {
+        let provider = AnthropicProvider::new("test-key");
+        for model in [
+            "claude-fable-5",
+            "claude-mythos-5-20260830",
+            "claude-opus-5",
+            "claude-opus-4-8-20260830",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-haiku-4-5",
+        ] {
+            assert_eq!(
+                provider.capability_loading_mode(model, None).await,
+                CapabilityLoadingMode::Progressive,
+                "{model}"
+            );
+        }
+        for model in [
+            "claude-opus-4-1",
+            "claude-sonnet-4-0",
+            "claude-sonnet-4-50",
+            "unknown-model",
+        ] {
+            assert_eq!(
+                provider.capability_loading_mode(model, None).await,
+                CapabilityLoadingMode::LegacyFullCatalog,
+                "{model}"
+            );
+        }
+        assert_eq!(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", Some("load_skill"))
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+        assert_eq!(
+            AnthropicProvider::new("test-key")
+                .with_base_url("https://compatible.example/v1")
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+            CapabilityLoadingMode::LegacyFullCatalog
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_selected_mode_controls_deferred_catalog_shape() {
+        let provider = AnthropicProvider::new("test-key");
+        let tools = vec![
+            ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: "Read".to_string(),
+                    description: String::new(),
+                    parameters: json!({"type":"object"}),
+                },
+            },
+            load_skill_tool(),
+        ];
+        let render = |mode| {
+            build_anthropic_request_with_cache_blocks_native_mode(
+                &[Message::user("inspect")],
+                &[],
+                &tools,
+                "claude-sonnet-4-6",
+                4096,
+                true,
+                None,
+                None,
+                None,
+                false,
+                &[],
+                mode,
+            )
+        };
+
+        let progressive = render(
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+        );
+        assert_eq!(progressive["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(progressive["tools"][0]["name"], "Read");
+        assert_eq!(progressive["tools"][1]["defer_loading"], true);
+        assert_eq!(progressive["tools"][2]["type"], ANTHROPIC_TOOL_SEARCH_TYPE);
+
+        for mode in [
+            provider
+                .capability_loading_mode("claude-opus-4-1", None)
+                .await,
+            provider
+                .capability_loading_mode("claude-sonnet-4-6", Some("load_skill"))
+                .await,
+            AnthropicProvider::new("test-key")
+                .with_base_url("https://compatible.example/v1")
+                .capability_loading_mode("claude-sonnet-4-6", None)
+                .await,
+        ] {
+            let legacy = render(mode);
+            assert_eq!(legacy["tools"].as_array().unwrap().len(), 2);
+            assert!(legacy.to_string().find("defer_loading").is_none());
+            assert!(legacy
+                .to_string()
+                .find(ANTHROPIC_TOOL_SEARCH_TYPE)
+                .is_none());
+        }
+    }
+
+    fn unsigned_tool_loop_messages() -> Vec<Message> {
+        vec![
+            Message::user("run a tool"),
+            Message::assistant_with_reasoning(
+                "",
+                Some(vec![bamboo_domain::ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: bamboo_domain::FunctionCall {
+                        name: "search".to_string(),
+                        arguments: r#"{"q":"test"}"#.to_string(),
+                    },
+                }]),
+                Some("Foreign unsigned reasoning.".to_string()),
+            ),
+            Message::tool_result("call_1", r#"{"ok":true}"#),
+        ]
+    }
+
+    #[tokio::test]
+    async fn forced_named_tool_retries_exact_thinking_error_with_auto_choice() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(ThinkingToolChoiceResponder)
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_reasoning_effort(Some(ReasoningEffort::High));
+        let tools = vec![load_skill_tool()];
+        let options = LLMRequestOptions {
+            required_tool: Some("load_skill".to_string()),
+            parallel_tool_calls: Some(false),
+            ..Default::default()
+        };
+
+        let _stream = provider
+            .chat_stream_with_options(
+                &[Message::user("activate")],
+                &tools,
+                Some(8192),
+                "deepseek-v4-pro",
+                Some(&options),
+            )
+            .await
+            .expect("exact incompatibility should retry with auto choice");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 2);
+        let named: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let fallback: Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(named.get("thinking").is_none());
+        assert_eq!(named["tool_choice"]["type"], "tool");
+        assert_eq!(named["tool_choice"]["name"], "load_skill");
+        assert!(fallback.get("thinking").is_none());
+        assert_eq!(fallback["tool_choice"]["type"], "auto");
+        assert_eq!(fallback["tool_choice"]["disable_parallel_tool_use"], true);
+        assert_eq!(fallback["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(fallback["tools"][0]["name"], "load_skill");
+    }
+
+    #[tokio::test]
+    async fn unsigned_tool_turn_disables_max_before_small_budget_validation() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(ANTHROPIC_SSE_OK),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_reasoning_effort(Some(ReasoningEffort::Max));
+
+        let _stream = provider
+            .chat_stream(
+                &unsigned_tool_loop_messages(),
+                &[],
+                Some(2_048),
+                "claude-sonnet-4-5",
+            )
+            .await
+            .expect("unsigned tool turn should disable thinking before Max validation");
+
+        let requests = server.received_requests().await.expect("requests recorded");
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], 2_048);
+    }
+
+    #[tokio::test]
+    async fn compat_replay_keeps_max_small_budget_validation_enabled() {
+        let server = MockServer::start().await;
+        let provider = AnthropicProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_reasoning_effort(Some(ReasoningEffort::Max))
+            .with_thinking_replay_always(true);
+
+        let result = provider
+            .chat_stream(
+                &unsigned_tool_loop_messages(),
+                &[],
+                Some(2_048),
+                "glm-compatible",
+            )
+            .await;
+
+        match result {
+            Err(LLMError::Api(message)) => {
+                assert!(message.contains("requires max_output_tokens of at least 2049"));
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("compat replay still requires a valid Max thinking budget"),
+        }
+        assert!(server
+            .received_requests()
+            .await
+            .expect("requests recorded")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_new_provider() {
+        let provider = AnthropicProvider::new("test_api_key");
+        assert_eq!(provider.api_key, "test_api_key");
+        assert_eq!(provider.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(provider.max_tokens, 1024);
+    }
+
+    #[test]
+    fn test_with_base_url() {
+        let provider =
+            AnthropicProvider::new("test_key").with_base_url("https://custom.anthropic.com");
+        assert_eq!(provider.base_url, "https://custom.anthropic.com");
+    }
+
+    #[test]
+    fn test_with_max_tokens() {
+        let provider = AnthropicProvider::new("test_key").with_max_tokens(2048);
+        assert_eq!(provider.max_tokens, 2048);
+    }
+
+    #[test]
+    fn test_chained_builders() {
+        let provider = AnthropicProvider::new("test_key")
+            .with_base_url("https://custom.api.com")
+            .with_max_tokens(4096);
+
+        assert_eq!(provider.api_key, "test_key");
+        assert_eq!(provider.base_url, "https://custom.api.com");
+        assert_eq!(provider.max_tokens, 4096);
+    }
+
+    #[test]
+    fn test_request_headers() {
+        let provider = AnthropicProvider::new("test_key");
+        let headers = provider
+            .build_headers(request_overrides::ENDPOINT_MESSAGES, Some("claude-test"))
+            .unwrap();
+
+        assert!(headers.contains_key("x-api-key"));
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "test_key"
+        );
+
+        assert!(headers.contains_key("anthropic-version"));
+        assert_eq!(
+            headers.get("anthropic-version").unwrap().to_str().unwrap(),
+            "2023-06-01"
+        );
+
+        assert!(headers.contains_key("content-type"));
+        assert_eq!(
+            headers.get("content-type").unwrap().to_str().unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_headers_with_invalid_api_key() {
+        // Test that headers with non-ASCII characters in API key fail
+        let provider = AnthropicProvider::new("test\u{0000}key"); // null byte
+        let result = provider.build_headers(request_overrides::ENDPOINT_MESSAGES, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_default_values() {
+        let provider = AnthropicProvider::new("key");
+
+        assert_eq!(provider.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(provider.max_tokens, 1024);
+    }
+
+    #[test]
+    fn test_error_response_handling() {
+        // Test error event parsing
+        let mut state = AnthropicStreamState::default();
+        let error_data =
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+
+        let result = parse_anthropic_sse_event(&mut state, "error", error_data);
+        assert!(result.is_err());
+
+        match result {
+            Err(LLMError::Api(msg)) => {
+                assert!(msg.contains("Anthropic error event"));
+            }
+            _ => panic!("Expected LLMError::Api"),
+        }
+    }
+
+    // ========== MODEL REQUIREMENT ARCHITECTURE TESTS ==========
+    // These tests ensure the design principle:
+    // "Provider must not have a default model field or with_model() method"
+
+    /// Test: AnthropicProvider does NOT have a model field
+    #[test]
+    fn anthropic_provider_has_no_model_field() {
+        // This test documents the provider structure:
+        // pub struct AnthropicProvider {
+        //     client: Client,
+        //     api_key: String,
+        //     base_url: String,
+        //     max_tokens: u32,
+        //     // NO model field!
+        // }
+        //
+        // If someone adds a model field, this test should be updated
+        // to reflect the architecture change.
+        let provider = AnthropicProvider::new("test_key");
+        // Verify we can access known fields
+        assert_eq!(provider.api_key, "test_key");
+        assert_eq!(provider.base_url, "https://api.anthropic.com/v1");
+        assert_eq!(provider.max_tokens, 1024);
+        // There is NO provider.model field to access
+    }
+
+    /// Test: AnthropicProvider does NOT have with_model() method
+    #[test]
+    fn anthropic_provider_has_no_with_model_method() {
+        let provider = AnthropicProvider::new("test_key");
+
+        // Available builder methods:
+        let provider = provider
+            .with_base_url("https://custom.api.com")
+            .with_max_tokens(2048);
+
+        // There is NO .with_model("gpt-4") method
+        // Model is passed to chat_stream() as a parameter
+
+        assert_eq!(provider.base_url, "https://custom.api.com");
+        assert_eq!(provider.max_tokens, 2048);
+    }
+}

@@ -1,0 +1,19 @@
+# Clippy configuration
+
+# Allow deprecated items for backward compatibility with legacy endpoints
+# This is intentional - we maintain deprecated endpoints for existing users
+#
+# Specific deprecated items:
+# - agent::stream::handler - Legacy /stream endpoint, replaced by /execute + /events
+# - BambooConfig - Legacy config format, replaced by core::Config
+
+# Keep version-aware lints aligned with the workspace's declared MSRV.
+msrv = "1.95"
+
+# Allow doc over-indentation (pre-existing style)
+doc-valid-idents = []
+
+# Avoid warnings for:
+# - module_inception (server::server)
+# - incompatible_msrv (is_none_or, Error::other)
+# - doc_overindented_list_items

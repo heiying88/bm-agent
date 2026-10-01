@@ -1,0 +1,1790 @@
+use super::validation::is_safe_workflow_name;
+
+async fn builtin_selection(
+    store: &bamboo_skills::SkillStore,
+    workflow_id: &str,
+) -> bamboo_skills::WorkflowCatalogEntry {
+    store.reload().await.expect("reload builtin catalog");
+    let (skills, workflows) = store.command_catalog_snapshots().await;
+    skills
+        .entries
+        .into_iter()
+        .chain(workflows.entries)
+        .find(|entry| {
+            entry.id == workflow_id
+                && entry.winner
+                && entry.source == bamboo_skills::WorkflowSource::Builtin
+                && entry.status == bamboo_skills::WorkflowStatus::Valid
+        })
+        .expect("exact builtin winner")
+}
+
+const MAX_LEGACY_FAILURE_BODY_BYTES: usize = 2 * 1024;
+
+/// Preserve the endpoint's actual status and response body when a success
+/// assertion fails without allowing an unexpectedly large or unescaped body to
+/// flood CI logs. This endpoint and its synthetic fixture carry no credentials.
+async fn assert_legacy_endpoint_success(context: &str, response: actix_web::dev::ServiceResponse) {
+    let status = response.status();
+    if status.is_success() {
+        return;
+    }
+
+    let body = actix_web::test::read_body(response).await;
+    let visible_len = body.len().min(MAX_LEGACY_FAILURE_BODY_BYTES);
+    let visible = String::from_utf8_lossy(&body[..visible_len]);
+    let truncated = if body.len() > visible_len {
+        " <truncated>"
+    } else {
+        ""
+    };
+    panic!("{context} failed: status={status}, body={visible:?}{truncated}");
+}
+
+#[actix_web::test]
+async fn workflow_catalog_unifies_metadata_without_exposing_bodies_or_paths() {
+    let data = tempfile::tempdir().expect("data dir");
+    let skill = data.path().join("skills/review");
+    tokio::fs::create_dir_all(&skill).await.expect("skill dir");
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Reviews changes\n---\nTOP SECRET INSTRUCTIONS\n",
+    )
+    .await
+    .expect("skill");
+    let workflow = data.path().join("skills/deploy");
+    tokio::fs::create_dir_all(&workflow)
+        .await
+        .expect("workflow dir");
+    tokio::fs::write(
+        workflow.join("SKILL.md"),
+        "---\nname: deploy\ndescription: Deploys changes\n---\nWORKFLOW SECRET BODY\n",
+    )
+    .await
+    .expect("workflow skill");
+    tokio::fs::write(
+        workflow.join("workflow.yaml"),
+        "id: deploy\nname: Deploy\ndescription: Deploys changes\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .await
+    .expect("workflow metadata");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog",
+        actix_web::web::get().to(super::list_workflow_catalog),
+    ))
+    .await;
+    let request = actix_web::test::TestRequest::get()
+        .uri("/catalog")
+        .to_request();
+    let body = actix_web::test::call_and_read_body(&app, request).await;
+    let text = std::str::from_utf8(&body).expect("utf8 response");
+    assert!(text.contains("Reviews changes"));
+    assert!(text.contains("\"kind\":\"instruction\""));
+    assert!(text.contains("Deploys changes"));
+    assert!(text.contains("\"kind\":\"orchestration\""));
+    assert!(text.contains("\"revision\""));
+    assert!(!text.contains("TOP SECRET INSTRUCTIONS"));
+    assert!(!text.contains("WORKFLOW SECRET BODY"));
+    assert!(!text.contains("SKILL.md"));
+
+    let initial: serde_json::Value = serde_json::from_slice(&body).expect("catalog json");
+    let entries = initial["entries"].as_array().expect("catalog entries");
+    let review = entries
+        .iter()
+        .find(|entry| entry["id"] == "review")
+        .expect("instruction entry");
+    assert_eq!(review["source"], "user");
+    assert_eq!(review["status"], "valid");
+    assert!(review["shadowed_candidates"]
+        .as_array()
+        .expect("safe shadow diagnostics")
+        .iter()
+        .any(|candidate| candidate["source"] == "builtin"));
+    let deploy = entries
+        .iter()
+        .find(|entry| entry["id"] == "deploy")
+        .expect("orchestration entry");
+    assert_eq!(deploy["status"], "valid");
+
+    const PRIVATE_INVALID_FIELD: &str = "private_invalid_catalog_field";
+    const PRIVATE_INVALID_BODY: &str = "PRIVATE INVALID REPLACEMENT BODY";
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        format!(
+            "---\nname: review\ndescription: changed too early\n{PRIVATE_INVALID_FIELD}: secret\n---\n{PRIVATE_INVALID_BODY}\n"
+        ),
+    )
+    .await
+    .expect("break instruction bundle");
+    state
+        .skill_manager
+        .store()
+        .reload_global_workflow_views()
+        .await
+        .expect("invalid publication stays isolated");
+    let invalid: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    let invalid_entries = invalid["entries"].as_array().expect("invalid entries");
+    let invalid_review = invalid_entries
+        .iter()
+        .find(|entry| entry["id"] == "review")
+        .expect("invalid instruction remains visible through LKG");
+    assert_eq!(invalid_review["status"], "invalid");
+    assert_eq!(invalid_review["description"], "Reviews changes");
+    assert!(invalid_review["last_error"].is_string());
+    let rendered = invalid_review.to_string();
+    assert!(!rendered.contains(PRIVATE_INVALID_FIELD));
+    assert!(!rendered.contains(PRIVATE_INVALID_BODY));
+    assert!(!rendered.contains(data.path().to_string_lossy().as_ref()));
+    assert!(invalid_entries
+        .iter()
+        .any(|entry| entry["id"] == "deploy" && entry["status"] == "valid"));
+
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: review\ndescription: Recovered review\n---\nRECOVERED PRIVATE BODY\n",
+    )
+    .await
+    .expect("repair instruction bundle");
+    state
+        .skill_manager
+        .store()
+        .reload_global_workflow_views()
+        .await
+        .expect("recovered publication");
+    let recovered: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    let recovered_review = recovered["entries"]
+        .as_array()
+        .expect("recovered entries")
+        .iter()
+        .find(|entry| entry["id"] == "review")
+        .expect("recovered instruction");
+    assert_eq!(recovered_review["status"], "valid");
+    assert_eq!(recovered_review["description"], "Recovered review");
+    assert!(!recovered.to_string().contains("RECOVERED PRIVATE BODY"));
+}
+
+#[actix_web::test]
+async fn workflow_catalog_session_without_workspace_uses_global_snapshot() {
+    let data = tempfile::tempdir().expect("data dir");
+    let skill = data.path().join("skills/global-review");
+    tokio::fs::create_dir_all(&skill).await.expect("skill dir");
+    tokio::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: global-review\ndescription: Global review workflow\n---\nGlobal body\n",
+    )
+    .await
+    .expect("skill");
+    tokio::fs::write(
+        skill.join("workflow.yaml"),
+        "id: global-review\nname: Global review\ndescription: Global review workflow\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .await
+    .expect("workflow metadata");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let session = bamboo_agent_core::Session::new("global-session", "test-model");
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/catalog",
+        actix_web::web::get().to(super::list_workflow_catalog),
+    ))
+    .await;
+    let request = actix_web::test::TestRequest::get()
+        .uri("/catalog?session_id=global-session")
+        .to_request();
+    let response = actix_web::test::call_service(&app, request).await;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert!(body["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .any(|entry| entry["id"] == "global-review"));
+}
+
+#[actix_web::test]
+async fn user_builtin_clone_is_exact_private_and_fresh_only() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let store = state
+        .skill_manager
+        .store_for_workspace(None)
+        .await
+        .expect("global store");
+    let source = builtin_selection(&store, "review").await;
+    let bundles =
+        bamboo_skills::store::builtin::load_builtin_skill_bundles().expect("builtin bundles");
+    let bundle = bundles
+        .iter()
+        .find(|bundle| bundle.skill.id == "review")
+        .expect("review bundle");
+    let expected =
+        bamboo_skills::store::builtin::builtin_clone_files(bundle).expect("exact clone files");
+    let request_json = serde_json::json!({
+        "source": "builtin",
+        "revision": source.revision,
+        "content_digest": source.content_digest.clone(),
+        "target": "user"
+    });
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&request_json)
+            .to_request(),
+    )
+    .await;
+    let status = response.status();
+    let body = actix_web::test::read_body(response).await;
+    let text = std::str::from_utf8(&body).expect("UTF-8 response");
+    assert_eq!(status, actix_web::http::StatusCode::CREATED, "{text}");
+    assert!(!text.contains(&bundle.skill.prompt));
+    assert!(!text.contains(data.path().to_string_lossy().as_ref()));
+    assert!(!text.contains("SKILL.md"));
+    assert!(!text.contains("dynamic_context"));
+    let receipt: serde_json::Value = serde_json::from_slice(&body).expect("clone receipt");
+    assert_eq!(receipt["workflow_id"], "review");
+    assert_eq!(receipt["target"], "user");
+    assert_eq!(receipt["published_source"], "user");
+    assert_eq!(receipt["source_preserved"], true);
+    assert_eq!(receipt["source_content_digest"], source.content_digest);
+    assert!(receipt["published_content_digest"]
+        .as_str()
+        .is_some_and(|value| value.len() == 64));
+
+    let target = data.path().join("skills/review");
+    for (relative, file) in &expected {
+        assert_eq!(
+            std::fs::read(target.join(relative)).expect("published resource"),
+            file.bytes
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(target.join(relative))
+                .expect("published metadata")
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, if file.executable { 0o755 } else { 0o644 });
+        }
+    }
+    let before = std::fs::read(target.join("SKILL.md")).expect("published SKILL.md");
+    let repeated = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&request_json)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(repeated.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read(target.join("SKILL.md")).expect("unchanged clone"),
+        before
+    );
+
+    std::fs::remove_dir_all(&target).expect("delete editable clone generation");
+    store.reload().await.expect("reload deleted generation");
+    let stale_revision = serde_json::json!({
+        "source": "builtin",
+        "revision": source.revision + 1,
+        "content_digest": source.content_digest.clone(),
+        "target": "user"
+    });
+    let stale = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(stale_revision)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(stale.status(), actix_web::http::StatusCode::CONFLICT);
+    assert!(!target.exists());
+
+    let recloned = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/review/clone")
+            .set_json(&request_json)
+            .to_request(),
+    )
+    .await;
+    let recloned_status = recloned.status();
+    let recloned_body = actix_web::test::read_body(recloned).await;
+    assert_eq!(
+        recloned_status,
+        actix_web::http::StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&recloned_body)
+    );
+    assert_eq!(
+        std::fs::read(target.join("SKILL.md")).expect("recloned definition"),
+        before
+    );
+}
+
+#[actix_web::test]
+async fn project_builtin_clone_uses_durable_session_project_authority() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = state
+        .project_store
+        .create("Clone Project", None)
+        .expect("create Project");
+    let mut session = bamboo_agent_core::Session::new("project-clone-session", "test-model");
+    session.set_project_id_meta(project.id.to_string());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist Project Session");
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+    );
+    let project_home = state.project_store.paths().project_home(&project.id);
+    let store = state
+        .skill_manager
+        .store_for_project_workspace(&project.id, &project_home, None)
+        .await
+        .expect("Project store");
+    let source = builtin_selection(&store, "plan").await;
+    let request_json = serde_json::json!({
+        "source": "builtin",
+        "revision": source.revision,
+        "content_digest": source.content_digest,
+        "target": "project",
+        "session_id": "project-clone-session"
+    });
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/plan/clone")
+            .set_json(request_json)
+            .to_request(),
+    )
+    .await;
+    let status = response.status();
+    let bytes = actix_web::test::read_body(response).await;
+    let visible = String::from_utf8_lossy(&bytes);
+    assert_eq!(status, actix_web::http::StatusCode::CREATED, "{visible}");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("clone response");
+    assert_eq!(body["target"], "project");
+    assert_eq!(body["published_source"], "project");
+    assert!(project_home.join("skills/plan/SKILL.md").is_file());
+    assert!(!data.path().join("skills/plan").exists());
+}
+
+#[actix_web::test]
+async fn stale_builtin_clone_selection_has_zero_publication_side_effects() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let store = state
+        .skill_manager
+        .store_for_workspace(None)
+        .await
+        .expect("global store");
+    let source = builtin_selection(&store, "debug").await;
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/catalog/{workflow_id}/clone",
+        actix_web::web::post().to(super::clone_workflow),
+    ))
+    .await;
+    for request in [
+        serde_json::json!({
+            "source": "builtin",
+            "revision": source.revision + 1,
+            "content_digest": source.content_digest.clone(),
+            "target": "user"
+        }),
+        serde_json::json!({
+            "source": "builtin",
+            "revision": source.revision,
+            "content_digest": "0".repeat(64),
+            "target": "user"
+        }),
+    ] {
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/catalog/debug/clone")
+                .set_json(request)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+    }
+    assert!(!data.path().join("skills/debug").exists());
+    assert!(!data.path().join("skills/.debug.clone-v1.json").exists());
+    assert!(!data.path().join(".workflow-clone-txn").exists());
+}
+
+#[actix_web::test]
+async fn assigned_project_workflow_catalog_reports_workspace_then_project_sources() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let project_store = bamboo_projects::ProjectStore::open(data.path()).expect("Project store");
+    let project = project_store
+        .create("Workflow Project", None)
+        .expect("create Project");
+    let project_skills = project_store
+        .paths()
+        .project_home(&project.id)
+        .join("skills");
+    for (id, description) in [
+        ("shared-workflow", "Project shared workflow"),
+        ("project-only", "Project only workflow"),
+    ] {
+        let skill = project_skills.join(id);
+        std::fs::create_dir_all(&skill).expect("Project skill");
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: {description}\n---\nPROJECT BODY\n"),
+        )
+        .expect("write Project skill");
+        std::fs::write(
+            skill.join("workflow.yaml"),
+            format!(
+                "id: {id}\nname: {id}\ndescription: {description}\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {{}}\n"
+            ),
+        )
+        .expect("write Project workflow metadata");
+    }
+    let workspace_skill = workspace.path().join(".bamboo/skills/shared-workflow");
+    std::fs::create_dir_all(&workspace_skill).expect("workspace skill");
+    std::fs::write(
+        workspace_skill.join("SKILL.md"),
+        "---\nname: shared-workflow\ndescription: Workspace overlay workflow\n---\nWORKSPACE BODY\n",
+    )
+    .expect("write workspace skill");
+    std::fs::write(
+        workspace_skill.join("workflow.yaml"),
+        "id: shared-workflow\nname: shared-workflow\ndescription: Workspace overlay workflow\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .expect("write workspace workflow metadata");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut session = bamboo_agent_core::Session::new("project-workflow-session", "test-model");
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/catalog",
+        actix_web::web::get().to(super::list_workflow_catalog),
+    ))
+    .await;
+    let body: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=project-workflow-session")
+            .to_request(),
+    )
+    .await;
+    let entries = body["entries"].as_array().expect("catalog entries");
+    let shared = entries
+        .iter()
+        .find(|entry| entry["id"] == "shared-workflow")
+        .expect("shared workflow");
+    assert_eq!(shared["description"], "Workspace overlay workflow");
+    assert_eq!(shared["source"], "workspace");
+    let project_only = entries
+        .iter()
+        .find(|entry| entry["id"] == "project-only")
+        .expect("Project workflow");
+    assert_eq!(project_only["source"], "project");
+}
+
+#[actix_web::test]
+async fn assigned_project_cannot_read_another_projects_workspace_workflows() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_skill = workspace.path().join(".bamboo/skills/other-project-secret");
+    std::fs::create_dir_all(&workspace_skill).expect("workspace skill");
+    let secret =
+        "---\nname: other-project-secret\ndescription: Other Project Secret\n---\nSECRET BODY\n";
+    std::fs::write(workspace_skill.join("SKILL.md"), secret).expect("workspace skill");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let session_project = state
+        .project_store
+        .create("Session Project", None)
+        .expect("session Project");
+    let _workspace_owner = state
+        .project_store
+        .create_with_bindings(
+            "Workspace Owner",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("workspace owner");
+    let mut session =
+        bamboo_agent_core::Session::new("cross-project-workflow-session", "test-model");
+    session.set_project_id_meta(session_project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist cross-Project Session");
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+    );
+
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/catalog/{workflow_id}/migrate",
+                actix_web::web::post().to(super::migrate_workflow),
+            ),
+    )
+    .await;
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=cross-project-workflow-session")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    let body = actix_web::test::read_body(response).await;
+    assert!(
+        !body
+            .windows(b"Other Project Secret".len())
+            .any(|window| window == b"Other Project Secret"),
+        "cross-Project workflow metadata must not be returned"
+    );
+    let migration = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/other-project-secret/migrate")
+            .set_json(serde_json::json!({
+                "session_id": "cross-project-workflow-session"
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(migration.status(), actix_web::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        std::fs::read_to_string(workspace_skill.join("SKILL.md")).expect("secret unchanged"),
+        secret
+    );
+}
+
+#[actix_web::test]
+async fn project_legacy_workflow_migration_is_exact_non_destructive_and_idempotent() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let legacy_dir = workspace.path().join(".bamboo/workflows");
+    std::fs::create_dir_all(&legacy_dir).expect("legacy workflow dir");
+    let source = legacy_dir.join("daily-report.md");
+    let original = "# Daily report\n\nSummarize today's changes.\n";
+    std::fs::write(&source, original).expect("legacy workflow");
+    let protected_source = legacy_dir.join("protected.md");
+    std::fs::write(&protected_source, "Legacy source must remain.\n")
+        .expect("protected legacy workflow");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = state
+        .project_store
+        .create_with_bindings(
+            "Legacy Migration Project",
+            None,
+            vec![bamboo_domain::WorkspaceBinding {
+                path: workspace.path().to_string_lossy().into_owned(),
+                label: None,
+                git_common_dir: None,
+            }],
+        )
+        .expect("create Project");
+    let project_home = state.project_store.paths().project_home(&project.id);
+    let protected_target = project_home.join("skills/protected/SKILL.md");
+    std::fs::create_dir_all(protected_target.parent().expect("protected target parent"))
+        .expect("protected target dir");
+    let protected_skill =
+        "---\nname: protected\ndescription: Existing canonical Skill\n---\nKeep this target.\n";
+    std::fs::write(&protected_target, protected_skill).expect("protected target");
+
+    let mut session = bamboo_agent_core::Session::new("legacy-migration-session", "test-model");
+    session.set_project_id_meta(project.id.to_string());
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist migration Session");
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state.clone())
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/catalog/{workflow_id}/migrate",
+                actix_web::web::post().to(super::migrate_workflow),
+            ),
+    )
+    .await;
+
+    let conflict = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/protected/migrate")
+            .set_json(serde_json::json!({"session_id": "legacy-migration-session"}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(conflict.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(&protected_target).expect("protected target unchanged"),
+        protected_skill
+    );
+    assert_eq!(
+        std::fs::read_to_string(&protected_source).expect("protected source unchanged"),
+        "Legacy source must remain.\n"
+    );
+
+    let before: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=legacy-migration-session")
+            .to_request(),
+    )
+    .await;
+    let legacy = before["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .find(|entry| entry["id"] == "daily-report")
+        .expect("legacy workflow entry");
+    assert_eq!(legacy["legacy"], true);
+    assert_eq!(legacy["migration_status"], "available");
+    assert_eq!(legacy["invocation_policy"]["explicit"], true);
+    assert_eq!(legacy["invocation_policy"]["automatic"], false);
+
+    let migrate = || {
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/daily-report/migrate")
+            .set_json(serde_json::json!({"session_id": "legacy-migration-session"}))
+            .to_request()
+    };
+    let first = actix_web::test::call_service(&app, migrate()).await;
+    assert!(first.status().is_success());
+    let first: serde_json::Value = actix_web::test::read_body_json(first).await;
+    assert_eq!(first["outcome"], "migrated");
+    assert_eq!(first["source_preserved"], true);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+
+    let target = project_home.join("skills/daily-report");
+    let migrated = std::fs::read_to_string(target.join("SKILL.md")).expect("migrated Skill");
+    assert!(migrated.contains("legacy_migration: true"));
+    assert!(migrated.contains(".bamboo/workflows/daily-report.md"));
+    assert!(migrated.contains("legacy_source_removal_boundary: lotus-119-complete"));
+    assert!(!migrated.contains(workspace.path().to_string_lossy().as_ref()));
+    assert!(migrated.contains("Summarize today's changes."));
+    assert!(target.join("agents/bamboo.yaml").exists());
+    assert!(
+        !workspace
+            .path()
+            .join(".bamboo/skills/daily-report")
+            .exists(),
+        "assigned Project migration must publish to Project home"
+    );
+
+    let edited = migrated.replace("Summarize today's changes.", "USER EDITED INSTRUCTIONS");
+    std::fs::write(target.join("SKILL.md"), &edited).expect("edit migrated target");
+
+    let second = actix_web::test::call_service(&app, migrate()).await;
+    assert!(second.status().is_success());
+    let second: serde_json::Value = actix_web::test::read_body_json(second).await;
+    assert_eq!(second["outcome"], "already_migrated");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        edited,
+        "idempotent retry must not rewrite the editable target"
+    );
+
+    let changed_request = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/daily-report/migrate")
+            .set_json(serde_json::json!({
+                "session_id": "legacy-migration-session",
+                "description": "Use a different migration description"
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(
+        changed_request.status(),
+        actix_web::http::StatusCode::CONFLICT
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        edited,
+        "a changed migration request must not rewrite the editable target"
+    );
+
+    let selected_generation = legacy_dir.join("daily-report.selected.md");
+    let raced_retry = super::handlers::migrate_workflow_with_source_hook(
+        state.clone(),
+        "daily-report".to_string(),
+        super::MigrateWorkflowRequest {
+            session_id: "legacy-migration-session".to_string(),
+            description: None,
+        },
+        |selected_path| {
+            std::fs::rename(selected_path, &selected_generation)
+                .expect("retain retry source generation");
+            std::fs::write(
+                selected_path,
+                "# Replaced during retry\n\nDifferent bytes.\n",
+            )
+            .expect("replace retry source generation");
+        },
+    )
+    .await
+    .expect("raced retry response");
+    assert_eq!(raced_retry.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        edited,
+        "a raced idempotent retry must not mutate the target"
+    );
+    std::fs::remove_file(&source).expect("remove raced replacement");
+    std::fs::rename(&selected_generation, &source).expect("restore selected source");
+
+    let mismatched_source = edited.replace(
+        "original_source: .bamboo/workflows/daily-report.md",
+        "original_source: .bamboo/workflows/another-report.md",
+    );
+    assert_ne!(
+        mismatched_source, edited,
+        "fixture must change source identity"
+    );
+    std::fs::write(target.join("SKILL.md"), &mismatched_source)
+        .expect("change migration source identity");
+    let non_exact = actix_web::test::call_service(&app, migrate()).await;
+    assert_eq!(non_exact.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        mismatched_source,
+        "non-exact repeat must not rewrite the editable target"
+    );
+    std::fs::write(target.join("SKILL.md"), &edited).expect("restore exact migration fixture");
+
+    let store = state
+        .skill_manager
+        .store_for_project_workspace(&project.id, &project_home, Some(workspace.path()))
+        .await
+        .expect("Project SkillStore");
+    let skill_catalog = store.skill_catalog_snapshot().await;
+    let migrated_skill = skill_catalog
+        .entries
+        .iter()
+        .find(|entry| entry.id == "daily-report")
+        .expect("migrated Skill entry");
+    assert_eq!(
+        migrated_skill.migration_status,
+        Some(bamboo_skills::LegacyWorkflowMigrationStatus::Migrated)
+    );
+
+    let after: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=legacy-migration-session")
+            .to_request(),
+    )
+    .await;
+    let entries = after["entries"].as_array().expect("catalog entries");
+    let same_id = entries
+        .iter()
+        .filter(|entry| entry["id"] == "daily-report")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        same_id.len(),
+        1,
+        "public catalog must not duplicate migration"
+    );
+    let migrated_workflow = same_id[0];
+    assert_eq!(migrated_workflow["migration_status"], "migrated");
+    assert_eq!(migrated_workflow["source"], "project");
+    assert!(migrated_workflow["shadowed_candidates"]
+        .as_array()
+        .expect("preserved source diagnostic")
+        .iter()
+        .any(|candidate| candidate["migration_status"] == "available"));
+
+    let changed_source = "# Daily report\n\nUse changed source instructions.\n";
+    std::fs::write(&source, changed_source).expect("change legacy source after migration");
+    let changed_repeat = actix_web::test::call_service(&app, migrate()).await;
+    assert_eq!(
+        changed_repeat.status(),
+        actix_web::http::StatusCode::CONFLICT
+    );
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), changed_source);
+    assert_eq!(
+        std::fs::read_to_string(target.join("SKILL.md")).unwrap(),
+        edited,
+        "changed source repeat must preserve the editable target"
+    );
+}
+
+#[actix_web::test]
+async fn global_legacy_workflow_migrates_into_canonical_user_skills() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let global_workflows = data.path().join("workflows");
+    std::fs::create_dir_all(&global_workflows).expect("global workflows");
+    let source = global_workflows.join("global-review.md");
+    let original =
+        "---\ndescription: Review changes from the global Workflow.\n---\nReview the diff.\n";
+    std::fs::write(&source, original).expect("global legacy workflow");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut session = bamboo_agent_core::Session::new("global-migration-session", "test-model");
+    session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist migration Session");
+    state.sessions.insert(
+        session.id.clone(),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session)),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state.clone())
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/catalog/{workflow_id}/migrate",
+                actix_web::web::post().to(super::migrate_workflow),
+            ),
+    )
+    .await;
+
+    let before: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog?session_id=global-migration-session")
+            .to_request(),
+    )
+    .await;
+    let advertised = before["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .find(|entry| entry["id"] == "global-review")
+        .expect("global Workflow");
+    assert_eq!(advertised["source"], "user");
+    assert_eq!(advertised["migration_status"], "available");
+
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/catalog/global-review/migrate")
+            .set_json(serde_json::json!({
+                "session_id": "global-migration-session"
+            }))
+            .to_request(),
+    )
+    .await;
+    assert!(response.status().is_success());
+    let body: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert_eq!(body["outcome"], "migrated");
+    assert_eq!(body["source_preserved"], true);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), original);
+
+    let target = data.path().join("skills/global-review/SKILL.md");
+    let migrated = std::fs::read_to_string(&target).expect("migrated Skill");
+    assert!(migrated.contains("workflows/global-review.md"));
+    assert!(migrated.contains("legacy_source_removal_boundary: lotus-119-complete"));
+    assert!(!migrated.contains(data.path().to_string_lossy().as_ref()));
+    assert!(
+        !workspace
+            .path()
+            .join(".bamboo/skills/global-review")
+            .exists(),
+        "global migration must not create a workspace copy"
+    );
+    let scoped = state
+        .skill_manager
+        .store_for_workspace(Some(workspace.path()))
+        .await
+        .expect("workspace store");
+    assert_eq!(
+        scoped
+            .get_skill("global-review")
+            .await
+            .expect("real migrated Skill")
+            .prompt,
+        "Review the diff."
+    );
+    assert_eq!(
+        std::fs::canonicalize(
+            scoped
+                .get_legacy_workflow_source("global-review")
+                .await
+                .expect("preserved source Workflow")
+        )
+        .unwrap(),
+        std::fs::canonicalize(&source).unwrap()
+    );
+}
+
+#[actix_web::test]
+async fn replacing_legacy_source_after_selection_conflicts_without_target_mutation() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workflows = data.path().join("workflows");
+    std::fs::create_dir_all(&workflows).expect("global workflows");
+    let source = workflows.join("raced-review.md");
+    let selected = "---\ndescription: Review the selected bytes.\n---\nSELECTED BODY\n";
+    let replacement = "---\ndescription: Review replacement bytes.\n---\nREPLACEMENT BODY\n";
+    std::fs::write(&source, selected).expect("selected source");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let session = bamboo_agent_core::Session::new("raced-migration-session", "test-model");
+    state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("persist migration Session");
+
+    let original = workflows.join("raced-review.selected.md");
+    let response = super::handlers::migrate_workflow_with_source_hook(
+        state,
+        "raced-review".to_string(),
+        super::MigrateWorkflowRequest {
+            session_id: "raced-migration-session".to_string(),
+            description: None,
+        },
+        |selected_path| {
+            std::fs::rename(selected_path, &original).expect("retain selected generation");
+            std::fs::write(selected_path, replacement).expect("install replacement generation");
+        },
+    )
+    .await
+    .expect("migration response");
+
+    assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_to_string(&original).unwrap(), selected);
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), replacement);
+    assert!(!data.path().join("skills/raced-review").exists());
+    assert!(!data
+        .path()
+        .join("skills/.raced-review.clone-v1.json")
+        .exists());
+    assert!(!data.path().join(".workflow-clone-txn").exists());
+}
+
+#[actix_web::test]
+async fn legacy_api_keeps_workflow_source_only_and_bridges_catalog_event() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut account_events = state.account_sink.subscribe();
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state.clone())
+            .route(
+                "/workflows",
+                actix_web::web::post().to(super::save_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::get().to(super::get_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::delete().to(super::delete_workflow),
+            ),
+    )
+    .await;
+    for content in ["First body", "Second body"] {
+        let request = actix_web::test::TestRequest::post()
+            .uri("/workflows")
+            .set_json(serde_json::json!({"name": "legacy", "content": content}))
+            .to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+        assert!(response.status().is_success());
+    }
+    let request = actix_web::test::TestRequest::get()
+        .uri("/workflows/legacy")
+        .to_request();
+    let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
+    assert_eq!(body["content"], "Second body");
+    assert!(
+        !data.path().join("skills/legacy/SKILL.md").exists(),
+        "legacy Workflow writes must not materialize a Skill"
+    );
+
+    let bridged = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut workflow_changes = 0;
+        loop {
+            let event = account_events.recv().await.expect("account event");
+            if matches!(
+                event.event,
+                bamboo_agent_core::AgentEvent::WorkflowChanged { .. }
+            ) {
+                workflow_changes += 1;
+                if workflow_changes == 2 {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(bridged.is_ok(), "workflow.changed must reach account feed");
+}
+
+#[actix_web::test]
+async fn instruction_catalog_lifecycle_reaches_the_durable_account_feed_in_order() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let mut account_events = state.account_sink.subscribe();
+    let skill_dir = data.path().join("skills/library-refresh");
+    tokio::fs::create_dir_all(&skill_dir)
+        .await
+        .expect("skill dir");
+    let skill_file = skill_dir.join("SKILL.md");
+    let valid = "---\nname: library-refresh\ndescription: Refresh the Workflow Library.\n---\nRefresh it.\n";
+
+    tokio::fs::write(&skill_file, valid)
+        .await
+        .expect("create instruction");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish changed instruction");
+    tokio::fs::write(&skill_file, "---\nname: [\n")
+        .await
+        .expect("invalidate instruction");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish invalid LKG instruction");
+    tokio::fs::write(&skill_file, valid)
+        .await
+        .expect("recover instruction");
+    state
+        .skill_manager
+        .store()
+        .reload()
+        .await
+        .expect("publish recovered instruction");
+
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut kinds = Vec::new();
+        while kinds.len() < 3 {
+            let event = account_events.recv().await.expect("account event");
+            match &event.event {
+                bamboo_agent_core::AgentEvent::WorkflowChanged { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    kinds.push("changed")
+                }
+                bamboo_agent_core::AgentEvent::WorkflowInvalid { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    kinds.push("invalid")
+                }
+                bamboo_agent_core::AgentEvent::WorkflowRecovered { workflow_id, .. }
+                    if workflow_id == "library-refresh" =>
+                {
+                    kinds.push("recovered")
+                }
+                _ => {}
+            }
+        }
+        kinds
+    })
+    .await
+    .expect("instruction catalog events reach the account feed");
+    assert_eq!(observed, ["changed", "invalid", "recovered"]);
+}
+
+#[actix_web::test]
+async fn global_workflow_create_update_delete_is_immediate_in_cached_session_views() {
+    let data = tempfile::tempdir().expect("data dir");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let project = state
+        .project_store
+        .create("Workflow cache Project", None)
+        .expect("Project");
+    let mut workspace_session =
+        bamboo_agent_core::Session::new("workspace-cache-session", "test-model");
+    workspace_session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.sessions.insert(
+        workspace_session.id.clone(),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(workspace_session)),
+    );
+    let mut project_session =
+        bamboo_agent_core::Session::new("project-cache-session", "test-model");
+    project_session.set_project_id_meta(project.id.to_string());
+    project_session.set_workspace_path_meta(workspace.path().to_string_lossy().into_owned());
+    state.sessions.insert(
+        project_session.id.clone(),
+        std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(project_session)),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/workflows",
+                actix_web::web::post().to(super::save_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::delete().to(super::delete_workflow),
+            ),
+    )
+    .await;
+
+    let session_ids = ["workspace-cache-session", "project-cache-session"];
+    let mut initial_revisions = Vec::new();
+    for session_id in session_ids {
+        let catalog: serde_json::Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!("/catalog?session_id={session_id}"))
+                .to_request(),
+        )
+        .await;
+        initial_revisions.push(catalog["revision"].as_u64().expect("catalog revision"));
+        assert!(!catalog["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|entry| entry["id"] == "live-global"));
+    }
+
+    for (description, body) in [
+        ("First global Workflow.", "First body"),
+        ("Second global Workflow.", "Second body"),
+    ] {
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/workflows")
+                .set_json(serde_json::json!({
+                    "name": "live-global",
+                    "content": format!(
+                        "---\ndescription: {description}\n---\n{body}\n"
+                    )
+                }))
+                .to_request(),
+        )
+        .await;
+        assert!(response.status().is_success());
+
+        for (index, session_id) in session_ids.iter().enumerate() {
+            let catalog: serde_json::Value = actix_web::test::call_and_read_body_json(
+                &app,
+                actix_web::test::TestRequest::get()
+                    .uri(&format!("/catalog?session_id={session_id}"))
+                    .to_request(),
+            )
+            .await;
+            assert!(catalog["revision"].as_u64().unwrap() > initial_revisions[index]);
+            let entry = catalog["entries"]
+                .as_array()
+                .expect("entries")
+                .iter()
+                .find(|entry| entry["id"] == "live-global")
+                .expect("same-request publication");
+            assert_eq!(entry["description"], description);
+            assert_eq!(entry["migration_status"], "available");
+            initial_revisions[index] = catalog["revision"].as_u64().unwrap();
+        }
+    }
+
+    let deleted = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::delete()
+            .uri("/workflows/live-global")
+            .to_request(),
+    )
+    .await;
+    assert!(deleted.status().is_success());
+    for (index, session_id) in session_ids.iter().enumerate() {
+        let catalog: serde_json::Value = actix_web::test::call_and_read_body_json(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!("/catalog?session_id={session_id}"))
+                .to_request(),
+        )
+        .await;
+        assert!(catalog["revision"].as_u64().unwrap() > initial_revisions[index]);
+        assert!(!catalog["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|entry| entry["id"] == "live-global"));
+    }
+}
+
+#[actix_web::test]
+async fn historical_legacy_import_remains_a_workflow_without_rewriting_its_bundle() {
+    let data = tempfile::tempdir().expect("data dir");
+    let source = data.path().join("workflows/legacy.md");
+    tokio::fs::create_dir_all(source.parent().expect("workflow parent"))
+        .await
+        .expect("workflow dir");
+    tokio::fs::write(&source, "Current Workflow source\n")
+        .await
+        .expect("workflow source");
+    let bundle = data.path().join("skills/legacy/SKILL.md");
+    tokio::fs::create_dir_all(bundle.parent().expect("bundle parent"))
+        .await
+        .expect("bundle dir");
+    let old_bundle = format!(
+        "---\nname: legacy\ndescription: Imported legacy workflow\nmetadata:\n  legacy_import: true\n  legacy_name: legacy\n  original_source: '{}'\n---\nHistorical copied body\n",
+        source.display()
+    );
+    tokio::fs::write(&bundle, &old_bundle)
+        .await
+        .expect("legacy bundle");
+
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route(
+                "/catalog",
+                actix_web::web::get().to(super::list_workflow_catalog),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::get().to(super::get_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::delete().to(super::delete_workflow),
+            ),
+    )
+    .await;
+
+    let catalog: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    let entry = catalog["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .find(|entry| entry["id"] == "legacy")
+        .expect("legacy Workflow");
+    assert_eq!(entry["legacy"], true);
+    assert_eq!(entry["migration_status"], "available");
+
+    let workflow: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/workflows/legacy")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(workflow["content"], "Current Workflow source\n");
+    assert_eq!(
+        tokio::fs::read_to_string(&bundle)
+            .await
+            .expect("bundle preserved"),
+        old_bundle
+    );
+
+    let deleted = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::delete()
+            .uri("/workflows/legacy")
+            .to_request(),
+    )
+    .await;
+    assert!(deleted.status().is_success());
+    assert!(!source.exists());
+    assert!(
+        !bundle.exists(),
+        "explicit deletion may clean only the adapter owned by this source"
+    );
+    let after: serde_json::Value = actix_web::test::call_and_read_body_json(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/catalog")
+            .to_request(),
+    )
+    .await;
+    assert!(!after["entries"]
+        .as_array()
+        .expect("catalog entries")
+        .iter()
+        .any(|entry| entry["id"] == "legacy"));
+}
+
+#[actix_web::test]
+async fn deleting_legacy_source_never_deletes_a_same_id_ordinary_skill() {
+    let data = tempfile::tempdir().expect("data dir");
+    let source = data.path().join("workflows/shared.md");
+    tokio::fs::create_dir_all(source.parent().expect("workflow parent"))
+        .await
+        .expect("workflow dir");
+    tokio::fs::write(&source, "Workflow source\n")
+        .await
+        .expect("workflow source");
+    let skill = data.path().join("skills/shared/SKILL.md");
+    tokio::fs::create_dir_all(skill.parent().expect("skill parent"))
+        .await
+        .expect("skill dir");
+    let ordinary = "---\nname: shared\ndescription: Ordinary Skill\n---\nOrdinary Skill body\n";
+    tokio::fs::write(&skill, ordinary)
+        .await
+        .expect("ordinary skill");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state).route(
+        "/workflows/{name}",
+        actix_web::web::delete().to(super::delete_workflow),
+    ))
+    .await;
+
+    let deleted = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::delete()
+            .uri("/workflows/shared")
+            .to_request(),
+    )
+    .await;
+    assert!(deleted.status().is_success());
+    assert!(!source.exists());
+    assert_eq!(
+        tokio::fs::read_to_string(&skill)
+            .await
+            .expect("ordinary Skill preserved"),
+        ordinary
+    );
+}
+
+#[actix_web::test]
+async fn concurrent_legacy_updates_leave_one_source_and_no_skill_bundle() {
+    const WRITES_PER_TASK: usize = 8;
+    const EXPLICIT_RELOADS: usize = WRITES_PER_TASK * 2;
+
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(actix_web::App::new().app_data(state.clone()).route(
+        "/workflows",
+        actix_web::web::post().to(super::save_workflow),
+    ))
+    .await;
+
+    // Historically the handler and SkillStore::reload() both materialized the
+    // same legacy source as a Skill bundle, but only the handler held the
+    // legacy I/O lock. Concurrent first-time hard links could therefore turn a
+    // successful source write into a non-success response. Exercise both paths
+    // together for a fixed number of rounds and retain the source-only contract.
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+    let first_start = start.clone();
+    let first_writer = async {
+        first_start.wait().await;
+        for round in 0..WRITES_PER_TASK {
+            let response = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::post()
+                    .uri("/workflows")
+                    .set_json(serde_json::json!({
+                        "name": "race",
+                        "content": format!("body one {round}")
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_legacy_endpoint_success("first concurrent POST /workflows", response).await;
+            tokio::task::yield_now().await;
+        }
+    };
+    let second_start = start.clone();
+    let second_writer = async {
+        second_start.wait().await;
+        for round in 0..WRITES_PER_TASK {
+            let response = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::post()
+                    .uri("/workflows")
+                    .set_json(serde_json::json!({
+                        "name": "race",
+                        "content": format!("body two {round}")
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_legacy_endpoint_success("second concurrent POST /workflows", response).await;
+            tokio::task::yield_now().await;
+        }
+    };
+    let reload_start = start;
+    let explicit_reloads = async {
+        reload_start.wait().await;
+        for _ in 0..EXPLICIT_RELOADS {
+            state
+                .skill_manager
+                .store()
+                .reload()
+                .await
+                .expect("explicit concurrent catalog reload");
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::join!(first_writer, second_writer, explicit_reloads);
+
+    let source = tokio::fs::read_to_string(data.path().join("workflows/race.md"))
+        .await
+        .expect("source");
+    assert!(
+        source == format!("body one {}", WRITES_PER_TASK - 1)
+            || source == format!("body two {}", WRITES_PER_TASK - 1)
+    );
+    assert!(
+        !data.path().join("skills/race/SKILL.md").exists(),
+        "concurrent Workflow writes must not create a Skill"
+    );
+    let mut entries = tokio::fs::read_dir(data.path().join("workflows"))
+        .await
+        .expect("workflow dir");
+    while let Some(entry) = entries.next_entry().await.expect("entry") {
+        assert!(!entry.file_name().to_string_lossy().ends_with(".tmp"));
+    }
+}
+
+#[actix_web::test]
+async fn legacy_api_preserves_names_outside_skill_id_grammar() {
+    let data = tempfile::tempdir().expect("data dir");
+    let state = actix_web::web::Data::new(
+        crate::app_state::AppState::new(data.path().to_path_buf())
+            .await
+            .expect("app state"),
+    );
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state)
+            .route(
+                "/workflows",
+                actix_web::web::get().to(super::list_workflows),
+            )
+            .route(
+                "/workflows",
+                actix_web::web::post().to(super::save_workflow),
+            )
+            .route(
+                "/workflows/{name}",
+                actix_web::web::get().to(super::get_workflow),
+            ),
+    )
+    .await;
+    let name = "发布 Workflow_v2";
+    let request = actix_web::test::TestRequest::post()
+        .uri("/workflows")
+        .set_json(serde_json::json!({"name": name, "content": "Original body"}))
+        .to_request();
+    let response = actix_web::test::call_service(&app, request).await;
+    assert_legacy_endpoint_success("POST /workflows with a legacy Unicode name", response).await;
+
+    let request = actix_web::test::TestRequest::get()
+        .uri("/workflows")
+        .to_request();
+    let listed: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
+    assert!(listed
+        .as_array()
+        .expect("workflow list")
+        .iter()
+        .any(|item| item["name"] == name));
+
+    let request = actix_web::test::TestRequest::get()
+        .uri("/workflows/%E5%8F%91%E5%B8%83%20Workflow_v2")
+        .to_request();
+    let loaded: serde_json::Value = actix_web::test::call_and_read_body_json(&app, request).await;
+    assert_eq!(loaded["name"], name);
+    assert_eq!(loaded["content"], "Original body");
+}
+
+#[test]
+fn safe_workflow_name_accepts_normal_names() {
+    assert!(is_safe_workflow_name("my-workflow_01"));
+    assert!(is_safe_workflow_name("workflow.v2"));
+    assert!(is_safe_workflow_name("Workflow Name"));
+}
+
+#[test]
+fn safe_workflow_name_rejects_path_traversal_and_control_chars() {
+    assert!(!is_safe_workflow_name("../secret"));
+    assert!(!is_safe_workflow_name("folder/name"));
+    assert!(!is_safe_workflow_name("line\nbreak"));
+    assert!(!is_safe_workflow_name(" null\0byte"));
+}
+
+#[test]
+fn safe_workflow_name_rejects_reserved_windows_names() {
+    assert!(!is_safe_workflow_name("CON"));
+    assert!(!is_safe_workflow_name("nul.txt"));
+    assert!(!is_safe_workflow_name("LPT1"));
+}
+
+#[test]
+fn safe_workflow_name_rejects_empty_string() {
+    assert!(!is_safe_workflow_name(""));
+}
+
+#[test]
+fn safe_workflow_name_rejects_whitespace_only() {
+    assert!(!is_safe_workflow_name("   "));
+    assert!(!is_safe_workflow_name("\t"));
+    assert!(!is_safe_workflow_name("\n"));
+}
+
+#[test]
+fn safe_workflow_name_rejects_leading_trailing_whitespace() {
+    assert!(!is_safe_workflow_name(" workflow"));
+    assert!(!is_safe_workflow_name("workflow "));
+    assert!(!is_safe_workflow_name(" workflow "));
+}
+
+#[test]
+fn safe_workflow_name_rejects_path_separators() {
+    assert!(!is_safe_workflow_name("path/to/workflow"));
+    assert!(!is_safe_workflow_name("path\\to\\workflow"));
+    assert!(!is_safe_workflow_name("a/b"));
+    assert!(!is_safe_workflow_name("a\\b"));
+}
+
+#[test]
+fn safe_workflow_name_rejects_double_dots() {
+    assert!(!is_safe_workflow_name(".."));
+    assert!(!is_safe_workflow_name("a..b"));
+    assert!(!is_safe_workflow_name("test..workflow"));
+}
+
+#[test]
+fn safe_workflow_name_rejects_control_characters() {
+    assert!(!is_safe_workflow_name("\x01"));
+    assert!(!is_safe_workflow_name("work\x02flow"));
+    assert!(!is_safe_workflow_name("test\x1F"));
+    assert!(!is_safe_workflow_name("\x7F"));
+}
+
+#[test]
+fn safe_workflow_name_rejects_very_long_names() {
+    let long_name = "a".repeat(256);
+    assert!(!is_safe_workflow_name(&long_name));
+
+    let exactly_255 = "a".repeat(255);
+    assert!(is_safe_workflow_name(&exactly_255));
+}
+
+#[test]
+fn safe_workflow_name_accepts_various_characters() {
+    assert!(is_safe_workflow_name("workflow-1"));
+    assert!(is_safe_workflow_name("workflow_2"));
+    assert!(is_safe_workflow_name("workflow.3"));
+    assert!(is_safe_workflow_name("workflow 4"));
+    assert!(is_safe_workflow_name("Workflow5"));
+    assert!(is_safe_workflow_name("123"));
+}
+
+#[test]
+fn safe_workflow_name_rejects_all_reserved_windows_names() {
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+
+    for name in reserved.iter() {
+        assert!(!is_safe_workflow_name(name), "Should reject {}", name);
+        assert!(
+            !is_safe_workflow_name(&format!("{}.txt", name)),
+            "Should reject {}.txt",
+            name
+        );
+    }
+}
+
+#[test]
+fn safe_workflow_name_rejects_special_characters() {
+    assert!(!is_safe_workflow_name("workflow@home"));
+    assert!(!is_safe_workflow_name("workflow#1"));
+    assert!(!is_safe_workflow_name("workflow!"));
+    assert!(!is_safe_workflow_name("workflow$"));
+    assert!(!is_safe_workflow_name("workflow%"));
+    assert!(!is_safe_workflow_name("workflow&"));
+    assert!(!is_safe_workflow_name("workflow*"));
+    assert!(!is_safe_workflow_name("workflow+"));
+    assert!(!is_safe_workflow_name("workflow="));
+    assert!(!is_safe_workflow_name("workflow|"));
+    assert!(!is_safe_workflow_name("workflow?"));
+    assert!(!is_safe_workflow_name("workflow["));
+    assert!(!is_safe_workflow_name("workflow]"));
+    assert!(!is_safe_workflow_name("workflow{"));
+    assert!(!is_safe_workflow_name("workflow}"));
+    assert!(!is_safe_workflow_name("workflow("));
+    assert!(!is_safe_workflow_name("workflow)"));
+    assert!(!is_safe_workflow_name("workflow<"));
+    assert!(!is_safe_workflow_name("workflow>"));
+    assert!(!is_safe_workflow_name("workflow,"));
+    assert!(!is_safe_workflow_name("workflow:"));
+    assert!(!is_safe_workflow_name("workflow;"));
+}
+
+#[test]
+fn safe_workflow_name_accepts_edge_cases() {
+    // Single character
+    assert!(is_safe_workflow_name("a"));
+    assert!(is_safe_workflow_name("Z"));
+    assert!(is_safe_workflow_name("1"));
+
+    // Numbers only
+    assert!(is_safe_workflow_name("12345"));
+
+    // Mixed case
+    assert!(is_safe_workflow_name("MyWorkflow"));
+
+    // With all allowed special chars
+    assert!(is_safe_workflow_name("my-workflow_v2.3 test"));
+}
+
+#[test]
+fn safe_workflow_name_accepts_unicode_alphanumeric() {
+    // Unicode letters and numbers are considered alphanumeric by Rust
+    assert!(is_safe_workflow_name("你好"));
+    assert!(is_safe_workflow_name("工作流"));
+    assert!(is_safe_workflow_name("ワークフロー"));
+    assert!(is_safe_workflow_name("αβγ"));
+    assert!(is_safe_workflow_name("τρόπος"));
+}
+
+#[test]
+fn safe_workflow_name_rejects_unicode_special_chars() {
+    // Special unicode symbols are not alphanumeric
+    assert!(!is_safe_workflow_name("workflow©"));
+    assert!(!is_safe_workflow_name("workflow®"));
+    assert!(!is_safe_workflow_name("test™"));
+    assert!(!is_safe_workflow_name("workflow€"));
+}

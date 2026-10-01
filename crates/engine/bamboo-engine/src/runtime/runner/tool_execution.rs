@@ -1,0 +1,2351 @@
+//! Tool execution helpers for the agent loop runner.
+
+use std::sync::Arc;
+
+use futures::future::join_all;
+use tokio::sync::mpsc;
+
+use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::task_context::TaskLoopContext;
+use bamboo_agent_core::tools::{
+    ExecutingSupervisorObservation, ToolCall, ToolExecutor, ToolSchema,
+};
+use bamboo_agent_core::{AgentError, AgentEvent, Session};
+use bamboo_domain::{
+    AgentHookPoint, AgentRuntimeState, CapabilityLoadingMode, ClassifiedToolSchema,
+    EffectiveCallableSet,
+};
+use bamboo_llm::LLMProvider;
+use bamboo_metrics::{MetricsCollector, RoundStatus as MetricsRoundStatus};
+
+fn build_context_pressure(session: &Session) -> Option<output_compressor::ContextPressure> {
+    let usage = session.token_usage.as_ref()?;
+    let budget = session.effective_token_budget()?;
+    let trigger = budget.compression_trigger_context_tokens();
+    if trigger == 0 {
+        return None;
+    }
+    let remaining = trigger.saturating_sub(usage.total_tokens);
+    let percent = ((usage.total_tokens as f64 / trigger as f64) * 100.0).min(100.0) as u8;
+    Some(output_compressor::ContextPressure {
+        usage_percent: percent,
+        remaining_tokens: remaining,
+    })
+}
+
+/// Build the task-aware compression hint from the ACTIVE task item's completion
+/// criteria (+ description), so a truncated tool output preferentially preserves
+/// lines relevant to what the task is verifying (Phase 4). `None` when there is
+/// no active task or it yields no significant terms.
+fn build_task_compression_hint(
+    task_context: &Option<TaskLoopContext>,
+) -> Option<output_compressor::TaskCompressionHint> {
+    let ctx = task_context.as_ref()?;
+    let item = ctx
+        .items
+        .iter()
+        .find(|item| Some(&item.id) == ctx.active_item_id.as_ref())?;
+    let mut phrases = item.completion_criteria.clone();
+    phrases.push(item.description.clone());
+    let hint = output_compressor::TaskCompressionHint::from_phrases(phrases);
+    (!hint.is_empty()).then_some(hint)
+}
+
+mod clarification;
+mod events;
+mod execution_paths;
+mod loop_state;
+mod output_compressor;
+mod per_call;
+mod policy;
+#[cfg(test)]
+mod supervisor_dispatch_tests;
+mod task;
+pub(crate) mod tool_error_collector;
+
+use loop_state::RoundExecutionState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSchedulingMode {
+    ParallelSafe,
+    Sequential,
+}
+
+fn scheduling_mode_for_tool_call(
+    tool_call: &ToolCall,
+    tools: &Arc<dyn ToolExecutor>,
+) -> ToolSchedulingMode {
+    let normalized = bamboo_tools::normalize_tool_ref(&tool_call.function.name)
+        .unwrap_or_else(|| tool_call.function.name.trim().to_string());
+
+    let canonical = bamboo_tools::resolve_alias(&normalized)
+        .map(|s: &str| s.to_string())
+        .unwrap_or(normalized);
+
+    let mut effective_call = tool_call.clone();
+    effective_call.function.name = canonical;
+
+    if bamboo_tools::parallel::ToolCallRuntime::supports_parallel(tools, &effective_call) {
+        ToolSchedulingMode::ParallelSafe
+    } else {
+        ToolSchedulingMode::Sequential
+    }
+}
+
+/// Preserve the current full-catalog behavior at execution boundaries that do
+/// not yet have a progressive provider adapter. The input is already filtered
+/// for this session/round, so the rebuilt classified view contains only those
+/// eligible schemas; HostOnly entries remain non-callable by domain policy.
+pub(crate) fn legacy_effective_callable_set(
+    eligible_tool_schemas: &[ToolSchema],
+) -> EffectiveCallableSet {
+    let catalog = eligible_tool_schemas
+        .iter()
+        .cloned()
+        .filter_map(ClassifiedToolSchema::new)
+        .collect::<Vec<_>>();
+    EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::LegacyFullCatalog,
+        std::iter::empty::<&str>(),
+    )
+}
+
+pub(crate) struct RoundToolExecutionResult {
+    pub awaiting_clarification: bool,
+    pub waiting_for_children: bool,
+    pub round_status: MetricsRoundStatus,
+    pub round_error: Option<String>,
+}
+
+struct SingleToolExecutionControl {
+    should_break: bool,
+    stop_round: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_and_apply_single_tool_call(
+    tool_call: &ToolCall,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    metrics_collector: Option<&MetricsCollector>,
+    session_id: &str,
+    round_id: &str,
+    round: usize,
+    session: &mut Session,
+    tools: &Arc<dyn ToolExecutor>,
+    config: &AgentLoopConfig,
+    effective_callable_set: &EffectiveCallableSet,
+    // Pre-built per-round snapshot of the executor's full tool-schema list —
+    // avoids re-cloning every schema on each tool call.
+    available_tool_schemas: &[ToolSchema],
+    runtime_state: &mut AgentRuntimeState,
+    task_context: &mut Option<TaskLoopContext>,
+    state: &mut RoundExecutionState,
+    policy_guard: &mut policy::ToolPolicyGuard,
+    reserved_calls: usize,
+) -> Result<SingleToolExecutionControl, AgentError> {
+    // Every sequential/single dispatch is its own externally visible safe
+    // boundary. Re-read the authoritative permission and Root tool control
+    // planes before dispatch; storage failures abort before ToolStart.
+    super::state_bridge::refresh_tool_boundary_authorities(
+        session,
+        runtime_state,
+        config.storage.as_ref(),
+    )
+    .await?;
+    let session_flags =
+        bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session_and_configured_mode(
+            session,
+            config.permission_mode.unwrap_or_default(),
+        );
+    let root_session_id = session.root_session_id.clone();
+    let executing_supervisor =
+        ExecutingSupervisorObservation::capture_from_executing_session(session);
+    let root_orchestration_only = session.root_orchestration_only_enabled();
+    // Plan mode gate: block mutating tools (except pause/clarification tools)
+    if session_flags.plan_read_only {
+        let tool_name = tool_call.function.name.trim();
+        if !bamboo_tools::orchestrator::plan_mode_allows_tool(tool_name) {
+            tracing::warn!(
+                "[{}][round:{}] Plan mode blocked mutating tool: tool_call_id={}, tool_name={}",
+                session_id,
+                round,
+                tool_call.id,
+                tool_name
+            );
+            let outcome = per_call::ToolExecutionOutcome {
+                permission_replay_origin: None,
+                needs_human: None,
+                post_tool_hook_eligible: false,
+                result: Err(format!("Plan mode: {} operation blocked", tool_name)),
+                tool_duration: std::time::Duration::ZERO,
+            };
+            policy_guard.observe_outcome(tool_call, &outcome.result);
+            let task_hint = build_task_compression_hint(task_context);
+            let outcome = output_compressor::maybe_compress(
+                &tool_call.function.name,
+                &tool_call.function.arguments,
+                session_id,
+                outcome,
+                session
+                    .effective_token_budget()
+                    .map(|b| b.max_tool_output_tokens)
+                    .unwrap_or(0),
+                build_context_pressure(session),
+                task_hint.as_ref(),
+            )
+            .await;
+            let should_break = per_call::apply_tool_execution_outcome(
+                per_call::ToolExecutionApplyContext {
+                    tool_call,
+                    event_tx,
+                    metrics_collector,
+                    session_id,
+                    round_id,
+                    round,
+                    session,
+                    tools,
+                    session_flags,
+                    config,
+                    runtime_state,
+                    task_context,
+                    state,
+                },
+                outcome,
+            )
+            .await?;
+            return Ok(SingleToolExecutionControl {
+                should_break,
+                stop_round: false,
+            });
+        }
+    }
+
+    let mut stop_round = false;
+    let outcome = match policy_guard.check_before_execution(tool_call, reserved_calls) {
+        Ok(()) => {
+            let before_tool_hooks = config
+                .hook_runner
+                .has_hooks_for(AgentHookPoint::BeforeToolExecution);
+            per_call::execute_model_requested_tool_call_only(
+                effective_callable_set,
+                per_call::ToolExecutionOnlyContext {
+                    tool_call,
+                    event_tx,
+                    metrics_collector,
+                    session_id,
+                    root_orchestration_only,
+                    root_session_id: &root_session_id,
+                    executing_supervisor,
+                    round_id,
+                    round,
+                    tools,
+                    config,
+                    hook_session: before_tool_hooks.then_some(&mut *session),
+                    hook_runtime_state: before_tool_hooks.then_some(&mut *runtime_state),
+                    session_flags,
+                    available_tool_schemas,
+                },
+            )
+            .await?
+        }
+        Err(violation) => {
+            stop_round = violation.should_stop_round();
+            let message = violation.into_message();
+            tracing::warn!(
+                "[{}][round:{}] Tool call blocked by policy before execution: tool_call_id={}, tool_name={}, error={}",
+                session_id,
+                round,
+                tool_call.id,
+                tool_call.function.name,
+                message
+            );
+            per_call::ToolExecutionOutcome {
+                permission_replay_origin: None,
+                needs_human: None,
+                post_tool_hook_eligible: false,
+                result: Err(message),
+                tool_duration: std::time::Duration::ZERO,
+            }
+        }
+    };
+
+    // Compress tool output before applying
+    let task_hint = build_task_compression_hint(task_context);
+    let outcome = output_compressor::maybe_compress(
+        &tool_call.function.name,
+        &tool_call.function.arguments,
+        session_id,
+        outcome,
+        session
+            .effective_token_budget()
+            .map(|b| b.max_tool_output_tokens)
+            .unwrap_or(0),
+        build_context_pressure(session),
+        task_hint.as_ref(),
+    )
+    .await;
+    // The output budget may turn an otherwise successful browser download
+    // into a bounded failure. Count the result the model actually receives.
+    policy_guard.observe_outcome(tool_call, &outcome.result);
+
+    let should_break = per_call::apply_tool_execution_outcome(
+        per_call::ToolExecutionApplyContext {
+            tool_call,
+            event_tx,
+            metrics_collector,
+            session_id,
+            round_id,
+            round,
+            session,
+            tools,
+            session_flags,
+            config,
+            runtime_state,
+            task_context,
+            state,
+        },
+        outcome,
+    )
+    .await?;
+
+    Ok(SingleToolExecutionControl {
+        should_break,
+        stop_round,
+    })
+}
+
+/// Check if the most recent tool result is from `compact_context` and set
+/// the manual compression flag on the session so the next compression check
+/// forces a compression cycle regardless of threshold.
+///
+/// Detection is based on the tool call name in the assistant message, not the
+/// tool result content — this avoids fragility if the tool output text changes.
+fn detect_manual_compression_request(session: &mut Session) {
+    if session.force_manual_compression.is_some() {
+        return;
+    }
+
+    // Find the most recent assistant message containing a compact_context tool call.
+    let Some((call_id, instructions)) = session
+        .messages
+        .iter()
+        .rev()
+        .take(6)
+        .find(|m| {
+            m.role == bamboo_agent_core::Role::Assistant
+                && m.tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|c| c.function.name == "compact_context"))
+        })
+        .and_then(|m| {
+            m.tool_calls.as_ref().and_then(|calls| {
+                let call = calls
+                    .iter()
+                    .find(|c| c.function.name == "compact_context")?;
+                let instructions =
+                    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                        .ok()
+                        .and_then(|args| args.get("instructions").cloned())
+                        .and_then(|v| v.as_str().map(String::from));
+                Some((call.id.clone(), instructions))
+            })
+        })
+    else {
+        return;
+    };
+
+    // Verify the corresponding tool result exists (call completed, not in-flight).
+    let result_exists = session.messages.iter().rev().take(4).any(|m| {
+        m.role == bamboo_agent_core::Role::Tool
+            && m.tool_call_id.as_deref() == Some(call_id.as_str())
+    });
+
+    if result_exists {
+        tracing::info!("detected compact_context tool call, flagging for manual compression");
+        session.force_manual_compression = Some(instructions.unwrap_or_default());
+    }
+}
+
+/// Best-effort mid-turn context compression, run after a single tool result.
+///
+/// Mid-turn compression is an OPTIMIZATION, never a correctness requirement. By
+/// the time it runs the assistant turn is already mid-execution: the assistant
+/// message (carrying this round's `tool_calls`) has been appended and one or
+/// more tools have run and committed their side effects. If the host
+/// summarization LLM call fails transiently (HTTP 500 / 429 / timeout), that
+/// error MUST NOT propagate out of `execute_round_tool_calls`. Propagating it
+/// surfaces the failure to the per-turn retry loop, which would either
+///   (a) classify it as retryable and re-run the WHOLE turn — appending a
+///       SECOND assistant message, re-billing the LLM, and orphaning the
+///       not-yet-executed tool calls; or
+///   (b) fail the turn terminally and abort the remaining tools.
+/// Both corrupt session state over a discardable optimization.
+///
+/// So this function is INFALLIBLE by construction: a compression failure is
+/// logged and swallowed, and the turn keeps executing its remaining tools with
+/// the uncompressed context. Compression is retried on the next natural
+/// trigger. (issue #238)
+#[allow(clippy::too_many_arguments)]
+async fn maybe_apply_mid_turn_context_compression_after_tool(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    llm: &Arc<dyn LLMProvider>,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    model_name: Option<&str>,
+    _compression_model_provider: Option<&Arc<dyn LLMProvider>>,
+    tool_schemas: &[ToolSchema],
+) {
+    let Some(model_name) = model_name else {
+        return;
+    };
+
+    detect_manual_compression_request(session);
+
+    match super::round_lifecycle::maybe_apply_mid_turn_context_compression(
+        session,
+        config,
+        llm,
+        event_tx,
+        session_id,
+        model_name,
+        tool_schemas,
+    )
+    .await
+    {
+        Ok(true) => {
+            tracing::debug!(
+                "[{}] Applied mid-turn host context compression after single tool result",
+                session_id
+            );
+        }
+        Ok(false) => {}
+        // Degrade gracefully: a transient summarization failure must never abort
+        // or retry the whole turn — keep running the remaining tools uncompressed.
+        Err(error) => {
+            tracing::warn!(
+                "[{}] Mid-turn context compression failed; continuing the turn with uncompressed context (best-effort, will retry on next trigger): {}",
+                session_id,
+                error
+            );
+        }
+    }
+}
+
+pub(crate) struct RoundToolExecution<'a, 'frame> {
+    pub(crate) tool_calls: &'a [ToolCall],
+    pub(crate) frame: &'a crate::runtime::runner::round_frame::RoundFrame<'frame>,
+    pub(crate) session: &'a mut Session,
+    pub(crate) runtime_state: &'a mut AgentRuntimeState,
+    pub(crate) task_context: &'a mut Option<TaskLoopContext>,
+    pub(crate) compression_model_name: Option<&'a str>,
+    pub(crate) compression_model_provider: Option<&'a Arc<dyn LLMProvider>>,
+    pub(crate) tool_schemas: &'a [ToolSchema],
+    /// Provider/session-resolved function membership at this conversation position.
+    pub(crate) effective_callable_set: &'a EffectiveCallableSet,
+}
+
+pub(crate) async fn execute_round_tool_calls(
+    execution: RoundToolExecution<'_, '_>,
+) -> Result<RoundToolExecutionResult, AgentError> {
+    let RoundToolExecution {
+        tool_calls,
+        frame,
+        session,
+        runtime_state,
+        task_context,
+        compression_model_name,
+        compression_model_provider,
+        tool_schemas,
+        effective_callable_set,
+    } = execution;
+
+    // Bind frame fields as locals so the rest of the function body stays unchanged.
+    let event_tx = frame.event_tx;
+    let metrics_collector = frame.metrics_collector;
+    let session_id = frame.session_id;
+    let round_id = frame.round_id;
+    let round = frame.turn;
+    let tools = frame.tools;
+    let config = frame.config;
+    let llm = frame.llm;
+
+    // Build the executor's full tool-schema list ONCE for this round instead of
+    // on every individual tool call (the per-call path previously called
+    // `tools.list_tools()`, which clones all ~25 schemas — each carrying a JSON
+    // parameters block — per invocation). The slice is threaded into the dispatch
+    // context via `ToolExecutionOnlyContext::available_tool_schemas`. It is a
+    // local, so it is scoped to this round/session and can never leak one
+    // session's tool set into another. NOTE: this is the executor's full set and
+    // is DISTINCT from the `tool_schemas` parameter (the per-session *filtered*
+    // prompt set) — they must not be conflated. The agent loop never
+    // registers/unregisters tools mid-round, so the snapshot stays valid for the
+    // whole round.
+    let available_tool_schemas: Vec<ToolSchema> = tools.list_tools();
+    let available_tool_schemas = available_tool_schemas.as_slice();
+
+    let mut state = RoundExecutionState::default();
+    let mut policy_guard = policy::ToolPolicyGuard::new(
+        config.max_tool_calls_per_round,
+        config.max_consecutive_failures_per_tool,
+    );
+
+    // Pre-classify all tool calls to avoid repeated normalization.
+    let scheduling_modes: Vec<ToolSchedulingMode> = if config
+        .hook_runner
+        .has_hooks_for(AgentHookPoint::BeforeToolExecution)
+    {
+        vec![ToolSchedulingMode::Sequential; tool_calls.len()]
+    } else {
+        tool_calls
+            .iter()
+            .map(|tc| scheduling_mode_for_tool_call(tc, tools))
+            .collect()
+    };
+
+    let mut next_index = 0usize;
+    'tool_calls: while next_index < tool_calls.len() {
+        let tool_call = &tool_calls[next_index];
+
+        if scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe {
+            let batch_start = next_index;
+            while next_index < tool_calls.len()
+                && scheduling_modes[next_index] == ToolSchedulingMode::ParallelSafe
+            {
+                next_index += 1;
+            }
+
+            let batch = &tool_calls[batch_start..next_index];
+
+            let policy_precheck_error = batch
+                .iter()
+                .enumerate()
+                .find_map(|(offset, call)| policy_guard.check_before_execution(call, offset).err());
+
+            if policy_precheck_error.is_some() {
+                for batch_call in batch {
+                    let control = execute_and_apply_single_tool_call(
+                        batch_call,
+                        event_tx,
+                        metrics_collector,
+                        session_id,
+                        round_id,
+                        round,
+                        session,
+                        tools,
+                        config,
+                        effective_callable_set,
+                        available_tool_schemas,
+                        runtime_state,
+                        task_context,
+                        &mut state,
+                        &mut policy_guard,
+                        0,
+                    )
+                    .await?;
+
+                    maybe_apply_mid_turn_context_compression_after_tool(
+                        session,
+                        config,
+                        llm,
+                        event_tx,
+                        session_id,
+                        compression_model_name,
+                        compression_model_provider,
+                        tool_schemas,
+                    )
+                    .await;
+
+                    if control.should_break || control.stop_round {
+                        break 'tool_calls;
+                    }
+                }
+                continue;
+            }
+
+            // Single parallel-safe tool: execute directly, skip join_all overhead
+            if batch.len() == 1 {
+                let control = execute_and_apply_single_tool_call(
+                    &batch[0],
+                    event_tx,
+                    metrics_collector,
+                    session_id,
+                    round_id,
+                    round,
+                    session,
+                    tools,
+                    config,
+                    effective_callable_set,
+                    available_tool_schemas,
+                    runtime_state,
+                    task_context,
+                    &mut state,
+                    &mut policy_guard,
+                    0,
+                )
+                .await?;
+
+                maybe_apply_mid_turn_context_compression_after_tool(
+                    session,
+                    config,
+                    llm,
+                    event_tx,
+                    session_id,
+                    compression_model_name,
+                    compression_model_provider,
+                    tool_schemas,
+                )
+                .await;
+
+                if control.should_break || control.stop_round {
+                    break 'tool_calls;
+                }
+                continue;
+            }
+
+            // A true parallel batch has one admission boundary: refresh once
+            // before any task is spawned, then freeze one flags snapshot across
+            // every already-started call. A transition during the batch applies
+            // at the next sequential call or batch, never nondeterministically
+            // to only part of this batch.
+            super::state_bridge::refresh_tool_boundary_authorities(
+                session,
+                runtime_state,
+                config.storage.as_ref(),
+            )
+            .await?;
+
+            let tool_names: Vec<&str> = batch.iter().map(|tc| tc.function.name.as_str()).collect();
+            tracing::info!(
+                "[{}][round:{}] ⚡ Executing {} parallel-safe tool calls concurrently: {:?}",
+                session_id,
+                round,
+                batch.len(),
+                tool_names
+            );
+
+            let parallel_start = std::time::Instant::now();
+            let per_tool_timeout = std::time::Duration::from_secs(config.per_tool_timeout_secs);
+            let batch_timeout = std::time::Duration::from_secs(config.parallel_batch_timeout_secs);
+            // Derive once before the parallel borrow; the Copy flags struct is
+            // captured by each concurrent task (we can't borrow `&mut session`
+            // inside them).
+            let session_flags = bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session_and_configured_mode(
+                session,
+                config.permission_mode.unwrap_or_default(),
+            );
+            let root_session_id = session.root_session_id.clone();
+            let root_session_id = root_session_id.as_str();
+            let executing_supervisor =
+                ExecutingSupervisorObservation::capture_from_executing_session(session);
+            let root_orchestration_only = session.root_orchestration_only_enabled();
+            let outcomes = tokio::time::timeout(
+                batch_timeout,
+                join_all(batch.iter().map(|tool_call| {
+                    let timeout = per_tool_timeout;
+                    async move {
+                        tokio::time::timeout(
+                            timeout,
+                            per_call::execute_model_requested_tool_call_only(
+                                effective_callable_set,
+                                per_call::ToolExecutionOnlyContext {
+                                    tool_call,
+                                    event_tx,
+                                    metrics_collector,
+                                    session_id,
+                                    root_orchestration_only,
+                                    root_session_id,
+                                    executing_supervisor,
+                                    round_id,
+                                    round,
+                                    tools,
+                                    config,
+                                    hook_session: None,
+                                    hook_runtime_state: None,
+                                    session_flags,
+                                    available_tool_schemas,
+                                },
+                            ),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Ok(per_call::ToolExecutionOutcome {
+                                permission_replay_origin: None,
+                                needs_human: None,
+                                post_tool_hook_eligible: true,
+                                result: Err(format!(
+                                    "Tool '{}' timed out after {:?}",
+                                    tool_call.function.name, timeout
+                                )),
+                                tool_duration: timeout,
+                            })
+                        })
+                    }
+                })),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                tracing::warn!(
+                    "[{}][round:{}] Parallel batch timed out after {:?}",
+                    session_id,
+                    round,
+                    batch_timeout
+                );
+                batch
+                    .iter()
+                    .map(|_batch_call| {
+                        Ok(per_call::ToolExecutionOutcome {
+                            permission_replay_origin: None,
+                            needs_human: None,
+                            post_tool_hook_eligible: true,
+                            result: Err(format!(
+                                "Parallel batch timed out after {:?}",
+                                batch_timeout
+                            )),
+                            tool_duration: batch_timeout,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let outcomes = outcomes
+                .into_iter()
+                .collect::<Result<Vec<_>, AgentError>>()?;
+            let parallel_elapsed = parallel_start.elapsed();
+
+            // Log individual tool durations to confirm parallelism
+            let individual_durations: Vec<String> = batch
+                .iter()
+                .zip(outcomes.iter())
+                .map(|(tc, o)| format!("{}={:?}", tc.function.name, o.tool_duration))
+                .collect();
+            let sum_sequential: std::time::Duration =
+                outcomes.iter().map(|o| o.tool_duration).sum();
+            tracing::info!(
+                "[{}][round:{}] ⚡ Parallel batch completed in {:?} (sequential would be {:?}, speedup {:.1}x): [{}]",
+                session_id,
+                round,
+                parallel_elapsed,
+                sum_sequential,
+                if parallel_elapsed.as_millis() > 0 {
+                    sum_sequential.as_millis() as f64 / parallel_elapsed.as_millis() as f64
+                } else {
+                    1.0
+                },
+                individual_durations.join(", ")
+            );
+
+            // Compress all outcomes in parallel before applying sequentially.
+            let max_tool_tokens = session
+                .effective_token_budget()
+                .map(|b| b.max_tool_output_tokens)
+                .unwrap_or(0);
+            let pressure = build_context_pressure(session);
+            let task_hint = build_task_compression_hint(task_context);
+            let compressed: Vec<_> =
+                join_all(batch.iter().zip(outcomes).map(|(batch_call, outcome)| {
+                    let tool_name = batch_call.function.name.clone();
+                    let args = batch_call.function.arguments.clone();
+                    let sid = session_id.to_string();
+                    let pressure = pressure
+                        .as_ref()
+                        .map(|p| output_compressor::ContextPressure {
+                            usage_percent: p.usage_percent,
+                            remaining_tokens: p.remaining_tokens,
+                        });
+                    let task_hint = task_hint.clone();
+                    async move {
+                        output_compressor::maybe_compress(
+                            &tool_name,
+                            &args,
+                            &sid,
+                            outcome,
+                            max_tool_tokens,
+                            pressure,
+                            task_hint.as_ref(),
+                        )
+                        .await
+                    }
+                }))
+                .await;
+
+            for (batch_call, outcome) in batch.iter().zip(compressed) {
+                policy_guard.observe_outcome(batch_call, &outcome.result);
+
+                let should_break = per_call::apply_tool_execution_outcome(
+                    per_call::ToolExecutionApplyContext {
+                        tool_call: batch_call,
+                        event_tx,
+                        metrics_collector,
+                        session_id,
+                        round_id,
+                        round,
+                        session,
+                        tools,
+                        session_flags,
+                        config,
+                        runtime_state,
+                        task_context,
+                        state: &mut state,
+                    },
+                    outcome,
+                )
+                .await?;
+
+                maybe_apply_mid_turn_context_compression_after_tool(
+                    session,
+                    config,
+                    llm,
+                    event_tx,
+                    session_id,
+                    compression_model_name,
+                    compression_model_provider,
+                    tool_schemas,
+                )
+                .await;
+
+                if should_break {
+                    break 'tool_calls;
+                }
+            }
+
+            continue;
+        }
+
+        let control = execute_and_apply_single_tool_call(
+            tool_call,
+            event_tx,
+            metrics_collector,
+            session_id,
+            round_id,
+            round,
+            session,
+            tools,
+            config,
+            effective_callable_set,
+            available_tool_schemas,
+            runtime_state,
+            task_context,
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
+        .await?;
+
+        next_index += 1;
+
+        maybe_apply_mid_turn_context_compression_after_tool(
+            session,
+            config,
+            llm,
+            event_tx,
+            session_id,
+            compression_model_name,
+            compression_model_provider,
+            tool_schemas,
+        )
+        .await;
+
+        if control.should_break || control.stop_round {
+            break;
+        }
+    }
+
+    Ok(state.into_result())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        execute_round_tool_calls, legacy_effective_callable_set, scheduling_mode_for_tool_call,
+        RoundToolExecution, RoundToolExecutionResult, ToolSchedulingMode,
+    };
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::tools::{
+        FunctionCall, FunctionSchema, ToolCall, ToolExecutionContext, ToolExecutor, ToolOutcome,
+        ToolResult, ToolSchema,
+    };
+    use bamboo_agent_core::{AgentError, AgentEvent, Message, Session};
+    use bamboo_domain::{
+        AgentRuntimeState, CapabilityLoadingMode, ClassifiedToolSchema, EffectiveCallableSet,
+        PermissionAuditSnapshot, SessionPermissionMode,
+    };
+    use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
+    use bamboo_tools::BuiltinToolExecutor;
+    use futures::stream;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    fn tool_call(name: &str) -> ToolCall {
+        tool_call_with_args(name, json!({}))
+    }
+
+    fn tool_call_with_args(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    fn builtin_tools() -> Arc<dyn ToolExecutor> {
+        Arc::new(BuiltinToolExecutor::new())
+    }
+
+    #[derive(Clone, Copy)]
+    enum BoundaryTransition {
+        Mode(SessionPermissionMode, u64),
+        RootOrchestrationOnly,
+        FailNextLoad,
+        RemoveSession,
+    }
+
+    struct BoundaryStorage {
+        session: Mutex<Option<Session>>,
+        loads: AtomicUsize,
+        fail_on_load: AtomicUsize,
+    }
+
+    impl BoundaryStorage {
+        fn new(session: Session) -> Self {
+            Self {
+                session: Mutex::new(Some(session)),
+                loads: AtomicUsize::new(0),
+                fail_on_load: AtomicUsize::new(0),
+            }
+        }
+
+        fn apply(&self, transition: BoundaryTransition) {
+            match transition {
+                BoundaryTransition::Mode(mode, audit_revision) => {
+                    let mut guard = self.session.lock().expect("boundary storage lock");
+                    let mut session = guard.clone().expect("transition requires session");
+                    session
+                        .agent_runtime_state
+                        .get_or_insert_with(AgentRuntimeState::default)
+                        .set_permission_mode(mode);
+                    permission_audit(mode, audit_revision).write_to(&mut session.metadata);
+                    *guard = Some(session);
+                }
+                BoundaryTransition::RootOrchestrationOnly => {
+                    let mut guard = self.session.lock().expect("boundary storage lock");
+                    let mut session = guard.clone().expect("transition requires session");
+                    session.set_root_orchestration_only(true).unwrap();
+                    *guard = Some(session);
+                }
+                BoundaryTransition::FailNextLoad => {
+                    self.fail_on_load
+                        .store(self.loads.load(Ordering::SeqCst) + 1, Ordering::SeqCst);
+                }
+                BoundaryTransition::RemoveSession => {
+                    *self.session.lock().expect("boundary storage lock") = None;
+                }
+            }
+        }
+
+        fn load_count(&self) -> usize {
+            self.loads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for BoundaryStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            *self.session.lock().expect("boundary storage lock") = Some(session.clone());
+            Ok(())
+        }
+
+        async fn load_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+            Ok(self.session.lock().expect("boundary storage lock").clone())
+        }
+
+        async fn load_runtime_control_plane(
+            &self,
+            _session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            let load = self.loads.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_on_load.load(Ordering::SeqCst) == load {
+                return Err(std::io::Error::other("injected control-plane read failure"));
+            }
+            Ok(self.session.lock().expect("boundary storage lock").clone())
+        }
+
+        async fn delete_session(&self, _session_id: &str) -> std::io::Result<bool> {
+            Ok(self
+                .session
+                .lock()
+                .expect("boundary storage lock")
+                .take()
+                .is_some())
+        }
+    }
+
+    struct PermissionBoundaryExecutor {
+        storage: Arc<BoundaryStorage>,
+        transition_on: &'static str,
+        transition: BoundaryTransition,
+        flags: Mutex<HashMap<String, bamboo_agent_core::tools::ToolExecutionSessionFlags>>,
+        approval_requests: AtomicUsize,
+        mutations: AtomicUsize,
+    }
+
+    impl PermissionBoundaryExecutor {
+        fn new(
+            storage: Arc<BoundaryStorage>,
+            transition_on: &'static str,
+            transition: BoundaryTransition,
+        ) -> Self {
+            Self {
+                storage,
+                transition_on,
+                transition,
+                flags: Mutex::new(HashMap::new()),
+                approval_requests: AtomicUsize::new(0),
+                mutations: AtomicUsize::new(0),
+            }
+        }
+
+        fn flags_for(&self, tool: &str) -> bamboo_agent_core::tools::ToolExecutionSessionFlags {
+            *self
+                .flags
+                .lock()
+                .expect("permission probe flags lock")
+                .get(tool)
+                .expect("tool must have entered executor")
+        }
+
+        fn entered(&self, tool: &str) -> bool {
+            self.flags
+                .lock()
+                .expect("permission probe flags lock")
+                .contains_key(tool)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for PermissionBoundaryExecutor {
+        async fn execute(
+            &self,
+            call: &ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            Ok(ToolResult::text(
+                true,
+                format!("{} complete", call.function.name),
+            ))
+        }
+
+        async fn execute_with_context_outcome(
+            &self,
+            call: &ToolCall,
+            ctx: ToolExecutionContext<'_>,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolOutcome> {
+            self.flags
+                .lock()
+                .expect("permission probe flags lock")
+                .insert(
+                    call.function.name.clone(),
+                    bamboo_agent_core::tools::ToolExecutionSessionFlags {
+                        bypass_permissions: ctx.bypass_permissions,
+                        auto_approve_permissions: ctx.auto_approve_permissions,
+                        plan_read_only: ctx.plan_read_only,
+                    },
+                );
+            if call.function.name == self.transition_on {
+                self.storage.apply(self.transition);
+            }
+            if matches!(call.function.name.as_str(), "mutation" | "after_batch") {
+                if ctx.auto_approve_permissions {
+                    self.mutations.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.approval_requests.fetch_add(1, Ordering::SeqCst);
+                    return Ok(ToolOutcome::NeedsHuman {
+                        question: bamboo_agent_core::PendingQuestion {
+                            tool_call_id: call.id.clone(),
+                            tool_name: call.function.name.clone(),
+                            question: "Approve mutation?".to_string(),
+                            options: vec!["approve".to_string(), "deny".to_string()],
+                            allow_custom: false,
+                            source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+                        },
+                        result: ToolResult::text(false, "approval required"),
+                    });
+                }
+            }
+            Ok(ToolOutcome::Completed(ToolResult::text(
+                true,
+                format!("{} complete", call.function.name),
+            )))
+        }
+
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            [
+                "Read",
+                "Bash",
+                "prepare",
+                "mutation",
+                "parallel_a",
+                "parallel_b",
+                "after_batch",
+            ]
+            .into_iter()
+            .map(|name| ToolSchema {
+                schema_type: "function".to_string(),
+                function: FunctionSchema {
+                    name: name.to_string(),
+                    description: "permission boundary probe".to_string(),
+                    parameters: json!({"type": "object", "properties": {}}),
+                },
+            })
+            .collect()
+        }
+
+        fn call_parallel_classification(
+            &self,
+            call: &ToolCall,
+        ) -> (bamboo_agent_core::tools::ToolMutability, bool) {
+            if call.function.name.starts_with("parallel_") {
+                (bamboo_agent_core::tools::ToolMutability::ReadOnly, true)
+            } else {
+                (bamboo_agent_core::tools::ToolMutability::Mutating, false)
+            }
+        }
+    }
+
+    struct BoundaryNoopProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for BoundaryNoopProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    fn permission_audit(mode: SessionPermissionMode, revision: u64) -> PermissionAuditSnapshot {
+        let resolution =
+            bamboo_domain::resolve_permission_mode(mode, bamboo_domain::PermissionMode::Default);
+        PermissionAuditSnapshot {
+            audit_revision: revision,
+            policy_revision: revision,
+            resolution,
+            executor_mapping: format!("bamboo_runtime:{}", resolution.effective.as_str()),
+            transitioned_at: format!("2026-07-31T12:00:{:02}Z", revision.min(59)),
+        }
+    }
+
+    fn permission_session(id: &str, mode: SessionPermissionMode, revision: u64) -> Session {
+        let mut session = Session::new(id, "model");
+        let mut runtime_state = AgentRuntimeState::new("permission-boundary-run");
+        runtime_state.set_permission_mode(mode);
+        session.agent_runtime_state = Some(runtime_state);
+        permission_audit(mode, revision).write_to(&mut session.metadata);
+        session
+    }
+
+    fn named_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    async fn run_permission_boundary_calls(
+        storage: Arc<BoundaryStorage>,
+        executor: Arc<PermissionBoundaryExecutor>,
+        session: Session,
+        calls: &[ToolCall],
+    ) -> (
+        Result<RoundToolExecutionResult, AgentError>,
+        Session,
+        AgentRuntimeState,
+        Vec<AgentEvent>,
+    ) {
+        let tool_schemas = executor.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&tool_schemas);
+        run_permission_boundary_calls_with_set(
+            storage,
+            executor,
+            session,
+            calls,
+            tool_schemas,
+            effective_callable_set,
+        )
+        .await
+    }
+
+    async fn run_permission_boundary_calls_with_set(
+        storage: Arc<BoundaryStorage>,
+        executor: Arc<PermissionBoundaryExecutor>,
+        mut session: Session,
+        calls: &[ToolCall],
+        tool_schemas: Vec<ToolSchema>,
+        effective_callable_set: EffectiveCallableSet,
+    ) -> (
+        Result<RoundToolExecutionResult, AgentError>,
+        Session,
+        AgentRuntimeState,
+        Vec<AgentEvent>,
+    ) {
+        let storage_port: Arc<dyn Storage> = storage;
+        let tools: Arc<dyn ToolExecutor> = executor;
+        let config = crate::runtime::config::AgentLoopConfig {
+            storage: Some(storage_port),
+            ..Default::default()
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let llm: Arc<dyn LLMProvider> = Arc::new(BoundaryNoopProvider);
+        let session_id = session.id.clone();
+        let frame = crate::runtime::runner::round_frame::RoundFrame {
+            session_id: &session_id,
+            round_id: "permission-boundary-round",
+            turn: 0,
+            debug_enabled: false,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            config: &config,
+            llm: &llm,
+            tools: &tools,
+        };
+        let mut runtime_state = session
+            .agent_runtime_state
+            .clone()
+            .expect("permission fixture runtime state");
+        let mut task_context = None;
+        let result = execute_round_tool_calls(RoundToolExecution {
+            tool_calls: calls,
+            frame: &frame,
+            session: &mut session,
+            runtime_state: &mut runtime_state,
+            task_context: &mut task_context,
+            compression_model_name: None,
+            compression_model_provider: None,
+            tool_schemas: &tool_schemas,
+            effective_callable_set: &effective_callable_set,
+        })
+        .await;
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        (result, session, runtime_state, events)
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_boundary_adopts_default_to_auto_before_call_b() {
+        let session =
+            permission_session("boundary-default-auto", SessionPermissionMode::Default, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "prepare",
+            BoundaryTransition::Mode(SessionPermissionMode::Auto, 2),
+        ));
+        let calls = [
+            named_call("call-a", "prepare"),
+            named_call("call-b", "mutation"),
+        ];
+
+        let (result, session, runtime_state, _) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert_eq!(executor.approval_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(executor.mutations.load(Ordering::SeqCst), 1);
+        assert!(executor.flags_for("mutation").auto_approve_permissions);
+        assert_eq!(
+            runtime_state.effective_permission_mode(),
+            SessionPermissionMode::Auto
+        );
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            SessionPermissionMode::Auto
+        );
+        let audit = PermissionAuditSnapshot::from_metadata(&session.metadata).unwrap();
+        assert_eq!(audit.audit_revision, 2);
+        assert_eq!(audit.resolution.requested, SessionPermissionMode::Auto);
+        assert_eq!(storage.load_count(), 2, "one load per sequential call");
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_boundary_adopts_auto_to_default_before_call_b() {
+        let session = permission_session("boundary-auto-default", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "prepare",
+            BoundaryTransition::Mode(SessionPermissionMode::Default, 2),
+        ));
+        let calls = [
+            named_call("call-a", "prepare"),
+            named_call("call-b", "mutation"),
+        ];
+
+        let (result, session, runtime_state, _) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(result.unwrap().awaiting_clarification);
+        assert_eq!(executor.approval_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            executor.mutations.load(Ordering::SeqCst),
+            0,
+            "Default call B must stop at approval rather than reuse stale Auto"
+        );
+        assert!(!executor.flags_for("mutation").auto_approve_permissions);
+        assert_eq!(
+            runtime_state.effective_permission_mode(),
+            SessionPermissionMode::Default
+        );
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            SessionPermissionMode::Default
+        );
+        let audit = PermissionAuditSnapshot::from_metadata(&session.metadata).unwrap();
+        assert_eq!(audit.audit_revision, 2);
+        assert_eq!(audit.resolution.requested, SessionPermissionMode::Default);
+        assert_eq!(storage.load_count(), 2, "one load per sequential call");
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_boundary_fails_closed_before_call_b_on_storage_loss() {
+        for transition in [
+            BoundaryTransition::FailNextLoad,
+            BoundaryTransition::RemoveSession,
+        ] {
+            let session =
+                permission_session("boundary-storage-loss", SessionPermissionMode::Auto, 1);
+            let storage = Arc::new(BoundaryStorage::new(session.clone()));
+            let executor = Arc::new(PermissionBoundaryExecutor::new(
+                storage.clone(),
+                "prepare",
+                transition,
+            ));
+            let calls = [
+                named_call("call-a", "prepare"),
+                named_call("call-b", "mutation"),
+            ];
+
+            let (result, _, _, events) =
+                run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls)
+                    .await;
+
+            let error = match result {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("unreadable authoritative posture must fail closed"),
+            };
+            assert!(error.contains("permission posture refresh failed closed"));
+            assert!(executor.entered("prepare"));
+            assert!(
+                !executor.entered("mutation"),
+                "call B must never enter the executor after an unreadable authoritative posture"
+            );
+            assert_eq!(executor.mutations.load(Ordering::SeqCst), 0);
+            assert!(events.iter().all(|event| {
+                !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "call-b")
+            }));
+            assert_eq!(storage.load_count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn same_round_root_tightening_blocks_stale_sequential_call_before_tool_start() {
+        let session =
+            permission_session("root-sequential-tightening", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "Read",
+            BoundaryTransition::RootOrchestrationOnly,
+        ));
+        let calls = [
+            named_call("read-first", "Read"),
+            named_call("bash-stale", "Bash"),
+        ];
+
+        let (result, running, _, events) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(running.root_orchestration_only_enabled());
+        assert_eq!(running.root_tool_authority_revision, 1);
+        assert!(executor.entered("Read"));
+        assert!(!executor.entered("Bash"));
+        assert!(events.iter().all(|event| {
+            !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "bash-stale")
+        }));
+        assert!(running.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("bash-stale")
+                && message
+                    .content
+                    .contains("outside orchestration-only Root authority")
+        }));
+        assert_eq!(storage.load_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn same_round_root_tightening_refreshes_at_parallel_batch_boundaries() {
+        let session =
+            permission_session("root-parallel-tightening", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "Read",
+            BoundaryTransition::RootOrchestrationOnly,
+        ));
+        let calls = [
+            named_call("read-first", "Read"),
+            named_call("parallel-a-stale", "parallel_a"),
+            named_call("parallel-b-stale", "parallel_b"),
+        ];
+
+        let (result, running, _, events) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(running.root_orchestration_only_enabled());
+        assert!(executor.entered("Read"));
+        assert!(!executor.entered("parallel_a"));
+        assert!(!executor.entered("parallel_b"));
+        for denied in ["parallel-a-stale", "parallel-b-stale"] {
+            assert!(events.iter().all(|event| {
+                !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == denied)
+            }));
+        }
+        assert_eq!(
+            storage.load_count(),
+            2,
+            "one refresh before the parallel batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_call_root_tightening_removes_revoked_schema_next_round() {
+        let session = permission_session("root-next-round", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "Read",
+            BoundaryTransition::RootOrchestrationOnly,
+        ));
+        let calls = [named_call("final-read", "Read")];
+        let (result, mut running, mut runtime_state, _) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(!running.root_orchestration_only_enabled());
+
+        let storage_port: Arc<dyn Storage> = storage.clone();
+        let config = crate::runtime::config::AgentLoopConfig {
+            storage: Some(storage_port),
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        crate::runtime::runner::round_prelude::refresh_round_boundary_and_prompt_context(
+            &mut running,
+            &mut runtime_state,
+            &config,
+            None,
+            &cancel,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(running.root_orchestration_only_enabled());
+        let tools: Arc<dyn ToolExecutor> = executor;
+        let names = crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session(
+            &config,
+            tools.as_ref(),
+            &running,
+        )
+        .into_iter()
+        .map(|schema| schema.function.name)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("Read"));
+        assert!(!names.contains("Bash"));
+        assert!(!names.contains("parallel_a"));
+        assert_eq!(
+            storage.load_count(),
+            2,
+            "tool plus bounded next-round proof read"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_refreshes_once_and_freezes_one_permission_snapshot() {
+        let session = permission_session("boundary-parallel", SessionPermissionMode::Default, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "parallel_a",
+            BoundaryTransition::Mode(SessionPermissionMode::Auto, 2),
+        ));
+        let calls = [
+            named_call("parallel-a", "parallel_a"),
+            named_call("parallel-b", "parallel_b"),
+            named_call("after-batch", "after_batch"),
+        ];
+
+        let (result, _, _, _) =
+            run_permission_boundary_calls(storage.clone(), executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(
+            !executor.flags_for("parallel_a").auto_approve_permissions
+                && !executor.flags_for("parallel_b").auto_approve_permissions,
+            "every already-started call in the batch must share its pre-batch Default snapshot"
+        );
+        assert!(
+            executor.flags_for("after_batch").auto_approve_permissions,
+            "the next safe boundary must adopt the mid-batch Default-to-Auto transition"
+        );
+        assert_eq!(
+            storage.load_count(),
+            2,
+            "one load for the two-call parallel batch plus one for the following sequential call"
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_gate_rejects_one_parallel_call_without_aborting_allowed_sibling() {
+        let session =
+            permission_session("progressive-mixed-parallel", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "never",
+            BoundaryTransition::Mode(SessionPermissionMode::Auto, 1),
+        ));
+        let calls = [
+            named_call("parallel-a", "parallel_a"),
+            named_call("parallel-b", "parallel_b"),
+        ];
+        let tool_schemas = executor.list_tools();
+        let catalog = tool_schemas
+            .iter()
+            .cloned()
+            .filter_map(ClassifiedToolSchema::new)
+            .collect::<Vec<_>>();
+        let effective_callable_set = EffectiveCallableSet::from_catalog(
+            &catalog,
+            CapabilityLoadingMode::Progressive,
+            ["parallel_a"],
+        );
+
+        let (result, session, _, events) = run_permission_boundary_calls_with_set(
+            storage,
+            executor.clone(),
+            session,
+            &calls,
+            tool_schemas,
+            effective_callable_set,
+        )
+        .await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(executor.entered("parallel_a"));
+        assert!(!executor.entered("parallel_b"));
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "parallel-a")
+        ));
+        assert!(events.iter().all(
+            |event| !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "parallel-b")
+        ));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("parallel-a")
+                && message.content.contains("parallel_a complete")
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("parallel-b")
+                && message
+                    .content
+                    .contains("not callable at the current conversation position")
+        }));
+    }
+
+    #[test]
+    fn read_tools_are_parallel_safe() {
+        let tools = builtin_tools();
+        assert_eq!(
+            scheduling_mode_for_tool_call(&tool_call("Read"), &tools),
+            ToolSchedulingMode::ParallelSafe
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(&tool_call("read_file"), &tools),
+            ToolSchedulingMode::ParallelSafe
+        );
+    }
+
+    #[test]
+    fn all_parallel_safe_tools_are_classified_correctly() {
+        let tools = builtin_tools();
+        let parallel_tools = [
+            "GetFileInfo",
+            "Glob",
+            "Grep",
+            "Read",
+            "WebFetch",
+            "WebSearch",
+            "Workspace",
+            "BashOutput",
+            "session_history",
+            "session_history_current",
+            "Sleep",
+        ];
+        for name in &parallel_tools {
+            assert_eq!(
+                scheduling_mode_for_tool_call(&tool_call(name), &tools),
+                ToolSchedulingMode::ParallelSafe,
+                "{name} should be parallel-safe"
+            );
+        }
+
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("session_note", json!({"action": "read"})),
+                &tools
+            ),
+            ToolSchedulingMode::ParallelSafe,
+            "session_note read action should be parallel-safe"
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("session_note", json!({"action": "list_topics"})),
+                &tools
+            ),
+            ToolSchedulingMode::ParallelSafe,
+            "session_note list_topics action should be parallel-safe"
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("session_note", json!({"action": "append", "content": "x"})),
+                &tools
+            ),
+            ToolSchedulingMode::Sequential,
+            "session_note append action should be sequential"
+        );
+    }
+
+    #[test]
+    fn aliases_resolve_to_parallel_safe() {
+        let tools = builtin_tools();
+        let aliases = [
+            "read_file",
+            "file_exists",
+            "fileExists",
+            "list_directory",
+            "get_file_info",
+            "getFileInfo",
+            "get_current_dir",
+            "getCurrentDir",
+        ];
+        for alias in &aliases {
+            assert_eq!(
+                scheduling_mode_for_tool_call(&tool_call(alias), &tools),
+                ToolSchedulingMode::ParallelSafe,
+                "alias {alias} should resolve to a parallel-safe tool"
+            );
+        }
+
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("memory_note", json!({"action": "read"})),
+                &tools
+            ),
+            ToolSchedulingMode::ParallelSafe,
+            "memory_note read alias should be parallel-safe"
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("memory_note", json!({"action": "list_topics"})),
+                &tools
+            ),
+            ToolSchedulingMode::ParallelSafe,
+            "memory_note list_topics alias should be parallel-safe"
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(
+                &tool_call_with_args("memory_note", json!({"action": "append", "content": "x"})),
+                &tools
+            ),
+            ToolSchedulingMode::Sequential,
+            "memory_note append alias should be sequential"
+        );
+    }
+
+    #[test]
+    fn side_effect_tools_remain_sequential() {
+        let tools = builtin_tools();
+        let sequential_tools = [
+            "Write",
+            "Edit",
+            "Bash",
+            "Task",
+            "NotebookEdit",
+            "KillShell",
+            "scheduler",
+            "SubSession",
+        ];
+        for name in &sequential_tools {
+            assert_eq!(
+                scheduling_mode_for_tool_call(&tool_call(name), &tools),
+                ToolSchedulingMode::Sequential,
+                "{name} should be sequential"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tools_are_sequential() {
+        let tools = builtin_tools();
+        assert_eq!(
+            scheduling_mode_for_tool_call(&tool_call("mcp__playwright__browser_snapshot"), &tools),
+            ToolSchedulingMode::Sequential,
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(&tool_call("mcp__some_server__some_tool"), &tools),
+            ToolSchedulingMode::Sequential,
+        );
+    }
+
+    #[test]
+    fn unknown_tools_are_sequential() {
+        let tools = builtin_tools();
+        assert_eq!(
+            scheduling_mode_for_tool_call(&tool_call("totally_unknown_tool"), &tools),
+            ToolSchedulingMode::Sequential,
+        );
+        assert_eq!(
+            scheduling_mode_for_tool_call(&tool_call(""), &tools),
+            ToolSchedulingMode::Sequential,
+        );
+    }
+
+    #[test]
+    fn plan_mode_exempt_tools_are_correct() {
+        for name in [
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "request_permissions",
+            "compact_context",
+        ] {
+            assert!(
+                bamboo_tools::orchestrator::plan_mode_allows_tool(name),
+                "{name} should be admitted by the shared Plan gate"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_mode_blocks_mutating_tools_via_classify() {
+        let mutating_tools = [
+            "Write",
+            "Edit",
+            "Bash",
+            "NotebookEdit",
+            "KillShell",
+            "totally_unknown_tool",
+        ];
+        for name in mutating_tools {
+            assert!(
+                !bamboo_tools::orchestrator::plan_mode_allows_tool(name),
+                "{name} should be blocked in plan mode"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_mode_allows_read_only_tools_via_classify() {
+        // Read-only tools should pass through plan mode
+        let read_only_tools = [
+            "Read",
+            "GetFileInfo",
+            "Glob",
+            "Grep",
+            "WebFetch",
+            "WebSearch",
+            "BashOutput",
+            "session_history",
+            "session_history_current",
+            "Sleep",
+        ];
+        for name in read_only_tools {
+            assert!(
+                bamboo_tools::orchestrator::plan_mode_allows_tool(name),
+                "{name} should be read-only (allowed in plan mode)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_gate_remains_authoritative_under_auto() {
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
+        use bamboo_agent_core::Session;
+        use bamboo_config::PermissionMode;
+        use tokio::sync::mpsc;
+
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        let mut session = Session::new("test-session", "test-model");
+        let tools = builtin_tools();
+        let config = crate::runtime::config::AgentLoopConfig {
+            permission_mode: Some(PermissionMode::Plan),
+            ..Default::default()
+        };
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
+
+        let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("test-session");
+        runtime_state.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+        let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
+
+        let tool_call = tool_call_with_args(
+            "Write",
+            json!({"file_path": "/tmp/plan_mode_test.txt", "content": "test"}),
+        );
+
+        let control = execute_and_apply_single_tool_call(
+            &tool_call,
+            &event_tx,
+            None,
+            "test-session",
+            "test-round-1",
+            0,
+            &mut session,
+            &tools,
+            &config,
+            &effective_callable_set,
+            &available_tool_schemas,
+            &mut runtime_state,
+            &mut None,
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
+        .await
+        .unwrap();
+
+        // Should not break the round, just block the tool
+        assert!(!control.should_break);
+        assert!(!control.stop_round);
+
+        // The session should have a tool result message with the plan mode error
+        let last_msg = session.messages.last().expect("should have a tool result");
+        assert!(
+            last_msg.content.contains("Plan mode"),
+            "Tool result should contain 'Plan mode' error, got: {}",
+            last_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_mode_gate_allows_read_in_pipeline() {
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
+        use bamboo_agent_core::Session;
+        use bamboo_config::PermissionMode;
+        use tokio::sync::mpsc;
+
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        let mut session = Session::new("test-session", "test-model");
+        let tools = builtin_tools();
+        let config = crate::runtime::config::AgentLoopConfig {
+            permission_mode: Some(PermissionMode::Plan),
+            ..Default::default()
+        };
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
+
+        let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("test-session");
+        let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
+
+        let temp_dir = std::env::temp_dir().join("bamboo_plan_mode_read_test");
+        std::fs::create_dir_all(&temp_dir).ok();
+        let file_path = temp_dir.join("test.txt");
+        std::fs::write(&file_path, "hello").ok();
+
+        let tool_call =
+            tool_call_with_args("Read", json!({"file_path": file_path.to_str().unwrap()}));
+
+        let control = execute_and_apply_single_tool_call(
+            &tool_call,
+            &event_tx,
+            None,
+            "test-session",
+            "test-round-1",
+            0,
+            &mut session,
+            &tools,
+            &config,
+            &effective_callable_set,
+            &available_tool_schemas,
+            &mut runtime_state,
+            &mut None,
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(!control.should_break);
+        assert!(!control.stop_round);
+
+        let last_msg = session.messages.last().expect("should have a tool result");
+        assert!(
+            !last_msg.content.contains("Plan mode"),
+            "Read should not be blocked in plan mode, got: {}",
+            last_msg.content
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn host_only_request_permissions_is_rejected_before_tool_start_under_auto() {
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
+        use bamboo_agent_core::Session;
+        use bamboo_config::PermissionMode;
+        use tokio::sync::mpsc;
+
+        let (event_tx, mut event_rx) = mpsc::channel(100);
+        let mut session = Session::new("auto-no-prompt", "test-model");
+        let tools = builtin_tools();
+        let config = crate::runtime::config::AgentLoopConfig {
+            permission_mode: Some(PermissionMode::Auto),
+            ..Default::default()
+        };
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
+        let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("auto-no-prompt");
+        runtime_state.set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+        let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
+        let tool_call = tool_call_with_args("request_permissions", json!({}));
+
+        let control = execute_and_apply_single_tool_call(
+            &tool_call,
+            &event_tx,
+            None,
+            "auto-no-prompt",
+            "auto-round-1",
+            0,
+            &mut session,
+            &tools,
+            &config,
+            &effective_callable_set,
+            &available_tool_schemas,
+            &mut runtime_state,
+            &mut None,
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(!control.should_break);
+        assert!(!control.stop_round);
+        assert!(!session.has_pending_question());
+        assert!(session.messages.last().is_some_and(|message| message
+            .content
+            .contains("not callable at the current conversation position")));
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            AgentEvent::NeedClarification { .. } | AgentEvent::ToolStart { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn host_only_request_permissions_is_rejected_before_tool_start_by_default() {
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
+        use bamboo_agent_core::Session;
+        use tokio::sync::mpsc;
+
+        let (event_tx, mut event_rx) = mpsc::channel(100);
+        let mut session = Session::new("typed-no-legacy-pause", "test-model");
+        let tools = builtin_tools();
+        let config = crate::runtime::config::AgentLoopConfig::default();
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
+        let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("typed-no-legacy-pause");
+        let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
+        let tool_call = tool_call_with_args(
+            "request_permissions",
+            json!({
+                "reason": "Need to write a protected file",
+                "permissions": [{
+                    "type": "write_file",
+                    "resource": "/protected/config.toml"
+                }]
+            }),
+        );
+
+        let control = execute_and_apply_single_tool_call(
+            &tool_call,
+            &event_tx,
+            None,
+            "typed-no-legacy-pause",
+            "typed-round-1",
+            0,
+            &mut session,
+            &tools,
+            &config,
+            &effective_callable_set,
+            &available_tool_schemas,
+            &mut runtime_state,
+            &mut None,
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(!control.should_break);
+        assert!(!control.stop_round);
+        assert!(!session.has_pending_question());
+        assert!(session.messages.last().is_some_and(|message| message
+            .content
+            .contains("not callable at the current conversation position")));
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().all(|event| !matches!(
+            event,
+            AgentEvent::NeedClarification { .. } | AgentEvent::ToolStart { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn plan_mode_gate_allows_exit_plan_mode_tool() {
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
+        use bamboo_agent_core::Session;
+        use bamboo_config::PermissionMode;
+        use tokio::sync::mpsc;
+
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        let mut session = Session::new("test-session", "test-model");
+        let tools = builtin_tools();
+        let config = crate::runtime::config::AgentLoopConfig {
+            permission_mode: Some(PermissionMode::Plan),
+            ..Default::default()
+        };
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
+
+        let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("test-session");
+        let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
+
+        let tool_call = tool_call_with_args("ExitPlanMode", json!({"plan": "test plan"}));
+
+        let control = execute_and_apply_single_tool_call(
+            &tool_call,
+            &event_tx,
+            None,
+            "test-session",
+            "test-round-1",
+            0,
+            &mut session,
+            &tools,
+            &config,
+            &effective_callable_set,
+            &available_tool_schemas,
+            &mut runtime_state,
+            &mut None,
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(!control.stop_round);
+        let last_msg = session.messages.last().expect("should have a tool result");
+        assert!(
+            !last_msg
+                .content
+                .contains("Plan mode: ExitPlanMode operation blocked"),
+            "ExitPlanMode should be exempt from plan mode gate, got: {}",
+            last_msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn default_mode_does_not_block_write() {
+        use super::{execute_and_apply_single_tool_call, loop_state::RoundExecutionState, policy};
+        use bamboo_agent_core::Session;
+        use tokio::sync::mpsc;
+
+        let (event_tx, _event_rx) = mpsc::channel(100);
+        let mut session = Session::new("test-session", "test-model");
+        let tools = builtin_tools();
+        let config = crate::runtime::config::AgentLoopConfig::default();
+        let available_tool_schemas = tools.list_tools();
+        let effective_callable_set = legacy_effective_callable_set(&available_tool_schemas);
+
+        let mut state = RoundExecutionState::default();
+        let mut runtime_state = AgentRuntimeState::new("test-session");
+        let mut policy_guard = policy::ToolPolicyGuard::new(80, 3);
+
+        let temp_dir = std::env::temp_dir().join("bamboo_default_mode_test");
+        std::fs::create_dir_all(&temp_dir).ok();
+        let file_path = temp_dir.join("test.txt");
+
+        let tool_call = tool_call_with_args(
+            "Write",
+            json!({"file_path": file_path.to_str().unwrap(), "content": "test"}),
+        );
+
+        let control = execute_and_apply_single_tool_call(
+            &tool_call,
+            &event_tx,
+            None,
+            "test-session",
+            "test-round-1",
+            0,
+            &mut session,
+            &tools,
+            &config,
+            &effective_callable_set,
+            &available_tool_schemas,
+            &mut runtime_state,
+            &mut None,
+            &mut state,
+            &mut policy_guard,
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert!(!control.stop_round);
+        let last_msg = session.messages.last().expect("should have a tool result");
+        assert!(
+            !last_msg.content.contains("Plan mode"),
+            "Write should work in default mode, got: {}",
+            last_msg.content
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn detect_manual_compression_request_sets_flag_when_tool_result_exists() {
+        use super::detect_manual_compression_request;
+        use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
+
+        let mut session = Session::new("s1", "m1");
+
+        // Assistant message with compact_context tool call
+        let mut assistant = Message::assistant("", None);
+        assistant.id = "msg-1".to_string();
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call-1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "compact_context".to_string(),
+                arguments: r#"{"instructions":"keep API signatures"}"#.to_string(),
+            },
+        }]);
+        session.messages.push(assistant);
+
+        // Tool result message
+        let mut tool_result = Message::tool_result("call-1", "Context compression requested");
+        tool_result.id = "msg-2".to_string();
+        session.messages.push(tool_result);
+
+        assert!(session.force_manual_compression.is_none());
+        detect_manual_compression_request(&mut session);
+        assert_eq!(
+            session.force_manual_compression.as_deref(),
+            Some("keep API signatures")
+        );
+    }
+
+    #[test]
+    fn detect_manual_compression_request_extracts_empty_when_no_instructions() {
+        use super::detect_manual_compression_request;
+        use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
+
+        let mut session = Session::new("s2", "m2");
+
+        let mut assistant = Message::assistant("", None);
+        assistant.id = "msg-1".to_string();
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call-2".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "compact_context".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        session.messages.push(assistant);
+
+        let mut tool_result = Message::tool_result("call-2", "ok");
+        tool_result.id = "msg-2".to_string();
+        session.messages.push(tool_result);
+
+        detect_manual_compression_request(&mut session);
+        assert!(session.force_manual_compression.is_some());
+        assert_eq!(session.force_manual_compression.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn detect_manual_compression_request_skips_if_flag_already_set() {
+        use super::detect_manual_compression_request;
+        use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
+
+        let mut session = Session::new("s3", "m3");
+        session.force_manual_compression = Some("already set".to_string());
+
+        let mut assistant = Message::assistant("", None);
+        assistant.id = "msg-1".to_string();
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call-3".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "compact_context".to_string(),
+                arguments: r#"{"instructions":"new instructions"}"#.to_string(),
+            },
+        }]);
+        session.messages.push(assistant);
+
+        let mut tool_result = Message::tool_result("call-3", "ok");
+        tool_result.id = "msg-2".to_string();
+        session.messages.push(tool_result);
+
+        detect_manual_compression_request(&mut session);
+        assert_eq!(
+            session.force_manual_compression.as_deref(),
+            Some("already set")
+        );
+    }
+
+    #[test]
+    fn detect_manual_compression_request_does_nothing_without_tool_result() {
+        use super::detect_manual_compression_request;
+        use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
+
+        let mut session = Session::new("s4", "m4");
+
+        // Only the assistant tool call — no tool result yet (tool is in-flight)
+        let mut assistant = Message::assistant("", None);
+        assistant.id = "msg-1".to_string();
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call-4".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "compact_context".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]);
+        session.messages.push(assistant);
+
+        detect_manual_compression_request(&mut session);
+        assert!(session.force_manual_compression.is_none());
+    }
+
+    #[test]
+    fn detect_manual_compression_request_does_nothing_for_other_tools() {
+        use super::detect_manual_compression_request;
+        use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
+
+        let mut session = Session::new("s5", "m5");
+
+        let mut assistant = Message::assistant("", None);
+        assistant.id = "msg-1".to_string();
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call-5".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "Read".to_string(),
+                arguments: r#"{"file_path":"/tmp/test"}"#.to_string(),
+            },
+        }]);
+        session.messages.push(assistant);
+
+        let mut tool_result = Message::tool_result("call-5", "file contents");
+        tool_result.id = "msg-2".to_string();
+        session.messages.push(tool_result);
+
+        detect_manual_compression_request(&mut session);
+        assert!(session.force_manual_compression.is_none());
+    }
+
+    #[test]
+    fn detect_manual_compression_request_finds_call_among_parallel_tool_calls() {
+        use super::detect_manual_compression_request;
+        use bamboo_agent_core::tools::FunctionCall;
+        use bamboo_agent_core::tools::ToolCall;
+        use bamboo_agent_core::{Message, Session};
+
+        let mut session = Session::new("s6", "m6");
+
+        // Multiple tool calls in one assistant turn, including compact_context
+        let mut assistant = Message::assistant("", None);
+        assistant.id = "msg-1".to_string();
+        assistant.tool_calls = Some(vec![
+            ToolCall {
+                id: "call-read".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "Read".to_string(),
+                    arguments: r#"{"file_path":"/tmp/a"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "call-compact".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "compact_context".to_string(),
+                    arguments: r#"{"instructions":"preserve error traces"}"#.to_string(),
+                },
+            },
+        ]);
+        session.messages.push(assistant);
+
+        let mut read_result = Message::tool_result("call-read", "file a");
+        read_result.id = "msg-2".to_string();
+        session.messages.push(read_result);
+
+        let mut compact_result = Message::tool_result("call-compact", "ok");
+        compact_result.id = "msg-3".to_string();
+        session.messages.push(compact_result);
+
+        detect_manual_compression_request(&mut session);
+        assert_eq!(
+            session.force_manual_compression.as_deref(),
+            Some("preserve error traces")
+        );
+    }
+}

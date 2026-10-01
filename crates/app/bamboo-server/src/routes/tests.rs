@@ -1,0 +1,2430 @@
+use actix_web::http::{header, StatusCode};
+use actix_web::{test, web, App};
+use tempfile::tempdir;
+
+#[actix_web::test]
+async fn browser_routes_require_access_and_an_existing_chat_session() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".into(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".into()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    for (method, uri) in [
+        ("PUT", "/api/v1/browser/sessions/missing"),
+        ("GET", "/api/v1/browser/sessions/missing"),
+        ("DELETE", "/api/v1/browser/sessions/missing"),
+        ("POST", "/api/v1/browser/sessions/missing/tabs"),
+        ("POST", "/api/v1/browser/sessions/missing/tabs/activate"),
+        ("POST", "/api/v1/browser/sessions/missing/tabs/close"),
+        ("POST", "/api/v1/browser/sessions/missing/navigate"),
+        ("POST", "/api/v1/browser/sessions/missing/history"),
+        ("POST", "/api/v1/browser/sessions/missing/viewport"),
+        ("POST", "/api/v1/browser/sessions/missing/input"),
+        ("POST", "/api/v1/browser/sessions/missing/dialog"),
+        ("GET", "/api/v1/browser/sessions/missing/dom"),
+        ("GET", "/api/v1/browser/sessions/missing/frame"),
+        ("GET", "/api/v1/browser/sessions/missing/screenshot"),
+    ] {
+        let request = match method {
+            "PUT" => test::TestRequest::put(),
+            "POST" => test::TestRequest::post(),
+            "DELETE" => test::TestRequest::delete(),
+            _ => test::TestRequest::get(),
+        }
+        .uri(uri)
+        .peer_addr("198.51.100.7:3000".parse().unwrap())
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({}))
+        .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri}"
+        );
+    }
+
+    // Reuse the same route tree with access disabled to check the handler's
+    // existing-session guard separately from the account access middleware.
+    app_state.config.write().await.access_control = None;
+
+    for uri in [
+        "/api/v1/browser/sessions/missing",
+        "/api/v1/browser/sessions/missing/dom",
+        "/api/v1/browser/sessions/missing/frame",
+        "/api/v1/browser/sessions/missing/screenshot",
+    ] {
+        let request = test::TestRequest::get().uri(uri).to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    let open = test::TestRequest::put()
+        .uri("/api/v1/browser/sessions/missing")
+        .set_json(serde_json::json!({}))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, open).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    for uri in [
+        "/api/v1/browser/sessions/missing/tabs",
+        "/api/v1/browser/sessions/missing/tabs/activate",
+        "/api/v1/browser/sessions/missing/tabs/close",
+    ] {
+        let body = if uri.ends_with("/tabs") {
+            serde_json::json!({"expected_epoch":1})
+        } else {
+            serde_json::json!({"expected_epoch":1,"tab_id":"missing"})
+        };
+        let request = test::TestRequest::post()
+            .uri(uri)
+            .set_json(body)
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, request).await.status(),
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+
+    let missing_dialog = test::TestRequest::post()
+        .uri("/api/v1/browser/sessions/missing/dialog")
+        .set_json(serde_json::json!({
+            "dialog_id":"a".repeat(24),"accept":true,"expected_epoch":1
+        }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, missing_dialog).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Reject malformed opaque IDs before dispatching to a browser host. This
+    // also bounds IDs that enter request logs and permission resources.
+    let mut session = bamboo_agent_core::Session::new("known-browser-chat", "test-model");
+    app_state.save_and_cache_session(&mut session).await;
+    for path in ["activate", "close"] {
+        for tab_id in [
+            "short".to_string(),
+            "AAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            "a".repeat(10_000),
+        ] {
+            let uri = format!("/api/v1/browser/sessions/known-browser-chat/tabs/{path}");
+            let request = test::TestRequest::post()
+                .uri(&uri)
+                .set_json(serde_json::json!({"tab_id":tab_id,"expected_epoch":1}))
+                .to_request();
+            assert_eq!(
+                test::call_service(&app, request).await.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri}"
+            );
+        }
+    }
+    let invalid_dialog = test::TestRequest::post()
+        .uri("/api/v1/browser/sessions/known-browser-chat/dialog")
+        .set_json(serde_json::json!({
+            "dialog_id":"a".repeat(10_000),"accept":true,"expected_epoch":1
+        }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, invalid_dialog).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[actix_web::test]
+#[ignore = "requires the Playwright Chromium runtime"]
+async fn browser_tab_routes_identify_the_active_dom_screenshot_and_frame() {
+    use bamboo_agent_core::Session;
+    use serde_json::{json, Value};
+
+    let data_dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let session_id = "browser-tab-route-integration";
+    let mut session = Session::new(session_id, "test-model");
+    state.save_and_cache_session(&mut session).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let base = format!("/api/v1/browser/sessions/{session_id}");
+
+    let opened = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(&base)
+            .set_json(json!({}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened: Value = test::read_body_json(opened).await;
+    assert!(opened["active_tab_id"].is_null());
+    assert!(opened["tabs"].as_array().unwrap().is_empty());
+    let invalid_url = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":opened["page_epoch"],"url":"file:///tmp/secret"}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(invalid_url.status(), StatusCode::BAD_REQUEST);
+
+    let first = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":opened["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first: Value = test::read_body_json(first).await;
+    let first_tab = first["active_tab_id"].as_str().unwrap().to_string();
+    assert_eq!(first["tabs"].as_array().unwrap().len(), 1);
+
+    let created = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":first["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value = test::read_body_json(created).await;
+    let second_tab = created["active_tab_id"].as_str().unwrap().to_string();
+    let created_epoch = created["page_epoch"].to_string();
+    assert_ne!(first_tab, second_tab);
+    assert_eq!(created["tabs"].as_array().unwrap().len(), 2);
+
+    let dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(dom.status(), StatusCode::OK);
+    let dom: Value = test::read_body_json(dom).await;
+    assert_eq!(dom["active_tab_id"], second_tab);
+
+    let screenshot = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/screenshot"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(screenshot.status(), StatusCode::OK);
+    assert_eq!(
+        screenshot.headers().get("X-Tab-Id").unwrap(),
+        second_tab.as_str()
+    );
+    assert_eq!(
+        screenshot
+            .headers()
+            .get("X-Page-Epoch")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        created_epoch.as_str()
+    );
+    assert!(test::read_body(screenshot).await.len() > 1000);
+
+    let frame = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/frame?after=0&wait_ms=5000"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(frame.status(), StatusCode::OK);
+    assert_eq!(
+        frame.headers().get("X-Tab-Id").unwrap(),
+        second_tab.as_str()
+    );
+    assert_eq!(
+        frame
+            .headers()
+            .get("X-Page-Epoch")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        created_epoch.as_str()
+    );
+    assert!(test::read_body(frame).await.len() > 1000);
+
+    let activated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/activate"))
+            .set_json(json!({"tab_id":first_tab,"expected_epoch":created["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let activated: Value = test::read_body_json(activated).await;
+    assert_eq!(activated["active_tab_id"], first_tab);
+    assert_ne!(activated["page_epoch"], created["page_epoch"]);
+
+    let stale = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/close"))
+            .set_json(json!({"tab_id":second_tab,"expected_epoch":created["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let closed =
+        test::call_service(&app, test::TestRequest::delete().uri(&base).to_request()).await;
+    assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+}
+
+#[actix_web::test]
+#[ignore = "requires the Playwright Chromium runtime"]
+async fn browser_frame_route_recovers_after_viewport_then_navigation() {
+    use bamboo_agent_core::Session;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let size = socket.read(&mut request).await.unwrap_or(0);
+                let alpha = std::str::from_utf8(&request[..size])
+                    .is_ok_and(|request| request.starts_with("GET /alpha "));
+                let body: &[u8] = if alpha {
+                    b"<!doctype html><title>Alpha recovery</title><main>Alpha recovery page</main>"
+                } else {
+                    b"<!doctype html><title>Beta recovery</title><main>Beta recovery page</main>"
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    });
+
+    let data_dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let session_id = "browser-frame-route-recovery";
+    let mut session = Session::new(session_id, "test-model");
+    state.save_and_cache_session(&mut session).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let base = format!("/api/v1/browser/sessions/{session_id}");
+    let opened = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(&base)
+            .set_json(json!({}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened: Value = test::read_body_json(opened).await;
+
+    let alpha = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(json!({
+                "url":format!("http://{address}/alpha"),
+                "expected_epoch":opened["page_epoch"]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(alpha.status(), StatusCode::OK);
+    let alpha: Value = test::read_body_json(alpha).await;
+    let tab_id = alpha["active_tab_id"].as_str().unwrap();
+    let alpha_frame = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/frame?after=0&wait_ms=5000"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(alpha_frame.status(), StatusCode::OK);
+    let alpha_seq: u64 = alpha_frame
+        .headers()
+        .get("X-Frame-Seq")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let resized = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/viewport"))
+            .set_json(json!({"width":640,"height":480,"expected_epoch":alpha["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resized.status(), StatusCode::OK);
+    let resized: Value = test::read_body_json(resized).await;
+    let beta = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(json!({
+                "url":format!("http://{address}/beta"),
+                "expected_epoch":resized["page_epoch"]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(beta.status(), StatusCode::OK);
+    let beta: Value = test::read_body_json(beta).await;
+    assert_eq!(beta["active_tab_id"], tab_id);
+    assert_ne!(beta["page_epoch"], resized["page_epoch"]);
+
+    let dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(dom.status(), StatusCode::OK);
+    let dom: Value = test::read_body_json(dom).await;
+    assert_eq!(dom["active_tab_id"], tab_id);
+    assert_eq!(dom["page_epoch"], beta["page_epoch"]);
+    assert!(dom["snapshot"].as_str().unwrap().contains("Beta recovery"));
+
+    let screenshot = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/screenshot"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(screenshot.status(), StatusCode::OK);
+    assert_eq!(screenshot.headers().get("X-Tab-Id").unwrap(), tab_id);
+    assert_eq!(
+        screenshot.headers().get("X-Page-Epoch").unwrap(),
+        beta["page_epoch"].to_string().as_str()
+    );
+    assert!(test::read_body(screenshot).await.starts_with(&[0xff, 0xd8]));
+
+    let frame = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/frame?after=0&wait_ms=5000"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(frame.status(), StatusCode::OK);
+    assert_eq!(frame.headers().get("X-Tab-Id").unwrap(), tab_id);
+    assert_eq!(
+        frame.headers().get("X-Page-Epoch").unwrap(),
+        beta["page_epoch"].to_string().as_str()
+    );
+    let beta_seq: u64 = frame
+        .headers()
+        .get("X-Frame-Seq")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(beta_seq > alpha_seq);
+    assert!(test::read_body(frame).await.starts_with(&[0xff, 0xd8]));
+
+    let closed =
+        test::call_service(&app, test::TestRequest::delete().uri(&base).to_request()).await;
+    assert_eq!(closed.status(), StatusCode::NO_CONTENT);
+    fixture.abort();
+}
+
+#[actix_web::test]
+#[ignore = "requires the Playwright Chromium runtime"]
+async fn browser_dialog_http_and_model_share_one_chat_without_cross_chat_response() {
+    use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
+    use bamboo_agent_core::Session;
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let fixture = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 2048];
+                let size = socket.read(&mut request).await.unwrap_or(0);
+                let background = std::str::from_utf8(&request[..size])
+                    .is_ok_and(|request| request.starts_with("GET /background "));
+                let body: &[u8] = if background {
+                    b"<!doctype html><button style='position:absolute;left:20px;top:20px;width:120px;height:40px' onclick=\"setTimeout(() => { alert('Background dialog'); document.querySelector('output').textContent='background answered' }, 1200)\">Schedule</button><output>idle</output>"
+                } else {
+                    b"<!doctype html><button style='position:absolute;left:20px;top:20px;width:120px;height:40px' onclick=\"alert('Private dialog');document.querySelector('output').textContent='answered'\">Ask</button><output>idle</output>"
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(body).await;
+            });
+        }
+    });
+
+    let data_dir = tempdir().unwrap();
+    let state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    for session_id in ["dialog-owner", "dialog-other"] {
+        let mut session = Session::new(session_id, "test-model");
+        state.save_and_cache_session(&mut session).await;
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let base = "/api/v1/browser/sessions/dialog-owner";
+    let opened = test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(base)
+            .set_json(json!({}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(opened.status(), StatusCode::OK);
+    let opened: Value = test::read_body_json(opened).await;
+    let navigated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(
+                json!({"url":format!("http://{address}/"),"expected_epoch":opened["page_epoch"]}),
+            )
+            .to_request(),
+    )
+    .await;
+    assert_eq!(navigated.status(), StatusCode::OK);
+    let navigated: Value = test::read_body_json(navigated).await;
+    let foreground_tab_id = navigated["active_tab_id"].as_str().unwrap().to_string();
+    let epoch = navigated["page_epoch"].as_u64().unwrap();
+
+    let click = |epoch| {
+        test::TestRequest::post()
+            .uri(&format!("{base}/input"))
+            .set_json(json!({"kind":"click","x":50,"y":35,"expected_epoch":epoch}))
+            .to_request()
+    };
+    let pending = test::call_service(&app, click(epoch)).await;
+    assert_eq!(pending.status(), StatusCode::OK);
+    let pending: Value = test::read_body_json(pending).await;
+    let dialog_id = pending["pending_dialog"]["dialog_id"].as_str().unwrap();
+    assert_eq!(pending["pending_dialog"]["type"], "alert");
+    assert_eq!(pending["pending_dialog"]["message"], "Private dialog");
+    assert_eq!(pending["pending_dialog"]["page_epoch"], epoch);
+
+    let state_response =
+        test::call_service(&app, test::TestRequest::get().uri(base).to_request()).await;
+    assert_eq!(state_response.status(), StatusCode::OK);
+    let browser_state: Value = test::read_body_json(state_response).await;
+    assert_eq!(browser_state["pending_dialog"]["dialog_id"], dialog_id);
+    assert_eq!(
+        test::call_service(&app, click(epoch)).await.status(),
+        StatusCode::CONFLICT
+    );
+    for path in ["dom", "screenshot"] {
+        let blocked = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("{base}/{path}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(blocked.status(), StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(blocked).await;
+        assert_eq!(body["error"]["code"], "dialog_pending");
+    }
+    let tool = crate::tools::browser::BrowserTool::new(state.browser.clone());
+    let mut owner_read_ctx = ToolCtx::none("dialog-test");
+    owner_read_ctx.session_id = Some(Arc::from("dialog-owner"));
+    assert!(tool
+        .invoke(json!({"action":"snapshot"}), owner_read_ctx)
+        .await
+        .is_err_and(|error| error.to_string().contains("use browser tabs")));
+    let wrong = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/dialog"))
+            .set_json(json!({"dialog_id":"0".repeat(24),"accept":true,"expected_epoch":epoch}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::CONFLICT);
+
+    // The HTTP handler serializes omitted text as null. The host must accept
+    // that as an absent prompt value for alert/confirm responses.
+    let accepted = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/dialog"))
+            .set_json(json!({"dialog_id":dialog_id,"accept":true,"expected_epoch":epoch}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let accepted: Value = test::read_body_json(accepted).await;
+    assert!(accepted.get("pending_dialog").is_none());
+    let dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(dom.status(), StatusCode::OK);
+    let dom: Value = test::read_body_json(dom).await;
+    assert!(dom["html"]
+        .as_str()
+        .unwrap()
+        .contains("<output>answered</output>"));
+
+    let second = test::call_service(&app, click(epoch)).await;
+    let second: Value = test::read_body_json(second).await;
+    let second_id = second["pending_dialog"]["dialog_id"].as_str().unwrap();
+    assert_ne!(second_id, dialog_id);
+    let mut other_ctx = ToolCtx::none("dialog-test");
+    other_ctx.session_id = Some(Arc::from("dialog-other"));
+    assert!(tool
+        .invoke(
+            json!({
+                "action":"dialog_respond","dialog_id":second_id,
+                "accept":true,"expected_epoch":epoch
+            }),
+            other_ctx
+        )
+        .await
+        .is_err());
+    let owner_state = state.browser.state("dialog-owner").await.unwrap();
+    assert_eq!(owner_state["pending_dialog"]["dialog_id"], second_id);
+    let mut owner_ctx = ToolCtx::none("dialog-test");
+    owner_ctx.session_id = Some(Arc::from("dialog-owner"));
+    let result = tool
+        .invoke(
+            json!({
+                "action":"dialog_respond","dialog_id":second_id,
+                "accept":true,"expected_epoch":epoch
+            }),
+            owner_ctx,
+        )
+        .await
+        .unwrap();
+    let ToolOutcome::Completed(result) = result else {
+        panic!("browser dialog did not complete")
+    };
+    let result: Value = serde_json::from_str(&result.result).unwrap();
+    assert!(result.get("pending_dialog").is_none());
+    assert_eq!(result["page_epoch"], epoch);
+
+    let created = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs"))
+            .set_json(json!({"expected_epoch":result["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: Value = test::read_body_json(created).await;
+    let background_tab_id = created["active_tab_id"].as_str().unwrap().to_string();
+    let background = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/navigate"))
+            .set_json(json!({"url":format!("http://{address}/background"),"expected_epoch":created["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(background.status(), StatusCode::OK);
+    let background: Value = test::read_body_json(background).await;
+    let scheduled =
+        test::call_service(&app, click(background["page_epoch"].as_u64().unwrap())).await;
+    assert_eq!(scheduled.status(), StatusCode::OK);
+    let scheduled: Value = test::read_body_json(scheduled).await;
+    let activated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/activate"))
+            .set_json(json!({"tab_id":foreground_tab_id,"expected_epoch":scheduled["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let mut background_pending: Value = test::read_body_json(activated).await;
+    for _ in 0..50 {
+        if background_pending.get("pending_dialog").is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(base).to_request()).await;
+        background_pending = test::read_body_json(response).await;
+    }
+    assert_eq!(background_pending["active_tab_id"], foreground_tab_id);
+    assert_eq!(
+        background_pending["pending_dialog"]["tab_id"],
+        background_tab_id
+    );
+    assert_eq!(
+        background_pending["pending_dialog"]["page_epoch"],
+        background_pending["page_epoch"]
+    );
+    let answered = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/dialog"))
+            .set_json(json!({
+                "dialog_id":background_pending["pending_dialog"]["dialog_id"],
+                "accept":true,"expected_epoch":background_pending["page_epoch"]
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(answered.status(), StatusCode::OK);
+    let answered: Value = test::read_body_json(answered).await;
+    assert_eq!(answered["active_tab_id"], foreground_tab_id);
+    let activated = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("{base}/tabs/activate"))
+            .set_json(json!({"tab_id":background_tab_id,"expected_epoch":answered["page_epoch"]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(activated.status(), StatusCode::OK);
+    let background_dom = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{base}/dom"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(background_dom.status(), StatusCode::OK);
+    let background_dom: Value = test::read_body_json(background_dom).await;
+    assert!(background_dom["html"]
+        .as_str()
+        .unwrap()
+        .contains("<output>background answered</output>"));
+
+    state.browser.close("dialog-owner").await.unwrap();
+    state.browser.close("dialog-other").await.unwrap();
+    fixture.abort();
+}
+
+use super::{configure_routes, configure_routes_with_rate_limiting};
+use crate::AppState;
+use bamboo_config::AccessControlConfig;
+
+#[actix_web::test]
+async fn configure_routes_registers_expected_api_prefixes() {
+    let app = test::init_service(App::new().configure(configure_routes)).await;
+
+    let requests = vec![
+        ("GET", "/api/v1/bootstrap"),
+        ("GET", "/api/v1/health"),
+        ("GET", "/api/v1/metrics/persistence"),
+        // Unversioned liveness/readiness probes (#251 finding 6).
+        ("GET", "/healthz"),
+        ("GET", "/readyz"),
+        ("POST", "/api/v1/sessions/example/project-dream/run"),
+        ("GET", "/api/v1/sessions/example/discoverable-tools"),
+        ("POST", "/api/v1/sessions/example/discoverable-tools"),
+        ("DELETE", "/api/v1/sessions/example/discoverable-tools"),
+        ("GET", "/v1/bamboo/workflows"),
+        ("GET", "/v1/bamboo/access/status"),
+        ("PUT", "/v1/bamboo/config/notifications"),
+        ("PUT", "/v1/bamboo/config/connect"),
+        ("GET", "/api/v1/plugins"),
+        ("GET", "/openai/v1/models"),
+        ("GET", "/anthropic/v1/models"),
+        ("GET", "/gemini/v1beta/models"),
+    ];
+
+    for (method, uri) in requests {
+        let req = match method {
+            "POST" => test::TestRequest::post().uri(uri).to_request(),
+            "PUT" => test::TestRequest::put().uri(uri).to_request(),
+            "DELETE" => test::TestRequest::delete().uri(uri).to_request(),
+            _ => test::TestRequest::get().uri(uri).to_request(),
+        };
+        let resp = test::call_service(&app, req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "expected route to be registered: {method} {uri}"
+        );
+    }
+}
+
+#[actix_web::test]
+async fn configure_routes_with_rate_limiting_registers_expected_api_prefixes() {
+    let app = test::init_service(App::new().configure(configure_routes_with_rate_limiting)).await;
+
+    let requests = vec![
+        ("GET", "/api/v1/bootstrap"),
+        ("GET", "/api/v1/health"),
+        ("GET", "/api/v1/metrics/persistence"),
+        // Unversioned liveness/readiness probes (#251 finding 6).
+        ("GET", "/healthz"),
+        ("GET", "/readyz"),
+        ("POST", "/api/v1/sessions/example/project-dream/run"),
+        ("GET", "/api/v1/sessions/example/discoverable-tools"),
+        ("POST", "/api/v1/sessions/example/discoverable-tools"),
+        ("DELETE", "/api/v1/sessions/example/discoverable-tools"),
+        ("GET", "/v1/bamboo/workflows"),
+        ("GET", "/v1/bamboo/access/status"),
+        ("PUT", "/v1/bamboo/config/notifications"),
+        ("PUT", "/v1/bamboo/config/connect"),
+        ("GET", "/api/v1/plugins"),
+        ("GET", "/openai/v1/models"),
+        ("GET", "/anthropic/v1/models"),
+        ("GET", "/gemini/v1beta/models"),
+    ];
+
+    for (method, uri) in requests {
+        let req = match method {
+            "POST" => test::TestRequest::post().uri(uri).to_request(),
+            "PUT" => test::TestRequest::put().uri(uri).to_request(),
+            "DELETE" => test::TestRequest::delete().uri(uri).to_request(),
+            _ => test::TestRequest::get().uri(uri).to_request(),
+        };
+        let resp = test::call_service(&app, req).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "expected route to be registered: {method} {uri}"
+        );
+    }
+}
+
+/// #251 (finding 1): every route that used to live ONLY under bare `/v1/*`
+/// (commands/settings/skills/tools/workspace/copilot/cluster) must now ALSO
+/// resolve under the canonical `/api/v1/*` prefix — proving the alias in
+/// `routes::bamboo_v1::bamboo_v1_routes` actually mounts both prefixes, not
+/// just the legacy one.
+#[actix_web::test]
+async fn bamboo_v1_routes_resolve_under_both_canonical_and_legacy_prefix() {
+    let app = test::init_service(App::new().configure(configure_routes)).await;
+
+    // A representative sample spanning every route group registered by
+    // `bamboo_routes_scope` (commands / settings / skills / tools / workspace /
+    // copilot / provider-catalog / provider-instances / cluster nodes).
+    let relative_paths = [
+        "/commands",
+        "/bamboo/workflows",
+        "/sessions/session/workflow-runs",
+        "/sessions/session/workflow-runs/example",
+        "/bamboo/setup/status",
+        "/bamboo/config",
+        "/bamboo/config/notifications",
+        "/bamboo/config/connect",
+        "/bamboo/access/status",
+        "/bamboo/model-limits/defaults",
+        "/bamboo/tools",
+        "/bamboo/env-vars",
+        "/skills",
+        "/skills/available-tools",
+        "/workspace/recent",
+        "/bamboo/provider-catalog",
+        "/bamboo/settings/provider-instances",
+        "/bamboo/settings/nodes",
+    ];
+
+    for relative in relative_paths {
+        for prefix in ["/api/v1", "/v1"] {
+            let uri = format!("{prefix}{relative}");
+            let req = test::TestRequest::get()
+                .uri(&uri)
+                .insert_header((header::HOST, "localhost:9562"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "expected {uri} to be registered (alias parity, #251 finding 1)"
+            );
+        }
+    }
+}
+
+/// #251 (finding 4): per-session actions (execute/events/stop/history/task/
+/// respond/child-approval) must resolve under BOTH their new canonical nested
+/// `/sessions/{id}/…` form AND their original flat `/…/{id}` form — the flat
+/// form is a permanent legacy alias to the same handler, not a breaking move.
+#[actix_web::test]
+async fn session_subresource_routes_resolve_under_nested_and_flat_alias() {
+    let app = test::init_service(App::new().configure(configure_routes)).await;
+
+    // (method, nested path, flat legacy alias path)
+    let pairs: Vec<(&str, String, String)> = vec![
+        (
+            "GET",
+            "/api/v1/sessions/example/history".to_string(),
+            "/api/v1/history/example".to_string(),
+        ),
+        (
+            "GET",
+            "/api/v1/sessions/example/task".to_string(),
+            "/api/v1/task/example".to_string(),
+        ),
+        (
+            "GET",
+            "/api/v1/sessions/example/task/exists".to_string(),
+            "/api/v1/task/example/exists".to_string(),
+        ),
+        (
+            "GET",
+            "/api/v1/sessions/example/respond/pending".to_string(),
+            "/api/v1/respond/example/pending".to_string(),
+        ),
+        (
+            "POST",
+            "/api/v1/sessions/example/stop".to_string(),
+            "/api/v1/stop/example".to_string(),
+        ),
+        (
+            "POST",
+            "/api/v1/sessions/example/child-approval".to_string(),
+            "/api/v1/child-approval/example".to_string(),
+        ),
+    ];
+
+    for (method, nested, flat) in pairs {
+        for uri in [&nested, &flat] {
+            let req = match method {
+                "POST" => test::TestRequest::post().uri(uri).to_request(),
+                _ => test::TestRequest::get().uri(uri).to_request(),
+            };
+            let resp = test::call_service(&app, req).await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "expected {method} {uri} to be registered (nested/alias parity, #251 finding 4)"
+            );
+        }
+    }
+}
+
+#[actix_web::test]
+async fn remote_unverified_request_is_blocked_by_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn lifecycle_hook_dry_run_is_blocked_by_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    for uri in ["/api/v1/bamboo/hooks/test", "/v1/bamboo/hooks/test"] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(uri)
+                .insert_header((header::HOST, "bamboo.example.com"))
+                .set_json(serde_json::json!({
+                    "event": "SessionStart",
+                    "command": "exit 99"
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+    }
+}
+
+#[actix_web::test]
+async fn workflow_run_routes_are_blocked_by_the_same_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+    for (method, uri) in [
+        ("POST", "/api/v1/sessions/session/workflow-runs"),
+        ("GET", "/api/v1/sessions/session/workflow-runs"),
+        ("GET", "/api/v1/sessions/session/workflow-runs/example"),
+        ("POST", "/v1/sessions/session/workflow-runs/example/cancel"),
+    ] {
+        let req = match method {
+            "POST" => test::TestRequest::post(),
+            _ => test::TestRequest::get(),
+        }
+        .uri(uri)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{method} {uri}");
+    }
+}
+
+/// `/api/v1/plugins` (Wave 2 § HTTP agent, `PLUGIN_PLAN.md`) added no new
+/// auth of its own — it is registered inside `agent_routes`'s `/api/v1`
+/// scope (see `routes::agent::plugin_scope`), so it must be blocked by the
+/// exact same `enforce_access_password_middleware` wrap as every other
+/// mutating route in that scope. Mirrors
+/// `remote_unverified_request_is_blocked_by_access_middleware` above,
+/// pointed at the plugin list route instead of `/v1/bamboo/workflows`.
+#[actix_web::test]
+async fn plugin_routes_are_blocked_by_the_same_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/api/v1/plugins")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[actix_web::test]
+async fn access_bootstrap_endpoints_remain_public() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    for req in [
+        test::TestRequest::get()
+            .uri("/v1/bamboo/access/status")
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .to_request(),
+        test::TestRequest::get()
+            .uri("/api/v1/health")
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .to_request(),
+    ] {
+        let resp = test::call_service(&app, req).await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}
+
+#[actix_web::test]
+async fn frontend_bootstrap_is_public_canonical_request_aware_and_secret_free() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let (device, device_token) =
+        crate::handlers::settings::issue_device_token("SECRET_BOOTSTRAP_DEVICE_LABEL");
+    let device_id = device.device_id.clone();
+    let device_hash = device.token_hash.clone();
+    let device_salt = device.token_salt.clone();
+    {
+        let mut config = app_state.config.write().await;
+        let mut access = password_access_control();
+        access.password_credential_ref =
+            Some(bamboo_config::CredentialRef::parse("access.bootstrap.secret").unwrap());
+        access.devices.push(device);
+        config.access_control = Some(access);
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    // The canonical bootstrap stays public even though ordinary agent routes
+    // are credential-gated. Its response reports policy separately from the
+    // current request's lack of credentials.
+    let remote = test::TestRequest::get()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let remote_response = test::call_service(&app, remote).await;
+    assert_eq!(remote_response.status(), StatusCode::OK);
+    assert_eq!(
+        remote_response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .unwrap(),
+        "no-store"
+    );
+    let vary = remote_response
+        .headers()
+        .get(header::VARY)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    for field in ["Cookie", "Authorization", "X-Device-Id"] {
+        assert!(vary.split(',').any(|value| value.trim() == field));
+    }
+    assert!(remote_response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("application/json"));
+    let remote_body = test::read_body(remote_response).await;
+    let remote_json: serde_json::Value = serde_json::from_slice(&remote_body).unwrap();
+    assert_eq!(remote_json["auth"]["policy"], "credential_required");
+    assert_eq!(remote_json["auth"]["request_state"], "unauthenticated");
+    assert_eq!(remote_json["auth"]["password_enabled"], true);
+    assert_eq!(remote_json["auth"]["device_auth_enabled"], true);
+
+    let serialized = String::from_utf8(remote_body.to_vec()).unwrap();
+    for secret in [
+        SECRET_HASH,
+        SECRET_SALT,
+        "SECRET_BOOTSTRAP_DEVICE_LABEL",
+        "access.bootstrap.secret",
+        device_id.as_str(),
+        device_token.as_str(),
+        device_hash.as_str(),
+        device_salt.as_str(),
+    ] {
+        assert!(
+            !serialized.contains(secret),
+            "bootstrap leaked secret material"
+        );
+    }
+
+    // Locality is evaluated from the real request rather than inferred from the
+    // configured policy.
+    let local = test::TestRequest::get()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let local_json: serde_json::Value = test::call_and_read_body_json(&app, local).await;
+    assert_eq!(local_json["auth"]["policy"], "credential_required");
+    assert_eq!(local_json["auth"]["request_state"], "local_bypass");
+
+    // A password-cookie authenticated request is reflected only after the
+    // server has verified the credential and issued its HttpOnly cookie.
+    let verify = test::TestRequest::post()
+        .uri("/api/v1/bamboo/access/verify")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "secret" }))
+        .to_request();
+    let verify_response = test::call_service(&app, verify).await;
+    assert_eq!(verify_response.status(), StatusCode::OK);
+    let cookie = verify_response
+        .headers()
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let cookie_bootstrap = test::TestRequest::get()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::COOKIE, cookie))
+        .to_request();
+    let cookie_json: serde_json::Value =
+        test::call_and_read_body_json(&app, cookie_bootstrap).await;
+    assert_eq!(cookie_json["auth"]["request_state"], "authenticated");
+
+    let device_bootstrap = test::TestRequest::get()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id))
+        .to_request();
+    let device_json: serde_json::Value =
+        test::call_and_read_body_json(&app, device_bootstrap).await;
+    assert_eq!(device_json["auth"]["request_state"], "authenticated");
+
+    // Public matching is exact and canonical-only. A remote sibling remains
+    // gated; the legacy prefix is observably absent when local bypass allows
+    // the request through routing; non-GET methods cannot invoke the handler.
+    let sibling = test::TestRequest::get()
+        .uri("/api/v1/bootstrap/extra")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, sibling).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let legacy = test::TestRequest::get()
+        .uri("/v1/bootstrap")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, legacy).await.status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let post = test::TestRequest::post()
+        .uri("/api/v1/bootstrap")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    assert!(!test::call_service(&app, post).await.status().is_success());
+
+    let protected = test::TestRequest::get()
+        .uri("/api/v1/sessions")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, protected).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[actix_web::test]
+async fn verified_cookie_allows_remote_request_through_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let verify_req = test::TestRequest::post()
+        .uri("/v1/bamboo/access/verify")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "secret" }))
+        .to_request();
+    let verify_resp = test::call_service(&app, verify_req).await;
+    assert_eq!(verify_resp.status(), StatusCode::OK);
+
+    let set_cookie = verify_resp
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("verify response should set cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let protected_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::COOKIE, set_cookie))
+        .to_request();
+    let protected_resp = test::call_service(&app, protected_req).await;
+    assert_eq!(protected_resp.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn system_prompt_snapshot_route_returns_project_dream_over_http() {
+    let data_dir = tempdir().unwrap();
+    bamboo_config::paths::init_bamboo_dir(data_dir.path().to_path_buf());
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+
+    let mut session = bamboo_agent_core::Session::new("session-http-project-dream", "gpt-5");
+    session.add_message(bamboo_agent_core::Message::system(
+        "Base prompt\n\n<!-- BAMBOO_EXTERNAL_MEMORY_START -->\n## External Memory (Persistent)\n\n### Project Dream Summary\n````md\nHTTP project dream content\n````\n\n### Session Memory Note (markdown)\n````md\nHTTP session note content\n````\n<!-- BAMBOO_EXTERNAL_MEMORY_END -->",
+    ));
+    app_state
+        .storage
+        .save_session(&session)
+        .await
+        .expect("save session");
+
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/api/v1/sessions/session-http-project-dream/system-prompt")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = actix_web::body::to_bytes(resp.into_body())
+        .await
+        .expect("read response body");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("parse response payload");
+
+    assert_eq!(
+        payload["dream_notebook"],
+        serde_json::json!("HTTP project dream content")
+    );
+    assert_eq!(
+        payload["project_dream"],
+        serde_json::json!("HTTP project dream content")
+    );
+    assert_eq!(
+        payload["session_memory_note"],
+        serde_json::json!("HTTP session note content")
+    );
+    assert!(payload.get("global_dream_fallback").is_none());
+    assert!(payload["external_memory"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("### Project Dream Summary"));
+}
+
+#[actix_web::test]
+async fn local_request_bypasses_access_middleware() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[actix_web::test]
+async fn dev_reset_route_registered_when_dev_endpoints_enabled() {
+    // Under `cargo test` (a debug build) dev endpoints are enabled, so the route is
+    // wired and matches (non-404). In a release build with no
+    // BAMBOO_ENABLE_DEV_ENDPOINTS it is absent — the production gate is covered by
+    // `routes::agent`'s `dev_endpoints_env_gate_*` unit test.
+    let app = test::init_service(App::new().configure(configure_routes)).await;
+    let req = test::TestRequest::post()
+        .uri("/api/v1/dev/reset")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "dev/reset must be registered when dev endpoints are enabled"
+    );
+}
+
+// --- v2-P1 (#181): `GET /v2/stream` unified WS multiplex ------------------
+
+/// The `/v2/stream` route is registered and reaches its handler. A plain GET
+/// (no WebSocket upgrade headers) is NOT a websocket request, so `actix_ws::handle`
+/// rejects it with `400 Bad Request` — which proves the route is wired through
+/// the `/v2` scope (a missing route would be `404`, a blocked one `401/426`).
+#[actix_web::test]
+async fn v2_stream_route_is_registered_and_reaches_handler() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    // Loopback peer (default test peer is 127.0.0.1) → `local_bypass`, so the
+    // access middleware lets the request through to the handler.
+    let req = test::TestRequest::get().uri("/v2/stream").to_request();
+    let resp = test::call_service(&app, req).await;
+
+    assert_ne!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "/v2/stream must be registered"
+    );
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a non-WebSocket GET reaches the handler and is rejected by actix_ws::handle"
+    );
+}
+
+/// `/v2/stream` upgrade is NOT middleware-gated (#189): browsers cannot set
+/// auth headers on a WS upgrade, so the upgrade is whitelisted and the ws_v2
+/// handler enforces auth via `hello` instead. A remote, password-protected,
+/// credential-less request therefore REACHES the handler (it is NOT the
+/// middleware's `401`); a non-WebSocket GET then gets the handler's own `400`
+/// (no upgrade headers). The handler still serves NO channel without a verified
+/// hello — that contract is covered by the ws_v2 unit tests (`apply_auth_gate`).
+///
+/// The sibling gated routes (`/v2/pair/code`, `/v2/devices`) STAY behind the
+/// middleware: a remote credential-less request is still `401`.
+#[actix_web::test]
+async fn v2_stream_upgrade_is_open_but_siblings_stay_gated() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(AccessControlConfig {
+            password_enabled: true,
+            repair_required: false,
+            password_hash: Some(
+                "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d".to_string(),
+            ),
+            password_salt: Some("01010101010101010101010101010101".to_string()),
+            password_credential_ref: None,
+            password_configured: false,
+            updated_at: None,
+            devices: Vec::new(),
+        });
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    // Remote, no cookie/header credential. The upgrade is whitelisted, so the
+    // middleware does NOT reject it: the request reaches the WS handler, and a
+    // non-WebSocket GET surfaces the handler's 400 (not the middleware's 401).
+    let req = test::TestRequest::get()
+        .uri("/v2/stream")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v2/stream upgrade must NOT be middleware-rejected (#189: hello carries auth)"
+    );
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a non-WebSocket GET reaches the handler and is rejected by actix_ws::handle"
+    );
+
+    // The sibling management routes are still gated: a remote credential-less
+    // request is rejected by the middleware with 401.
+    let gated = test::TestRequest::post()
+        .uri("/v2/pair/code")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, gated).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v2/pair/code must stay middleware-gated"
+    );
+
+    let gated = test::TestRequest::get()
+        .uri("/v2/devices")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    let resp = test::call_service(&app, gated).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v2/devices must stay middleware-gated"
+    );
+}
+
+// --- v2-P2 (#181): per-device token pairing + enforcement -----------------
+
+/// The hash of password "secret" with salt `01..01` (matches the literals above).
+const SECRET_HASH: &str = "a65192f8d645bc4d19765b8ea61bfbb896dc999cb88a4be419518c5493f92c9d";
+const SECRET_SALT: &str = "01010101010101010101010101010101";
+
+fn password_access_control() -> AccessControlConfig {
+    AccessControlConfig {
+        password_enabled: true,
+        repair_required: false,
+        password_hash: Some(SECRET_HASH.to_string()),
+        password_salt: Some(SECRET_SALT.to_string()),
+        password_credential_ref: None,
+        password_configured: false,
+        updated_at: None,
+        devices: Vec::new(),
+    }
+}
+
+/// `POST /v2/pair` with the correct root password issues a device token whose
+/// hash (not the plaintext) is persisted; the token then authenticates a remote
+/// request through the access middleware.
+#[actix_web::test]
+async fn v2_pair_issues_token_that_authenticates_remote_request() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair (public route; self-gates on root password).
+    let pair_req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "root_password": "secret", "label": "iPhone 15" }))
+        .to_request();
+    let pair_resp = test::call_service(&app, pair_req).await;
+    assert_eq!(pair_resp.status(), StatusCode::OK);
+    let body = actix_web::body::to_bytes(pair_resp.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_id = payload["device_id"].as_str().unwrap().to_string();
+    let device_token = payload["device_token"].as_str().unwrap().to_string();
+    assert!(device_token.starts_with("bd1_"));
+    assert!(device_id.starts_with("bamboo_"));
+
+    // The plaintext token is NEVER persisted — only the hash.
+    {
+        let config = app_state.config.read().await;
+        let devices = &config.access_control.as_ref().unwrap().devices;
+        assert_eq!(devices.len(), 1);
+        assert_ne!(devices[0].token_hash, device_token);
+    }
+
+    // The token authenticates a remote request through the middleware.
+    let ok_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id))
+        .to_request();
+    let ok_resp = test::call_service(&app, ok_req).await;
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+
+    // A bogus token is rejected.
+    let bad_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, "Bearer bd1_deadbeef"))
+        .insert_header(("X-Device-Id", "bamboo_000000000000"))
+        .to_request();
+    let bad_resp = test::call_service(&app, bad_req).await;
+    assert_eq!(bad_resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `POST /v2/pair` with a wrong root password is rejected with 401.
+#[actix_web::test]
+async fn v2_pair_rejects_wrong_root_password() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "root_password": "wrong", "label": "x" }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// `POST /v2/pair` when no root password is set returns 400 with guidance.
+#[actix_web::test]
+async fn v2_pair_requires_root_password_to_be_set() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "root_password": "", "label": "x" }))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Changing the root password MUST preserve already-paired devices — replacing
+/// the whole `AccessControlConfig` would silently wipe every device token.
+#[actix_web::test]
+async fn password_change_preserves_paired_devices() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair a device.
+    let pair_req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "root_password": "secret", "label": "iPad" }))
+        .to_request();
+    let pair_resp = test::call_service(&app, pair_req).await;
+    assert_eq!(pair_resp.status(), StatusCode::OK);
+    let device_count_before = app_state
+        .config
+        .read()
+        .await
+        .access_control
+        .as_ref()
+        .unwrap()
+        .devices
+        .len();
+    assert_eq!(device_count_before, 1);
+
+    // Change the root password (local bypass → current_password not required).
+    let expected_revision = app_state
+        .config_facade
+        .as_ref()
+        .expect("modular config facade")
+        .registry()
+        .access_control
+        .snapshot()
+        .revision;
+    let change_req = test::TestRequest::post()
+        .uri("/v1/bamboo/access/password")
+        .insert_header((header::HOST, "localhost:9562"))
+        .set_json(serde_json::json!({
+            "expected_revision": expected_revision,
+            "action": "replace",
+            "value": "newsecret"
+        }))
+        .to_request();
+    let change_resp = test::call_service(&app, change_req).await;
+    assert_eq!(change_resp.status(), StatusCode::OK);
+
+    // The device survives the password change.
+    let config = app_state.config.read().await;
+    let access = config.access_control.as_ref().unwrap();
+    assert_eq!(
+        access.devices.len(),
+        1,
+        "password change must NOT wipe paired devices"
+    );
+    assert_eq!(access.devices[0].label, "iPad");
+}
+
+// --- v2-P2 (#181, slice 2): pairing codes + /v2/devices management ---------
+
+use crate::handlers::settings::PairingCodeEntry;
+use std::time::Duration;
+
+/// Inject a code directly into the ephemeral store with the given TTL.
+fn inject_code(app_state: &AppState, code: &str, ttl: Duration) {
+    app_state
+        .pairing_codes
+        .insert(code.to_string(), PairingCodeEntry::new(ttl));
+}
+
+/// Inject an already-expired code (expiry in the past).
+fn inject_expired_code(app_state: &AppState, code: &str) {
+    // Reuse a 0-TTL entry: `expires_at == now` ⇒ already expired by the
+    // `>=` predicate, with no sleep needed.
+    app_state.pairing_codes.insert(
+        code.to_string(),
+        PairingCodeEntry::new(Duration::from_secs(0)),
+    );
+}
+
+/// `POST /v2/pair { code }` → redeem a valid code → token authenticates a remote
+/// request; the code is single-use (a second redeem fails).
+#[actix_web::test]
+async fn v2_pair_code_redeems_once_and_token_authenticates() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    inject_code(&app_state, "842913", Duration::from_secs(120));
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Redeem the code.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "842913", "label": "iPad" }))
+        .to_request();
+    let resp = test::call_service(&app, redeem).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_id = payload["device_id"].as_str().unwrap().to_string();
+    let device_token = payload["device_token"].as_str().unwrap().to_string();
+    assert!(device_token.starts_with("bd1_"));
+
+    // The token authenticates a remote request through the middleware.
+    let ok_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, ok_req).await.status(),
+        StatusCode::OK
+    );
+
+    // Second redeem of the SAME code fails (one-time consume).
+    let again = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "842913", "label": "iPad2" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, again).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// An expired code is rejected.
+#[actix_web::test]
+async fn v2_pair_code_expired_is_rejected() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    inject_expired_code(&app_state, "111111");
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "111111", "label": "x" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// An unknown code is rejected.
+#[actix_web::test]
+async fn v2_pair_code_unknown_is_rejected() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "999999", "label": "x" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// Brute-force guard: after the failure threshold, further code redemptions are
+/// rejected for the cooldown; a correct code outside the cooldown still works.
+#[actix_web::test]
+async fn v2_pair_code_brute_force_guard_trips_then_recovers() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // 10 wrong codes trip the cooldown.
+    for _ in 0..10 {
+        let req = test::TestRequest::post()
+            .uri("/v2/pair")
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .set_json(serde_json::json!({ "code": "000000", "label": "x" }))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, req).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // Even a freshly-injected VALID code is now rejected while in cooldown.
+    inject_code(&app_state, "123456", Duration::from_secs(120));
+    let blocked = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "123456", "label": "x" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, blocked).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "valid code must be blocked during cooldown"
+    );
+
+    // Simulate the cooldown elapsing by clearing the guard, then a valid code
+    // (re-injected — the trip cleared outstanding codes) works again.
+    app_state.pairing_code_guard.record_success();
+    inject_code(&app_state, "654321", Duration::from_secs(120));
+    let ok = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "654321", "label": "after-cooldown" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, ok).await.status(),
+        StatusCode::OK,
+        "a correct code outside the cooldown must work"
+    );
+}
+
+/// `GET /v2/devices` lists devices as a summary DTO that EXCLUDES token_hash and
+/// token_salt (assert the serialized JSON has no such keys/values).
+#[actix_web::test]
+async fn v2_devices_list_excludes_secret_material() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    inject_code(&app_state, "424242", Duration::from_secs(120));
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair a device so the list is non-empty.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "424242", "label": "Pixel" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, redeem).await.status(),
+        StatusCode::OK
+    );
+
+    // Grab the persisted secrets so we can assert they don't appear in the list.
+    let (hash, salt) = {
+        let config = app_state.config.read().await;
+        let d = &config.access_control.as_ref().unwrap().devices[0];
+        (d.token_hash.clone(), d.token_salt.clone())
+    };
+
+    // GET /v2/devices (local bypass → reaches the gated handler).
+    let list = test::TestRequest::get()
+        .uri("/v2/devices")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let resp = test::call_service(&app, list).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+    let raw = String::from_utf8(body.to_vec()).unwrap();
+
+    assert!(
+        !raw.contains("token_hash"),
+        "DTO must not expose token_hash key"
+    );
+    assert!(
+        !raw.contains("token_salt"),
+        "DTO must not expose token_salt key"
+    );
+    assert!(!raw.contains(&hash), "DTO must not leak the hash value");
+    assert!(!raw.contains(&salt), "DTO must not leak the salt value");
+
+    let arr: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(arr.as_array().unwrap().len(), 1);
+    assert_eq!(arr[0]["label"], "Pixel");
+    assert_eq!(arr[0]["revoked"], false);
+}
+
+/// `DELETE /v2/devices/{id}` revokes (token stops verifying, has_active_devices
+/// flips when it was the last device); an unknown id → 404.
+#[actix_web::test]
+async fn v2_devices_delete_revokes_and_404s_unknown() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    app_state
+        .update_access_control_credentials(0, true, Default::default(), |config| {
+            config.access_control = Some(password_access_control());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    inject_code(&app_state, "333333", Duration::from_secs(120));
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "333333", "label": "Watch" }))
+        .to_request();
+    let resp = test::call_service(&app, redeem).await;
+    let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_id = payload["device_id"].as_str().unwrap().to_string();
+    let device_token = payload["device_token"].as_str().unwrap().to_string();
+
+    // Token works before revoke.
+    let before = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id.clone()))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, before).await.status(),
+        StatusCode::OK
+    );
+
+    // Revoke (local bypass → reaches the gated handler).
+    let del = test::TestRequest::delete()
+        .uri(&format!("/v2/devices/{device_id}"))
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    assert_eq!(test::call_service(&app, del).await.status(), StatusCode::OK);
+
+    // The row is kept but marked revoked.
+    {
+        let config = app_state.config.read().await;
+        let access = config.access_control.as_ref().unwrap();
+        assert_eq!(access.devices.len(), 1, "revoke keeps the audit row");
+        assert!(access.devices[0].revoked);
+    }
+
+    // Token no longer authenticates (instant revocation). Since this was the last
+    // active device but a root password is still set, remote access still gates.
+    let after = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {device_token}")))
+        .insert_header(("X-Device-Id", device_id.clone()))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, after).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "revoked token must stop authenticating immediately"
+    );
+
+    // Unknown id → 404.
+    let unknown = test::TestRequest::delete()
+        .uri("/v2/devices/bamboo_doesnotexist")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// `POST /v2/devices/{id}/rotate` issues a NEW working token; the OLD token stops
+/// verifying; device_id is unchanged; unknown id → 404.
+#[actix_web::test]
+async fn v2_devices_rotate_swaps_token_and_404s_unknown() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    inject_code(&app_state, "555555", Duration::from_secs(120));
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Pair.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "555555", "label": "Laptop" }))
+        .to_request();
+    let resp = test::call_service(&app, redeem).await;
+    let body = actix_web::body::to_bytes(resp.into_body()).await.unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_id = payload["device_id"].as_str().unwrap().to_string();
+    let old_token = payload["device_token"].as_str().unwrap().to_string();
+
+    // Rotate (local bypass → reaches the gated handler).
+    let rot = test::TestRequest::post()
+        .uri(&format!("/v2/devices/{device_id}/rotate"))
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let rot_resp = test::call_service(&app, rot).await;
+    assert_eq!(rot_resp.status(), StatusCode::OK);
+    let rbody = actix_web::body::to_bytes(rot_resp.into_body())
+        .await
+        .unwrap();
+    let rpayload: serde_json::Value = serde_json::from_slice(&rbody).unwrap();
+    let new_id = rpayload["device_id"].as_str().unwrap().to_string();
+    let new_token = rpayload["device_token"].as_str().unwrap().to_string();
+    assert_eq!(new_id, device_id, "device_id is unchanged across rotation");
+    assert_ne!(new_token, old_token, "rotation issues a different token");
+
+    // OLD token no longer verifies.
+    let old_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {old_token}")))
+        .insert_header(("X-Device-Id", device_id.clone()))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, old_req).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "old token must stop verifying after rotation"
+    );
+
+    // NEW token works, and the label/created_at are preserved.
+    let new_req = test::TestRequest::get()
+        .uri("/v1/bamboo/workflows")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .insert_header((header::AUTHORIZATION, format!("Bearer {new_token}")))
+        .insert_header(("X-Device-Id", device_id.clone()))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, new_req).await.status(),
+        StatusCode::OK
+    );
+    {
+        let config = app_state.config.read().await;
+        let d = &config.access_control.as_ref().unwrap().devices[0];
+        assert_eq!(d.label, "Laptop", "label preserved across rotation");
+        assert!(!d.revoked);
+    }
+
+    // Unknown id → 404.
+    let unknown = test::TestRequest::post()
+        .uri("/v2/devices/bamboo_nope/rotate")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, unknown).await.status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// `POST /v2/pair/code` is GATED: a remote unauthenticated caller is 401 by the
+/// middleware (unlike `/v2/stream`, which is open-upgrade + handler-enforced).
+#[actix_web::test]
+async fn v2_pair_code_requires_auth() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    let req = test::TestRequest::post()
+        .uri("/v2/pair/code")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, req).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "/v2/pair/code must be behind the access middleware"
+    );
+}
+
+/// `POST /v2/pair/code` from a local (bypass) caller returns a 6-digit code +
+/// ttl, and that code then redeems at `/v2/pair`.
+#[actix_web::test]
+async fn v2_pair_code_local_issue_then_redeem() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(App::new().app_data(app_state).configure(configure_routes)).await;
+
+    // Local request → bypass → reaches the gated handler.
+    let code_req = test::TestRequest::post()
+        .uri("/v2/pair/code")
+        .insert_header((header::HOST, "localhost:9562"))
+        .to_request();
+    let code_resp = test::call_service(&app, code_req).await;
+    assert_eq!(code_resp.status(), StatusCode::OK);
+    let body = actix_web::body::to_bytes(code_resp.into_body())
+        .await
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let code = payload["code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 6);
+    assert!(code.chars().all(|c| c.is_ascii_digit()));
+    assert_eq!(payload["ttl"].as_u64().unwrap(), 120);
+
+    // Redeem it.
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": code, "label": "redeemed" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, redeem).await.status(),
+        StatusCode::OK
+    );
+}
+
+// --- #190: per-IP root-password brute-force throttle -------------------------
+
+/// `POST /v1/bamboo/access/verify`: a few wrong passwords still 401; after the
+/// 5th consecutive wrong attempt from one IP the next request gets 429 with a
+/// Retry-After header, and the throttle is keyed PER IP (a different IP is not
+/// blocked). A correct password before the threshold succeeds and resets.
+#[actix_web::test]
+async fn access_verify_throttles_after_threshold_per_ip() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    let attacker = "203.0.113.50:5555".parse().unwrap();
+    let wrong = |peer| {
+        test::TestRequest::post()
+            .uri("/v1/bamboo/access/verify")
+            .peer_addr(peer)
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .set_json(serde_json::json!({ "password": "wrong" }))
+            .to_request()
+    };
+
+    // First 5 wrong attempts are plain 401 (Unauthorized), not throttled.
+    for _ in 0..5 {
+        let resp = test::call_service(&app, wrong(attacker)).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // The 6th request from the SAME IP is now 429 with a Retry-After header, and
+    // the password is not even compared.
+    let blocked = test::call_service(&app, wrong(attacker)).await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        blocked.headers().get(header::RETRY_AFTER).is_some(),
+        "429 must carry a Retry-After header"
+    );
+
+    // A DIFFERENT IP is unaffected (per-IP isolation): a correct password from a
+    // fresh IP succeeds.
+    let other = "198.51.100.77:6666".parse().unwrap();
+    let ok = test::TestRequest::post()
+        .uri("/v1/bamboo/access/verify")
+        .peer_addr(other)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "secret" }))
+        .to_request();
+    assert_eq!(test::call_service(&app, ok).await.status(), StatusCode::OK);
+}
+
+/// A correct password BEFORE the threshold succeeds and resets the counter, so a
+/// later wrong attempt starts a fresh window (no premature lockout for a user who
+/// fat-fingers a couple of times then gets it right).
+#[actix_web::test]
+async fn access_verify_success_resets_counter() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    let peer = "203.0.113.51:5555".parse().unwrap();
+    // 3 wrong attempts (under the threshold).
+    for _ in 0..3 {
+        let resp = test::TestRequest::post()
+            .uri("/v1/bamboo/access/verify")
+            .peer_addr(peer)
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .set_json(serde_json::json!({ "password": "wrong" }))
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, resp).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // A correct password succeeds AND resets the counter.
+    let ok = test::TestRequest::post()
+        .uri("/v1/bamboo/access/verify")
+        .peer_addr(peer)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "secret" }))
+        .to_request();
+    assert_eq!(test::call_service(&app, ok).await.status(), StatusCode::OK);
+
+    // Counter is reset: a single wrong attempt is still just 401, not 429.
+    let after = test::TestRequest::post()
+        .uri("/v1/bamboo/access/verify")
+        .peer_addr(peer)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "password": "wrong" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, after).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A local/loopback request is NEVER throttled, even past the threshold, so the
+/// desktop can never lock itself out.
+#[actix_web::test]
+async fn access_verify_loopback_is_never_throttled() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // 10 wrong attempts from a loopback host — well over the threshold.
+    for _ in 0..10 {
+        let resp = test::TestRequest::post()
+            .uri("/v1/bamboo/access/verify")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .insert_header((header::HOST, "localhost:9562"))
+            .set_json(serde_json::json!({ "password": "wrong" }))
+            .to_request();
+        // Local is never 429; a wrong local password is still a plain 401.
+        assert_eq!(
+            test::call_service(&app, resp).await.status(),
+            StatusCode::UNAUTHORIZED,
+            "loopback must never be throttled"
+        );
+    }
+}
+
+/// `POST /v2/pair` root-password path: after 5 wrong root passwords from one IP,
+/// the next request is 429 with Retry-After (the password is not compared).
+#[actix_web::test]
+async fn v2_pair_root_password_throttles_after_threshold() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    let attacker = "203.0.113.60:7777".parse().unwrap();
+    let wrong = || {
+        test::TestRequest::post()
+            .uri("/v2/pair")
+            .peer_addr(attacker)
+            .insert_header((header::HOST, "bamboo.example.com"))
+            .set_json(serde_json::json!({ "root_password": "wrong", "label": "x" }))
+            .to_request()
+    };
+
+    // 5 wrong root passwords → plain 401.
+    for _ in 0..5 {
+        assert_eq!(
+            test::call_service(&app, wrong()).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    // 6th is throttled with Retry-After.
+    let blocked = test::call_service(&app, wrong()).await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(blocked.headers().get(header::RETRY_AFTER).is_some());
+}
+
+/// The root-password throttle is INDEPENDENT of the existing code-path guard:
+/// burning failures on the root-password path must NOT lock out the code path
+/// (and vice versa). Confirms we did not accidentally double-guard or share state.
+#[actix_web::test]
+async fn root_password_throttle_does_not_block_code_path() {
+    let data_dir = tempdir().unwrap();
+    let app_state = web::Data::new(AppState::new(data_dir.path().to_path_buf()).await.unwrap());
+    {
+        let mut config = app_state.config.write().await;
+        config.access_control = Some(password_access_control());
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+
+    // Trip the root-password guard for this IP (>= threshold wrong root passwords).
+    let attacker = "203.0.113.61:8888".parse().unwrap();
+    for _ in 0..6 {
+        let _ = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/v2/pair")
+                .peer_addr(attacker)
+                .insert_header((header::HOST, "bamboo.example.com"))
+                .set_json(serde_json::json!({ "root_password": "wrong", "label": "x" }))
+                .to_request(),
+        )
+        .await;
+    }
+
+    // The code path (separate guard) still works: inject + redeem a valid code
+    // from the SAME IP succeeds, proving the guards are not shared.
+    inject_code(&app_state, "424242", Duration::from_secs(120));
+    let redeem = test::TestRequest::post()
+        .uri("/v2/pair")
+        .peer_addr(attacker)
+        .insert_header((header::HOST, "bamboo.example.com"))
+        .set_json(serde_json::json!({ "code": "424242", "label": "code-device" }))
+        .to_request();
+    assert_eq!(
+        test::call_service(&app, redeem).await.status(),
+        StatusCode::OK,
+        "code path must be unaffected by the root-password throttle"
+    );
+}

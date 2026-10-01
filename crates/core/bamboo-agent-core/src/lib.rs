@@ -1,0 +1,39 @@
+//! Core agent functionality for Bamboo.
+
+pub mod agent;
+pub mod composition;
+pub mod storage;
+pub mod tools;
+pub mod workspace_state;
+
+// Re-export commonly used types (mirrors current agent/core/mod.rs)
+pub use agent::events::{
+    AgentEvent, GoldCheckpoint, GoldConfidence, GoldDecision, TitleSource, TokenUsage,
+};
+pub use agent::hooks::AgentHook;
+pub use agent::tool_event_display::NativeToolEventDisplay;
+pub use agent::types::{parse_prompt_external_memory_sections, PromptSnapshotExternalMemoryParts};
+pub use agent::types::{
+    CompressionEvent, CompressionTriggerType, ConversationSummary, ImageOcrLine, ImageOcrResult,
+    ImageUrlRef, Message, MessageContent, MessagePart, MessagePhase, PendingQuestion,
+    PendingQuestionSource, PromptMemoryObservability, PromptSnapshot, Role, Session, SessionKind,
+};
+pub use agent::{AgentError, StreamTimeoutError, StreamTimeoutPhase};
+pub use bamboo_domain::{
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+};
+pub use bamboo_domain::{ProviderPromptUsage, TokenBudgetUsage};
+pub use storage::Storage;
+pub use tools::{
+    classify_tool, execute_tool_call, finalize_tool_calls, handle_tool_result_with_agentic_support,
+    handle_tool_result_with_agentic_support_and_persistence, normalize_tool_name, parse_tool_args,
+    parse_tool_args_best_effort, plan_mode_allows_tool, try_parse_agentic_result, AgenticContext,
+    AgenticTool, AgenticToolResult, BashCompletionInfo, BashCompletionSink, FunctionCall,
+    FunctionSchema, RegistryError, SharedTool, SmartCodeReviewTool, Tool, ToolCall,
+    ToolCallAccumulator, ToolError, ToolExecutionContext, ToolExecutor, ToolGoal,
+    ToolHandlingOutcome, ToolMutability, ToolRegistry, ToolResult, ToolResultImage, ToolSchema,
+};
+pub use tools::{
+    AsyncToolCompletionInfo, AsyncToolCompletionSink, AsyncWaitKind, RunningCompletion,
+    RunningHandle, ToolClass, ToolCtx, ToolOutcome, ToolResultFuture,
+};

@@ -1,0 +1,524 @@
+//! Stateful notification service wrapping the pure [`crate::policy`].
+//!
+//! [`NotificationService`] is the object the server holds (behind an `Arc`).
+//! It adds three things to bare classification:
+//!
+//! - a **dedup window** so a repeated event (same `dedup_key`) does not spam the
+//!   user within [`NotificationService::DEDUP_WINDOW`];
+//! - **preference persistence** so updates survive a restart; and
+//! - **per-session relay idempotency** so the server spawns at most one
+//!   notification relay per session.
+//!
+//! All methods take `&self`; interior mutability is provided by `RwLock`,
+//! `Mutex`, and a `DashSet`. The type is intentionally **not** `Clone` — share
+//! it via `Arc`.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use bamboo_agent_core::AgentEvent;
+use bamboo_domain::poison::PoisonRecover;
+use dashmap::DashSet;
+
+use crate::policy;
+use crate::policy::{ClassifiedNotification, NotificationPriority};
+use crate::preferences::NotificationPreferences;
+
+/// Notification policy service: classification + dedup + preference persistence.
+///
+/// Construct with [`NotificationService::new`] and share via `Arc`.
+pub struct NotificationService {
+    /// Current user preferences (hot-swappable via [`Self::set_preferences`]).
+    preferences: RwLock<NotificationPreferences>,
+    /// Last-emitted instant per `dedup_key`, used to suppress rapid repeats.
+    dedup: Mutex<HashMap<String, Instant>>,
+    /// Session ids that currently have a running relay (server idempotency).
+    active_relays: DashSet<String>,
+    /// Path the preferences are persisted to.
+    prefs_path: PathBuf,
+}
+
+impl NotificationService {
+    /// Window within which a repeated `dedup_key` is coalesced (suppressed).
+    pub const DEDUP_WINDOW: Duration = Duration::from_secs(30);
+
+    /// Creates a service, loading preferences from `prefs_path`.
+    ///
+    /// A missing or unparsable file falls back to
+    /// [`NotificationPreferences::default`] (see [`NotificationPreferences::load`]).
+    /// The dedup map and relay set start empty.
+    pub fn new(prefs_path: PathBuf) -> Self {
+        let preferences = NotificationPreferences::load(&prefs_path);
+        Self {
+            preferences: RwLock::new(preferences),
+            dedup: Mutex::new(HashMap::new()),
+            active_relays: DashSet::new(),
+            prefs_path,
+        }
+    }
+
+    /// Classifies `event` and, if notification-worthy and not a recent
+    /// duplicate, materialises an [`AgentEvent::Notification`].
+    ///
+    /// Returns `None` when the policy declines the event (disabled, gated, or
+    /// not notification-worthy) or when an identical `dedup_key` fired within
+    /// [`Self::DEDUP_WINDOW`]. On a successful (non-deduped) emission the dedup
+    /// map is opportunistically pruned of entries older than the window.
+    pub fn notify(&self, session_id: &str, event: &AgentEvent) -> Option<AgentEvent> {
+        let classified = {
+            let prefs = self.preferences.read().recover_poison();
+            policy::classify(session_id, event, &prefs)?
+        };
+        self.dedup_and_mint(session_id, classified)
+    }
+
+    /// Mints a custom notification for the `notify` tool.
+    ///
+    /// This is a passthrough classification (see
+    /// [`policy::classify_custom`]): it does not consult a per-category
+    /// preference — there isn't one for arbitrary agent-chosen content — only
+    /// the master `enabled` switch and the shared dedup window apply. Callers
+    /// choose `priority`; `title`/`body` are used verbatim (no truncation).
+    pub fn mint_custom(
+        &self,
+        session_id: &str,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        priority: NotificationPriority,
+    ) -> Option<AgentEvent> {
+        let title = title.into();
+        let body = body.into();
+        let classified = {
+            let prefs = self.preferences.read().recover_poison();
+            policy::classify_custom(session_id, &title, &body, priority, &prefs)?
+        };
+        self.dedup_and_mint(session_id, classified)
+    }
+
+    /// Mints a schedule-run completion/failure notification (see
+    /// [`policy::classify_schedule_run`] for the full no-double-fire
+    /// rationale): it shares the SAME category/priority/dedup key that
+    /// [`Self::notify`] would derive from the raw `AgentEvent::Complete`/
+    /// `Error` a scheduled run's agent loop also emits, so this is safe to
+    /// call unconditionally alongside the always-on relay — at most one of
+    /// the two ever survives this service's dedup window.
+    pub fn notify_schedule_run(
+        &self,
+        session_id: &str,
+        success: bool,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) -> Option<AgentEvent> {
+        let classified = {
+            let prefs = self.preferences.read().recover_poison();
+            policy::classify_schedule_run(session_id, success, title.into(), body.into(), &prefs)?
+        };
+        self.dedup_and_mint(session_id, classified)
+    }
+
+    /// Shared dedup-check + [`AgentEvent::Notification`] minting used by both
+    /// [`Self::notify`] and [`Self::mint_custom`], once a
+    /// [`ClassifiedNotification`] has already cleared policy gating.
+    fn dedup_and_mint(
+        &self,
+        session_id: &str,
+        classified: ClassifiedNotification,
+    ) -> Option<AgentEvent> {
+        {
+            let mut dedup = self.dedup.lock().recover_poison();
+            if let Some(last) = dedup.get(&classified.dedup_key) {
+                if last.elapsed() < Self::DEDUP_WINDOW {
+                    return None;
+                }
+            }
+            let now = Instant::now();
+            dedup.insert(classified.dedup_key.clone(), now);
+            // Opportunistically drop entries that can no longer suppress anything.
+            dedup.retain(|_, &mut last| last.elapsed() < Self::DEDUP_WINDOW);
+        }
+
+        Some(AgentEvent::Notification {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            category: classified.category.as_str().to_string(),
+            priority: classified.priority.as_str().to_string(),
+            title: classified.title,
+            body: classified.body,
+            dedup_key: Some(classified.dedup_key),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        })
+    }
+
+    /// Returns a snapshot clone of the current preferences.
+    pub fn preferences(&self) -> NotificationPreferences {
+        self.preferences.read().recover_poison().clone()
+    }
+
+    /// Replaces the current preferences and persists them to disk.
+    ///
+    /// The in-memory value is updated first, then written to the configured
+    /// path; a write error is returned but the in-memory update still stands.
+    pub fn set_preferences(&self, prefs: NotificationPreferences) -> std::io::Result<()> {
+        {
+            let mut guard = self.preferences.write().recover_poison();
+            *guard = prefs.clone();
+        }
+        prefs.save(&self.prefs_path)
+    }
+
+    /// Marks `session_id` as having a running relay.
+    ///
+    /// Returns `true` when the session was newly inserted — i.e. the caller is
+    /// the one that should spawn the relay. Returns `false` if a relay is
+    /// already active for this session.
+    pub fn try_begin_relay(&self, session_id: &str) -> bool {
+        self.active_relays.insert(session_id.to_string())
+    }
+
+    /// Clears the running-relay marker for `session_id`.
+    pub fn end_relay(&self, session_id: &str) {
+        self.active_relays.remove(session_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn clarification(question: &str, tool_call_id: &str) -> AgentEvent {
+        AgentEvent::NeedClarification {
+            question: question.to_string(),
+            options: None,
+            tool_call_id: Some(tool_call_id.to_string()),
+            tool_name: None,
+            allow_custom: true,
+            source: None,
+        }
+    }
+
+    fn service() -> (NotificationService, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        (NotificationService::new(path), dir)
+    }
+
+    #[test]
+    fn notify_dedups_within_window_and_refires_other_keys() {
+        let (svc, _dir) = service();
+        let first = svc.notify("sess", &clarification("question", "tc-1"));
+        assert!(first.is_some());
+
+        // Same dedup_key again within the window → suppressed.
+        let second = svc.notify("sess", &clarification("question", "tc-1"));
+        assert!(second.is_none());
+
+        // A different dedup_key (different tool_call_id) still fires.
+        let third = svc.notify("sess", &clarification("question", "tc-2"));
+        assert!(third.is_some());
+    }
+
+    #[test]
+    fn notify_builds_notification_variant_with_expected_fields() {
+        let (svc, _dir) = service();
+        let event = svc
+            .notify("sess-42", &clarification("Need input", "tc-9"))
+            .unwrap();
+        match event {
+            AgentEvent::Notification {
+                session_id,
+                category,
+                priority,
+                title,
+                dedup_key,
+                id,
+                created_at,
+                ..
+            } => {
+                assert_eq!(session_id, "sess-42");
+                assert_eq!(category, "needs_clarification");
+                assert_eq!(priority, "high");
+                assert_eq!(title, "Your input needed");
+                assert_eq!(dedup_key.as_deref(), Some("clarification:sess-42:tc-9"));
+                assert!(!id.is_empty());
+                assert!(!created_at.is_empty());
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_preferences_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        let svc = NotificationService::new(path.clone());
+
+        let updated = NotificationPreferences {
+            enabled: true,
+            on_clarification: false,
+            on_tool_approval: false,
+            on_context_pressure: true,
+            on_subagent_complete: false,
+            on_background_task_complete: true,
+            on_run_complete: false,
+            on_run_failed: true,
+        };
+        svc.set_preferences(updated.clone()).unwrap();
+        assert_eq!(svc.preferences(), updated);
+
+        // A fresh service over the same path reads the persisted value.
+        let reloaded = NotificationService::new(path);
+        assert_eq!(reloaded.preferences(), updated);
+    }
+
+    #[test]
+    fn try_begin_relay_is_idempotent_per_session() {
+        let (svc, _dir) = service();
+        assert!(svc.try_begin_relay("sess"));
+        assert!(!svc.try_begin_relay("sess"));
+
+        svc.end_relay("sess");
+        // After ending, the session can begin a relay again.
+        assert!(svc.try_begin_relay("sess"));
+    }
+
+    #[test]
+    fn notify_returns_none_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        let svc = NotificationService::new(path);
+        svc.set_preferences(NotificationPreferences {
+            enabled: false,
+            ..NotificationPreferences::default()
+        })
+        .unwrap();
+        assert!(svc
+            .notify("sess", &clarification("question", "tc-1"))
+            .is_none());
+    }
+
+    #[test]
+    fn mint_custom_dedups_identical_content_and_refires_on_change() {
+        let (svc, _dir) = service();
+        let first = svc.mint_custom("sess", "Title", "Body", NotificationPriority::Low);
+        assert!(first.is_some());
+
+        // Same title+body within the window → suppressed.
+        let second = svc.mint_custom("sess", "Title", "Body", NotificationPriority::Low);
+        assert!(second.is_none());
+
+        // Different body → distinct dedup key → fires.
+        let third = svc.mint_custom("sess", "Title", "Different body", NotificationPriority::Low);
+        assert!(third.is_some());
+    }
+
+    #[test]
+    fn mint_custom_builds_notification_variant_with_custom_category() {
+        let (svc, _dir) = service();
+        let event = svc
+            .mint_custom(
+                "sess-7",
+                "Heads up",
+                "Something happened",
+                NotificationPriority::Normal,
+            )
+            .unwrap();
+        match event {
+            AgentEvent::Notification {
+                session_id,
+                category,
+                priority,
+                title,
+                body,
+                ..
+            } => {
+                assert_eq!(session_id, "sess-7");
+                assert_eq!(category, "custom");
+                assert_eq!(priority, "normal");
+                assert_eq!(title, "Heads up");
+                assert_eq!(body, "Something happened");
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mint_custom_returns_none_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        let svc = NotificationService::new(path);
+        svc.set_preferences(NotificationPreferences {
+            enabled: false,
+            ..NotificationPreferences::default()
+        })
+        .unwrap();
+        assert!(svc
+            .mint_custom("sess", "Title", "Body", NotificationPriority::Low)
+            .is_none());
+    }
+
+    #[test]
+    fn notify_run_completed_and_run_failed() {
+        let (svc, _dir) = service();
+        let complete = svc
+            .notify(
+                "sess-1",
+                &AgentEvent::Complete {
+                    usage: bamboo_agent_core::TokenUsage {
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        total_tokens: 15,
+                    },
+                },
+            )
+            .unwrap();
+        match complete {
+            AgentEvent::Notification {
+                category,
+                priority,
+                dedup_key,
+                ..
+            } => {
+                assert_eq!(category, "run_completed");
+                assert_eq!(priority, "normal");
+                assert_eq!(dedup_key.as_deref(), Some("run:sess-1:done"));
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+
+        let failed = svc
+            .notify(
+                "sess-1",
+                &AgentEvent::Error {
+                    message: "boom".to_string(),
+                },
+            )
+            .unwrap();
+        match failed {
+            AgentEvent::Notification {
+                category,
+                priority,
+                dedup_key,
+                ..
+            } => {
+                assert_eq!(category, "run_failed");
+                assert_eq!(priority, "high");
+                assert_eq!(dedup_key.as_deref(), Some("run:sess-1:failed"));
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn notify_schedule_run_builds_expected_notification() {
+        let (svc, _dir) = service();
+        let completed = svc
+            .notify_schedule_run("sess-9", true, "Schedule 'nightly' completed", "All done.")
+            .unwrap();
+        match completed {
+            AgentEvent::Notification {
+                category,
+                priority,
+                title,
+                body,
+                dedup_key,
+                ..
+            } => {
+                assert_eq!(category, "run_completed");
+                assert_eq!(priority, "normal");
+                assert_eq!(title, "Schedule 'nightly' completed");
+                assert_eq!(body, "All done.");
+                assert_eq!(dedup_key.as_deref(), Some("run:sess-9:done"));
+            }
+            other => panic!("expected Notification, got {other:?}"),
+        }
+    }
+
+    /// The core no-double-fire guarantee (WP5): a scheduled run's raw
+    /// `AgentEvent::Complete` is independently classified by the always-on
+    /// relay via `notify`, AND the schedule manager's completion hook calls
+    /// `notify_schedule_run` to enrich it — both share dedup key
+    /// `"run:{session_id}:done"`, so within the dedup window only the FIRST
+    /// of the two ever produces a delivered notification; the second is
+    /// coalesced. This holds regardless of call order.
+    #[test]
+    fn notify_schedule_run_shares_dedup_window_with_generic_complete_event() {
+        let (svc, _dir) = service();
+        // Generic relay path fires first (raw AgentEvent::Complete)...
+        let first = svc.notify(
+            "sess-1",
+            &AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+        );
+        assert!(first.is_some());
+        // ...the schedule-level enrichment attempt is deduped away.
+        let second =
+            svc.notify_schedule_run("sess-1", true, "Schedule 'nightly' completed", "All done.");
+        assert!(second.is_none());
+    }
+
+    /// Same guarantee, opposite call order: the schedule-level enrichment
+    /// wins the race and the later generic relay classification is the one
+    /// deduped away. Either order is safe — never both.
+    #[test]
+    fn notify_schedule_run_first_dedups_the_later_generic_complete_event() {
+        let (svc, _dir) = service();
+        let first =
+            svc.notify_schedule_run("sess-2", true, "Schedule 'nightly' completed", "All done.");
+        assert!(first.is_some());
+        let second = svc.notify(
+            "sess-2",
+            &AgentEvent::Complete {
+                usage: bamboo_agent_core::TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+            },
+        );
+        assert!(second.is_none());
+    }
+
+    /// Same guarantee for the failure side (`run:{session_id}:failed`).
+    #[test]
+    fn notify_schedule_run_failure_shares_dedup_window_with_generic_error_event() {
+        let (svc, _dir) = service();
+        let first = svc.notify(
+            "sess-3",
+            &AgentEvent::Error {
+                message: "boom".to_string(),
+            },
+        );
+        assert!(first.is_some());
+        let second = svc.notify_schedule_run("sess-3", false, "Schedule 'nightly' failed", "boom");
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn notify_schedule_run_gated_by_prefs_and_disabled_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        let svc = NotificationService::new(path);
+        svc.set_preferences(NotificationPreferences {
+            on_run_complete: false,
+            ..NotificationPreferences::default()
+        })
+        .unwrap();
+        assert!(svc.notify_schedule_run("sess", true, "t", "b").is_none());
+        // Failure category is unaffected by the on_run_complete flag.
+        assert!(svc.notify_schedule_run("sess", false, "t", "b").is_some());
+
+        svc.set_preferences(NotificationPreferences {
+            enabled: false,
+            ..NotificationPreferences::default()
+        })
+        .unwrap();
+        assert!(svc.notify_schedule_run("sess", false, "t", "b").is_none());
+    }
+}

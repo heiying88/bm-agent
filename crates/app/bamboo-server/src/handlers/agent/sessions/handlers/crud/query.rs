@@ -1,0 +1,729 @@
+use std::collections::HashMap;
+
+use actix_web::{web, HttpResponse, Result};
+use bamboo_agent_core::SessionKind;
+
+use crate::app_state::AppState;
+
+use super::super::super::types::{
+    GetSessionResponse, ListSessionsQuery, ListSessionsResponse, SessionActiveWorkflow,
+    SessionSummary,
+};
+use super::running::{is_session_running, running_session_ids};
+
+/// Default page size for `GET /api/v1/sessions` when the client omits `limit`.
+/// Deliberately generous so a typical client sees all of its recent sessions in
+/// one page, while still bounding the response so the list can't grow without
+/// limit as session count grows forever (#252).
+const DEFAULT_SESSIONS_PAGE: usize = 200;
+/// Hard cap on the page size, so a client-supplied `limit` can't force an
+/// unbounded read (mirrors the metrics `normalize_limit` clamp). (#252)
+const MAX_SESSIONS_PAGE: usize = 1000;
+
+/// Resolve the effective page size: the default when omitted, otherwise clamped
+/// to `1..=MAX_SESSIONS_PAGE`. Never unbounded. (#252)
+fn clamp_page_size(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_SESSIONS_PAGE)
+        .clamp(1, MAX_SESSIONS_PAGE)
+}
+
+/// `GET /api/v1/sessions`
+pub async fn list_sessions(
+    state: web::Data<AppState>,
+    query: web::Query<ListSessionsQuery>,
+) -> Result<HttpResponse> {
+    let running = running_session_ids(&state).await;
+    let entries = state.session_store.list_index_entries().await;
+
+    // Compute running child counts per parent session over the FULL set: a
+    // parent's running children may land on a different page, so this count must
+    // not be paginated or it would be wrong for parents shown on this page.
+    let mut running_child_counts: HashMap<String, u32> = HashMap::new();
+    // Root rows also need the flattened tree size before filtering and
+    // pagination. Clients use this count to decide whether to hydrate a tree.
+    let mut subagent_counts: HashMap<String, u32> = HashMap::new();
+    for entry in &entries {
+        if entry.kind == SessionKind::Child {
+            *subagent_counts
+                .entry(entry.root_session_id.clone())
+                .or_insert(0) += 1;
+        }
+        if running.contains(&entry.id) {
+            if let Some(parent_id) = &entry.parent_session_id {
+                *running_child_counts.entry(parent_id.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Filter before applying the page window. Otherwise a recent child-heavy
+    // tree can consume the page and hide ordinary root conversations.
+    // `list_index_entries` is already newest-first, so retaining matches keeps
+    // the existing deterministic order.
+    let filtered_entries: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| query.kind.is_none_or(|kind| entry.kind == kind))
+        .filter(|entry| {
+            query
+                .root_session_id
+                .as_deref()
+                .is_none_or(|root_session_id| entry.root_session_id == root_session_id)
+        })
+        .collect();
+
+    // Server-enforced pagination bounds the filtered response so both root and
+    // tree queries stay finite as the session index grows (#252).
+    let total = filtered_entries.len();
+    let limit = clamp_page_size(query.limit);
+    let offset = query.offset.unwrap_or(0).min(total);
+
+    let sessions: Vec<SessionSummary> = filtered_entries
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|entry| {
+            let is_running = running.contains(&entry.id);
+            let mut summary = SessionSummary::from_entry(entry, is_running);
+            summary.running_child_count =
+                running_child_counts.get(&summary.id).copied().unwrap_or(0);
+            summary.subagent_count = subagent_counts.get(&summary.id).copied().unwrap_or(0);
+            summary
+        })
+        .collect();
+
+    let end = offset + sessions.len();
+    let next_offset = if end < total { Some(end) } else { None };
+
+    Ok(HttpResponse::Ok().json(ListSessionsResponse {
+        sessions,
+        total,
+        limit,
+        offset,
+        next_offset,
+    }))
+}
+
+/// `GET /api/v1/sessions/{session_id}`
+pub async fn get_session(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> Result<HttpResponse> {
+    let session_id = path.into_inner();
+    match state.session_store.get_index_entry(&session_id).await {
+        Some(entry) => {
+            let is_running = is_session_running(&state, &session_id).await;
+            let running = running_session_ids(&state).await;
+            let all_entries = state.session_store.list_index_entries().await;
+            let running_child_count = all_entries
+                .iter()
+                .filter(|e| {
+                    e.parent_session_id.as_ref() == Some(&session_id) && running.contains(&e.id)
+                })
+                .count() as u32;
+            let subagent_count = all_entries
+                .iter()
+                .filter(|entry| {
+                    entry.kind == SessionKind::Child && entry.root_session_id == session_id
+                })
+                .count() as u32;
+            let mut summary = SessionSummary::from_entry(entry, is_running);
+            summary.running_child_count = running_child_count;
+            summary.subagent_count = subagent_count;
+
+            // Load the authoritative session once for both its ETag and the
+            // public-safe active Workflow identity. The index deliberately
+            // does not mirror this richer lifecycle object.
+            let durable_session = match state.storage.load_session(&session_id).await {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    tracing::warn!(
+                        %session_id,
+                        "session index entry has no authoritative durable session"
+                    );
+                    return Ok(HttpResponse::NotFound().json(serde_json::json!({
+                        "error": crate::error::error_value("Session not found"),
+                        "session_id": session_id
+                    })));
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %session_id,
+                        %error,
+                        "failed to load authoritative session detail"
+                    );
+                    if error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+                    {
+                        return Ok(HttpResponse::Conflict().json(serde_json::json!({
+                            "error": {
+                                "type": "api_error",
+                                "code": "session_authority_unavailable",
+                                "message": "Session authority could not be verified; recover the session before retrying",
+                            },
+                            "session_id": session_id,
+                        })));
+                    }
+                    return Ok(crate::error::json_error(
+                        actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to load session detail",
+                    ));
+                }
+            };
+            summary.root_orchestration_only =
+                Some(durable_session.root_orchestration_only_enabled());
+            summary.thinking_mode = Some(durable_session.root_thinking_mode());
+            summary.reasoning_effort = durable_session.reasoning_effort;
+            if durable_session.kind == SessionKind::Root
+                && durable_session.parent_session_id.is_none()
+            {
+                summary.root_mode_transition_epoch =
+                    Some(durable_session.root_mode_transition_epoch);
+                summary.root_mode_birth_token = Some(durable_session.root_mode_birth_token());
+            }
+            let selected_catalog = durable_session
+                .metadata
+                .get(bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_CATALOG_KEY)
+                .and_then(|raw| {
+                    serde_json::from_str::<Vec<bamboo_skills::WorkflowCatalogEntry>>(raw)
+                        .map_err(|error| {
+                            tracing::warn!(
+                                %session_id,
+                                %error,
+                                "ignored invalid pinned workflow catalog metadata in session detail"
+                            );
+                        })
+                        .ok()
+                })
+                .unwrap_or_default();
+            summary.active_workflow = match durable_session
+                .metadata
+                .get(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY)
+            {
+                Some(raw) => match serde_json::from_str::<bamboo_skills::ActiveWorkflow>(raw) {
+                    Ok(active) => {
+                        let entry = selected_catalog.iter().find(|entry| {
+                            entry.id == active.id
+                                && entry.source == active.source
+                                && entry.revision == active.revision
+                        });
+                        Some(SessionActiveWorkflow::from_active(active, entry))
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %session_id,
+                            %error,
+                            "active Workflow metadata is malformed in authoritative session detail"
+                        );
+                        return Ok(crate::error::json_error(
+                            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to load active Workflow state",
+                        ));
+                    }
+                },
+                None => None,
+            };
+            // Surface the session ETag (`metadata_version`) so clients can send
+            // it back as `If-Match` on metadata writes (optimistic concurrency).
+            let etag = durable_session.metadata_version;
+
+            let mut response = HttpResponse::Ok();
+            response.insert_header((actix_web::http::header::ETAG, format!("\"{etag}\"")));
+            Ok(response.json(GetSessionResponse { session: summary }))
+        }
+        None => Ok(HttpResponse::NotFound().json(serde_json::json!({
+            // Canonical nested error envelope — matches `AppError`'s shape
+            // (#251 finding 2), with `session_id` kept as a sibling field.
+            "error": crate::error::error_value("Session not found"),
+            "session_id": session_id
+        }))),
+    }
+}
+
+// Pure clamp unit test — kept in its own module that does NOT import
+// `actix_web::test`, so the built-in `#[test]` attribute isn't shadowed by the
+// actix test-macro re-export.
+#[cfg(test)]
+mod clamp_tests {
+    use super::{clamp_page_size, DEFAULT_SESSIONS_PAGE, MAX_SESSIONS_PAGE};
+
+    #[test]
+    fn clamp_page_size_defaults_and_caps() {
+        // Omitted → the bounded default, never an unbounded read (#252).
+        assert_eq!(clamp_page_size(None), DEFAULT_SESSIONS_PAGE);
+        // In-range passes through untouched.
+        assert_eq!(clamp_page_size(Some(50)), 50);
+        // Over the hard cap is clamped down; zero is clamped up to 1.
+        assert_eq!(clamp_page_size(Some(10_000_000)), MAX_SESSIONS_PAGE);
+        assert_eq!(clamp_page_size(Some(0)), 1);
+    }
+}
+
+#[cfg(test)]
+mod pagination_http_tests {
+    use actix_web::{test, web, App};
+    use serde_json::Value;
+    use tempfile::tempdir;
+
+    use super::{DEFAULT_SESSIONS_PAGE, MAX_SESSIONS_PAGE};
+    use crate::routes::configure_routes;
+    use crate::AppState;
+    use bamboo_agent_core::Session;
+
+    async fn app_state_with_sessions(n: usize) -> web::Data<AppState> {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        for i in 0..n {
+            let mut session = Session::new(format!("sess-{i:03}"), "model");
+            state.save_and_cache_session(&mut session).await;
+        }
+        state
+    }
+
+    /// Omitting `limit` returns the server default page size (bounded), and a
+    /// `limit` above the hard max is clamped to the max — mirrors the metrics
+    /// `normalize_limit` clamp. Without the pagination fix the response carries
+    /// no `limit` field at all, so these assertions fail. (#252)
+    #[actix_web::test]
+    async fn list_sessions_default_and_max_are_enforced() {
+        let state = app_state_with_sessions(3).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        // No params → the effective page size is the server default, not unbounded.
+        let resp: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp["limit"], DEFAULT_SESSIONS_PAGE as u64);
+        assert_eq!(resp["total"], 3);
+        assert_eq!(resp["sessions"].as_array().unwrap().len(), 3);
+        // Everything fits on the first page, so there is no next page.
+        assert!(resp.get("next_offset").is_none() || resp["next_offset"].is_null());
+
+        // A `limit` above the hard cap is clamped down to the max.
+        let capped: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?limit=10000000")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(capped["limit"], MAX_SESSIONS_PAGE as u64);
+    }
+
+    /// `limit`/`offset` slice the newest-first list and `next_offset` walks the
+    /// pages, ending at `None` on the last page. (#252)
+    #[actix_web::test]
+    async fn list_sessions_pages_with_limit_and_offset() {
+        let state = app_state_with_sessions(3).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        // First page of 2 of 3 → a next page starts at offset 2.
+        let page1: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?limit=2")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(page1["total"], 3);
+        assert_eq!(page1["limit"], 2);
+        assert_eq!(page1["offset"], 0);
+        assert_eq!(page1["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(page1["next_offset"], 2);
+
+        // Second page picks up the remaining 1 and reports no further page.
+        let page2: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?limit=2&offset=2")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(page2["offset"], 2);
+        assert_eq!(page2["sessions"].as_array().unwrap().len(), 1);
+        assert!(page2.get("next_offset").is_none() || page2["next_offset"].is_null());
+    }
+
+    /// Kind/tree filters must run before pagination. Recent descendants cannot
+    /// evict roots from a root page, and clients can hydrate one flattened tree
+    /// without loading unrelated child summaries.
+    #[actix_web::test]
+    async fn list_sessions_filters_roots_and_lazy_tree_children_before_pagination() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+
+        for id in ["root-a", "root-b", "root-c"] {
+            let mut root = Session::new(id, "model");
+            state.save_and_cache_session(&mut root).await;
+        }
+
+        let mut child_a = Session::new_child("child-a", "root-a", "model", "Child A");
+        state.save_and_cache_session(&mut child_a).await;
+        let mut child_b = Session::new_child("child-b", "root-b", "model", "Child B");
+        state.save_and_cache_session(&mut child_b).await;
+        let mut grandchild_a =
+            Session::new_child_of("grandchild-a", &child_a, "model", "Grandchild A");
+        state.save_and_cache_session(&mut grandchild_a).await;
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let root_page: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?kind=root&limit=2")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(root_page["total"], 3);
+        assert_eq!(root_page["sessions"].as_array().unwrap().len(), 2);
+        assert_eq!(root_page["next_offset"], 2);
+        assert!(root_page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["kind"] == "root"));
+
+        let all_roots: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?kind=root&limit=10")
+                .to_request(),
+        )
+        .await;
+        let roots = all_roots["sessions"].as_array().unwrap();
+        let root_a = roots
+            .iter()
+            .find(|session| session["id"] == "root-a")
+            .expect("root-a summary");
+        let root_b = roots
+            .iter()
+            .find(|session| session["id"] == "root-b")
+            .expect("root-b summary");
+        let root_c = roots
+            .iter()
+            .find(|session| session["id"] == "root-c")
+            .expect("root-c summary");
+        assert_eq!(root_a["subagent_count"], 2);
+        assert_eq!(root_b["subagent_count"], 1);
+        assert_eq!(root_c["subagent_count"], 0);
+
+        let first_child_page: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?kind=child&root_session_id=root-a&limit=1")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first_child_page["total"], 2);
+        assert_eq!(first_child_page["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(first_child_page["next_offset"], 1);
+        assert_eq!(first_child_page["sessions"][0]["root_session_id"], "root-a");
+        assert_eq!(first_child_page["sessions"][0]["kind"], "child");
+        assert_eq!(first_child_page["sessions"][0]["subagent_count"], 0);
+
+        let second_child_page: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions?kind=child&root_session_id=root-a&limit=1&offset=1")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(second_child_page["sessions"].as_array().unwrap().len(), 1);
+        assert!(
+            second_child_page.get("next_offset").is_none()
+                || second_child_page["next_offset"].is_null()
+        );
+
+        let root_detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/root-a")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(root_detail["session"]["subagent_count"], 2);
+    }
+
+    /// `GET /api/v1/sessions/{id}` on an unknown id must use the canonical
+    /// nested error envelope (`{"error": {"message", "type"}}`, matching
+    /// `AppError`), not the old flat `{"error": "<string>"}` shape. #251
+    /// (finding 2).
+    #[actix_web::test]
+    async fn get_session_not_found_uses_canonical_error_envelope() {
+        let state = app_state_with_sessions(0).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let resp = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/does-not-exist")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "Session not found");
+        assert_eq!(body["session_id"], "does-not-exist");
+    }
+
+    #[actix_web::test]
+    async fn session_detail_reports_unavailable_root_authority_instead_of_cached_mode() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let mut root = Session::new("root-proof-unavailable", "model");
+        root.set_root_orchestration_only(true).unwrap();
+        state.storage.save_session(&root).await.unwrap();
+        let proof = state
+            .session_store
+            .sessions_root_dir()
+            .join(&root.id)
+            .join("root-tool-authority.json");
+        tokio::fs::write(&proof, b"{").await.unwrap();
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/root-proof-unavailable")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::CONFLICT);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "session_authority_unavailable");
+    }
+
+    #[actix_web::test]
+    async fn session_detail_restores_public_active_workflow_but_list_stays_lightweight() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let mut session = Session::new("workflow-session", "model");
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.to_string(),
+            serde_json::json!({
+                "id": "review",
+                "source": "builtin",
+                "revision": 7,
+                "kind": "instruction",
+                "args": {"focus": "security"},
+                "invoked_by": "user",
+                "activated_at": "2026-08-21T00:00:00Z",
+                "status": "active",
+                "context_fingerprint": "sha256:test",
+                "dynamic_context": [{
+                    "provider_id": "private-provider",
+                    "tool": "context",
+                    "provenance": "private",
+                    "generated_at": "2026-08-21T00:00:00Z",
+                    "expires_at": null,
+                    "status": "active",
+                    "stop_on_failure": false,
+                    "content": "secret dynamic provider output"
+                }]
+            })
+            .to_string(),
+        );
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_CATALOG_KEY.to_string(),
+            serde_json::json!([{
+                "id": "review",
+                "name": "Review changes",
+                "description": "Pinned public metadata",
+                "kind": "instruction",
+                "source": "builtin",
+                "revision": 7,
+                "version": "3",
+                "invocation_policy": {"automatic": true, "explicit": true},
+                "argument_schema": {"type": "object"},
+                "status": "valid",
+                "legacy": false,
+                "winner": true
+            }])
+            .to_string(),
+        );
+        state.save_and_cache_session(&mut session).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        let list: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        assert!(list["sessions"][0].get("active_workflow").is_none());
+
+        let detail: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/workflow-session")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(detail["session"]["active_workflow"]["id"], "review");
+        assert_eq!(
+            detail["session"]["active_workflow"]["name"],
+            "Review changes"
+        );
+        assert_eq!(detail["session"]["active_workflow"]["source"], "builtin");
+        assert_eq!(detail["session"]["active_workflow"]["version"], "3");
+        let active = &detail["session"]["active_workflow"];
+        assert_eq!(active["kind"], "instruction");
+        assert_eq!(active["invoked_by"], "user");
+        assert!(active.get("args").is_none());
+        assert!(active.get("context_fingerprint").is_none());
+        assert!(active.get("dynamic_context").is_none());
+        assert!(!detail
+            .to_string()
+            .contains("secret dynamic provider output"));
+    }
+
+    #[actix_web::test]
+    async fn session_detail_fails_closed_when_durable_load_fails() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let mut session = Session::new("broken-session-detail", "model");
+        state.save_and_cache_session(&mut session).await;
+        let entry = state
+            .session_store
+            .get_index_entry("broken-session-detail")
+            .await
+            .expect("durable index entry");
+        let session_json = temp_dir.path().join(entry.rel_path).join("session.json");
+        tokio::fs::remove_file(&session_json)
+            .await
+            .expect("remove durable session file");
+        tokio::fs::create_dir(&session_json)
+            .await
+            .expect("inject unreadable session path");
+
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/broken-session-detail")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(response
+            .headers()
+            .get(actix_web::http::header::ETAG)
+            .is_none());
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["message"], "Failed to load session detail");
+        assert!(!body
+            .to_string()
+            .contains(&session_json.to_string_lossy()[..]));
+    }
+
+    #[actix_web::test]
+    async fn session_detail_fails_closed_for_malformed_active_workflow_metadata() {
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let mut session = Session::new("malformed-active-workflow", "model");
+        session.metadata.insert(
+            bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY.to_string(),
+            r#"{"id":"private-id","args":{"api_key":"must-not-echo"}"#.to_string(),
+        );
+        state.save_and_cache_session(&mut session).await;
+        let app = test::init_service(App::new().app_data(state).configure(configure_routes)).await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions/malformed-active-workflow")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(response
+            .headers()
+            .get(actix_web::http::header::ETAG)
+            .is_none());
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(
+            body["error"]["message"],
+            "Failed to load active Workflow state"
+        );
+        assert!(!body.to_string().contains("must-not-echo"));
+        assert!(!body.to_string().contains("private-id"));
+    }
+}

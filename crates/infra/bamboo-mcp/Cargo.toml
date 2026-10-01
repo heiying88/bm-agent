@@ -1,0 +1,33 @@
+[package]
+name = "bamboo-mcp"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Model Context Protocol (MCP) client — protocol, transports, executor, manager — for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
+bamboo-llm = { path = "../../infra/bamboo-llm" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+serde = { workspace = true }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "native-tls", "charset", "http2", "system-proxy"] }
+eventsource-stream = "0.2"
+dashmap = "6"
+base64 = "0.23"
+sha2 = "0.11"
+hex = "0.4"
+thiserror = "2"
+jsonschema = { version = "0.49.2", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+mockall = "0.15"
