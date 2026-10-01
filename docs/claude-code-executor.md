@@ -1,41 +1,25 @@
-# Driving Claude Code as an external agent — protocol reference
+# 将 Claude Code 作为外部 agent 驱动——协议参考
 
-Status: **implemented** — `ClaudeCodeExecutor` lives at `src/claude_code_executor.rs`
-and is selected via `subagents.executor = "claude_code"` (see the [config
-reference](config-reference.md#sub-agents--external-cli-executors) for the
-user-facing config surface). This doc is kept as protocol-reference detail for
-anyone touching/extending the executor itself — the original design record.
-Source: distilled from `chenhg5/cc-connect` `agent/claudecode/` (Go, battle-tested against
-Claude Code 2.x in production), verified against the repo at commit `main@2026-07-11`.
-File references below are to that repo, and may not match line numbers in the
-current bamboo implementation exactly.
+状态：**已实现**——`ClaudeCodeExecutor` 位于 `src/claude_code_executor.rs`，通过 `subagents.executor = "claude_code"` 选用（面向用户的配置面参见[配置参考](config-reference.md#sub-agents--external-cli-executors)）。本文档保留为协议参考细节，供需要改动/扩展该执行器的人查阅——它是最初的设计记录。来源：提炼自 `chenhg5/cc-connect` 的 `agent/claudecode/`（Go 实现，在生产环境中经受过 Claude Code 2.x 的实战检验），并对照该仓库 `main@2026-07-11` 提交验证过。下文的文件引用均指向该仓库，行号未必与当前 bamboo 实现完全一致。
 
-## Where this plugs into bamboo
+## 它在 bamboo 中的接入点
 
-`bamboo-subagent::provision::ExecutorSpec` reserves the slot
-(`provision.rs:221`):
+`bamboo-subagent::provision::ExecutorSpec` 预留了该槽位（`provision.rs:221`）：
 
 ```rust
-/// Wrap an external CLI agent as the engine.
+/// 将外部 CLI agent 包装为引擎。
 CliAdapter { command: String, args: Vec<String> },
 ```
 
-The original implementation plan (kept for history):
+最初的实现计划（留档）：
 
-1. `ClaudeCodeExecutor: ChildExecutor` (`executor.rs:169`) — owns the child process,
-   translates `RunSpec` → stream-json stdin, stream-json stdout → `EventSink`,
-   `SteerInbox` → mid-turn user injection / permission responses,
-   `CancellationToken` → graceful shutdown (see §7).
-2. Worker executor factory: map `ExecutorSpec::CliAdapter`(or a dedicated
-   `ClaudeCode` variant carrying model/permission-mode/resume-id) to it.
-3. `bamboo-engine/src/external_agents/runtime.rs:104,215` — accept executor kind
-   `"claude_code"` alongside `"echo"` / `"bamboo_runtime"`.
+1. `ClaudeCodeExecutor: ChildExecutor`（`executor.rs:169`）——持有子进程，负责 `RunSpec` → stream-json stdin、stream-json stdout → `EventSink`、`SteerInbox` → 轮中用户注入/权限响应、`CancellationToken` → 优雅关停（见 §7）的转换。
+2. worker 执行器工厂：把 `ExecutorSpec::CliAdapter`（或携带 model/permission-mode/resume-id 的专用 `ClaudeCode` 变体）映射到它。
+3. `bamboo-engine/src/external_agents/runtime.rs:104,215`——在接受 `"echo"` / `"bamboo_runtime"` 的同时接受执行器种类 `"claude_code"`。
 
-## 1. Spawn
+## 1. 派生
 
-One **long-lived process per session** (NOT per message). Repeated turns are
-repeated stdin writes to the same process; `--resume` is only for reattaching
-after the process died.
+**每个 session 一个长驻进程**（而不是每条消息一个）。重复的轮次就是向同一进程重复写入 stdin；`--resume` 仅用于进程死亡后的重新挂接。
 
 ```
 claude \
@@ -44,93 +28,46 @@ claude \
   --permission-prompt-tool stdio \
   --replay-user-messages \
   --verbose \
-  --permission-mode <acceptEdits|plan|bypassPermissions|default>  # ALWAYS explicit — see below
-  [--strict-mcp-config] [--setting-sources project|""]            # isolation — see below
-  [--resume <session_id>]                                    # omit for a fresh session
+  --permission-mode <acceptEdits|plan|bypassPermissions|default>  # 总是显式传递——见下文
+  [--strict-mcp-config] [--setting-sources project|""]            # 隔离——见下文
+  [--resume <session_id>]                                    # 全新 session 时省略
   [--model <model>]
   [--tools Read,Glob,Grep] [--disallowedTools Bash Edit ...]
   [--system-prompt <s>] [--append-system-prompt-file <path>]
 ```
 
-(cc-connect: `agent/claudecode/session.go:234-322`)
+（cc-connect：`agent/claudecode/session.go:234-322`）
 
-**`--permission-mode` is ALWAYS passed explicitly (issue #443, CRITICAL).**
-Real-machine e2e against claude 2.1.207 found that the headless stream-json
-default — when the flag is omitted entirely — is `auto`, which self-approves
-every tool and never emits a `can_use_tool` ask. `ClaudeCodeExecutor::build_command`
-therefore always sends `permission_mode` when configured, else the literal
-string `default` — never nothing. This is what makes the "no host bridge →
-deny unless `bypassPermissions`" local-decide policy in §3 actually trigger;
-before this fix it was unreachable dead code (every ask was auto-approved by
-the CLI itself, so `control_request` never fired for anything the executor
-would have denied).
+**`--permission-mode` 总是被显式传递（issue #443，关键）。**针对 claude 2.1.207 的真机 e2e 测试发现，完全省略该标志时，无头 stream-json 的默认值是 `auto`——它会自动批准每一个工具，且从不发出 `can_use_tool` 询问。因此 `ClaudeCodeExecutor::build_command` 在已配置时总是发送 `permission_mode`，否则发送字面字符串 `default`——绝不什么都不发。正是这一点让 §3 中"没有 host bridge → 除非 `bypassPermissions` 否则拒绝"的本地决策策略真正得以触发；在修复之前它是不可达的死代码（每个询问都被 CLI 自己自动批准，因此执行器本会拒绝的任何操作都不会触发 `control_request`）。
 
-**Isolation from the invoking user's `~/.claude`, by default (issue #443).**
-The same e2e run showed the child loading the user's entire global config: 6
-MCP servers (including a desktop-control server), every installed skill, and
-memory paths — ~8k cache-creation tokens and a large ambient-authority surface
-for a single `touch`. Unless `inherit_user_config: true` is set on the
-`ClaudeCode` executor spec, `build_command` adds `--strict-mcp-config` and
-`--setting-sources project`, so the child sees only project-scoped config, not
-the user's global one. A typed read-only activation additionally passes an
-empty `--setting-sources` value even if inheritance was requested. That keeps
-repository-controlled settings, CLAUDE.md, skills, and especially hooks out of
-the process: Claude's `plan` permission mode controls built-in tools but does
-not sandbox hook subprocesses.
+**默认与调用方用户的 `~/.claude` 隔离（issue #443）。**同一场 e2e 测试显示，子进程加载了用户的全部全局配置：6 个 MCP 服务器（其中包括一个桌面控制服务器）、所有已安装的 skill 以及 memory 路径——为一次 `touch` 付出约 8k 缓存创建 token 和一大片环境性授权面。除非在 `ClaudeCode` 执行器 spec 上设置 `inherit_user_config: true`，`build_command` 都会加上 `--strict-mcp-config` 和 `--setting-sources project`，使子进程只看到项目作用域的配置，而不是用户的全局配置。类型化的只读激活即使被请求继承，也会额外传一个空的 `--setting-sources` 值。这可以把仓库控制的设置、CLAUDE.md、skill，尤其是 hook 挡在进程之外：Claude 的 `plan` 权限模式能约束内置工具，却不能沙箱化 hook 子进程。
 
-Environment (issue #443 — env allowlist supersedes the earlier
-strip-one-var approach):
-- The child is spawned under `env_clear()` **plus an explicit allowlist**:
-  `HOME`, `PATH`, `SHELL`, `TERM`, `LANG`, `LC_*` (prefix), `TMPDIR`, `USER`,
-  `LOGNAME`. Everything else in the parent process env — including any
-  `*_API_KEY` — is stripped by construction, not by a denylist.
-- `forward_env: Vec<String>` on the executor spec names EXTRA variables to
-  forward verbatim on top of the allowlist. Forwarding `ANTHROPIC_API_KEY`
-  this way is an explicit opt-in that flips billing from the CLI's own
-  subscription auth to the API key — see §6.
-- `CLAUDECODE` is still explicitly `env_remove`d after the allowlist pass —
-  redundant now that `env_clear()` means it can't leak in from the parent at
-  all, kept as executable documentation of the nested-session hazard below.
-- The worker forwards host-provisioned `disabled_tools` as bare
-  `--disallowedTools` rules. A typed read-only activation also sets the
-  positive built-in surface to `--tools Read,Glob,Grep` and denies `mcp__*`.
-  This keeps Bash, mutation, delegation, web, and newly-added built-in tools
-  outside the child even though Claude's native `plan` mode remains enabled as
-  another layer.
-- Before a parent sends any typed read-only provision to a local worker, it
-  runs `subagent-worker --print-capabilities` and requires the explicit
-  `typed_read_only_tool_policy_v1` acknowledgement. This happens before the
-  assignment or provision document is delivered. A pre-change Bamboo worker
-  rejects the unknown flag, and a custom worker without the acknowledgement is
-  refused, so forward-compatible JSON field skipping cannot silently erase the
-  read-only boundary.
-- Put the child in its own **process group** so shutdown can kill the whole tree
-  (claude → its MCP servers) (`session.go:369`).
+环境（issue #443——环境变量白名单取代了先前逐个剔除变量的做法）：
+- 子进程在 `env_clear()` **再加一份显式白名单**之下派生：`HOME`、`PATH`、`SHELL`、`TERM`、`LANG`、`LC_*`（前缀）、`TMPDIR`、`USER`、`LOGNAME`。父进程环境中的其他一切——包括任何 `*_API_KEY`——都在构造层面被剥离，而不是靠黑名单。
+- 执行器 spec 上的 `forward_env: Vec<String>` 指定要在白名单之外额外逐字转发的变量。以这种方式转发 `ANTHROPIC_API_KEY` 是一次显式选择，会把计费从 CLI 自身的订阅认证切到 API key——见 §6。
+- `CLAUDECODE` 在白名单处理之后仍会被显式 `env_remove`——既然有了 `env_clear()`，它本来就不可能从父进程泄漏进来，这一步属于冗余，保留它是作为下文嵌套 session 风险的可执行文档。
+- worker 会把宿主下发的 `disabled_tools` 转发为裸的 `--disallowedTools` 规则。类型化的只读激活还会把正向内置工具面设置为 `--tools Read,Glob,Grep` 并拒绝 `mcp__*`。这样即使 Claude 原生的 `plan` 模式作为又一层防线仍然开启，Bash、变更、委派、网络和新加入的内置工具也都被挡在子进程之外。
+- 父级在向本地 worker 发送任何类型化只读供给之前，会先运行 `subagent-worker --print-capabilities` 并要求显式的 `typed_read_only_tool_policy_v1` 确认。这发生在 assignment 或 provision 文档送达之前。变更前的 Bamboo worker 会拒绝未知标志，缺少该确认的自定义 worker 会被拒收，因此前向兼容的 JSON 字段跳过不可能静默抹掉只读边界。
+- 把子进程放进它自己的**进程组**，这样关停时可以杀掉整棵进程树（claude → 它的 MCP 服务器）（`session.go:369`）。
 
-Nested-session hazard: Claude Code detects its own `CLAUDECODE` env var and
-misbehaves if it inherits one from an outer session (`session.go:372`).
+嵌套 session 风险：Claude Code 会检测自己的 `CLAUDECODE` 环境变量，一旦从外层 session 继承到它就会行为异常（`session.go:372`）。
 
-Gotchas:
-- Drop `--verbose` when routing through claude-code-router — router output
-  corrupts the JSON stream (`claudecode.go:524-526`).
-- `bypassPermissions` under euid 0 is rejected by the CLI; downgrade and surface
-  a warning (`session.go:225-229`).
-- Even in `default` mode, the CLI's own sandbox auto-runs plain read-only
-  commands (e.g. a bare `echo`) without asking — exercising the permission
-  relay requires a command with a real side effect (a file write).
+注意事项：
+- 经 claude-code-router 路由时去掉 `--verbose`——路由器输出会破坏 JSON 流（`claudecode.go:524-526`）。
+- euid 0 下的 `bypassPermissions` 会被 CLI 拒绝；降级并给出警告（`session.go:225-229`）。
+- 即使在 `default` 模式下，CLI 自带的沙箱也会不询问就自动运行普通的只读命令（例如一个裸 `echo`）——要验证权限中继，需要一条有真实副作用（写文件）的命令。
 
-## 2. Wire protocol
+## 2. 线上协议
 
-Newline-delimited JSON both ways. **Reader must allow 10 MB lines**
-(`session.go:472` uses a 10 MB scanner buffer; tool results can be huge).
+双向均为按换行分隔的 JSON。**读取方必须允许 10 MB 的单行**（`session.go:472` 使用 10 MB 的扫描缓冲；工具结果可能非常大）。
 
-### stdin → claude (user turn)
+### stdin → claude（用户轮次）
 
 ```json
 {"type":"user","message":{"role":"user","content":"fix the failing test"}}
 ```
 
-Multimodal content uses parts:
+多模态内容使用 parts：
 
 ```json
 {"type":"user","message":{"role":"user","content":[
@@ -139,37 +76,31 @@ Multimodal content uses parts:
 ]}}
 ```
 
-Non-image files are NOT inlined: write them to a scratch dir and reference the
-absolute paths in the prompt text ("Files saved locally, please read them: …") —
-the agent opens them with its own Read tool (`core/message.go:103-141`).
+非图片文件不做内联：把它们写入一个临时目录，并在 prompt 文本中引用其绝对路径（"文件已保存在本地，请读取：……"）——agent 会用它自己的 Read 工具打开它们（`core/message.go:103-141`）。
 
-### stdout → executor, dispatched on top-level `type`
+### stdout → 执行器，按顶层 `type` 分发
 
-| type | meaning | what to extract |
+| type | 含义 | 需提取的内容 |
 |---|---|---|
-| `system` | session bootstrap | `session_id` (agent-assigned — persist it for resume), `model` |
-| `assistant` | one model message | iterate `message.content[]`: `text` → token/text event; `thinking` → thinking event; `tool_use` → tool-start event (`name`, `input`). `message.usage` gives live context numbers (its `output_tokens` is a placeholder, ignore) |
-| `user` | echoed tool results | `content[].type == "tool_result"` → tool-end event (`content` truncated, `is_error`) |
-| `result` | turn end | final text, `session_id`, token totals. **`subtype: "compact"/"compaction"` is MID-turn** — do not treat as turn completion (cc-connect issue #481) |
-| `control_request` | permission ask | see §3 |
-| `control_cancel_request` | CLI withdrew a pending ask | drop the matching pending approval |
+| `system` | session 引导 | `session_id`（由 agent 分配——持久化以备 resume）、`model` |
+| `assistant` | 一条模型消息 | 遍历 `message.content[]`：`text` → token/文本事件；`thinking` → thinking 事件；`tool_use` → 工具开始事件（`name`、`input`）。`message.usage` 给出实时上下文数字（其 `output_tokens` 是占位值，忽略） |
+| `user` | 回显的工具结果 | `content[].type == "tool_result"` → 工具结束事件（`content` 被截断、`is_error`） |
+| `result` | 轮次结束 | 最终文本、`session_id`、token 总量。**`subtype: "compact"/"compaction"` 是轮中事件**——不要当作轮次完成（cc-connect issue #481） |
+| `control_request` | 权限询问 | 见 §3 |
+| `control_cancel_request` | CLI 撤回了一个待处理的询问 | 丢弃对应的待处理审批 |
 
-Unknown types: log at debug, never fail the stream (`session.go:587-594`).
-On process exit, surface stderr as an error event and complete the run exactly
-once (`session.go:512-535`).
+未知类型：以 debug 级别记录日志，绝不让流失败（`session.go:587-594`）。进程退出时，把 stderr 作为错误事件抛出，并恰好完成一次运行（`session.go:512-535`）。
 
-## 3. Permission relay (`--permission-prompt-tool stdio`)
+## 3. 权限中继（`--permission-prompt-tool stdio`）
 
-The CLI asks before each gated tool call:
+CLI 在每次受门控的工具调用前发起询问：
 
 ```json
 {"type":"control_request","request_id":"r1","request":{
   "subtype":"can_use_tool","tool_name":"Bash","input":{"command":"rm -rf build"}}}
 ```
 
-Executor decides locally (auto-allow for `bypassPermissions`-equivalent modes,
-auto-allow edit-tools for acceptEdits, etc.) or relays to the parent as a
-NeedsHuman-style event, then answers on stdin:
+执行器在本地决策（对 `bypassPermissions` 等价模式自动放行，对 acceptEdits 自动放行编辑类工具等），或者以 NeedsHuman 风格的事件中继给父级，然后通过 stdin 应答：
 
 ```json
 {"type":"control_response","response":{
@@ -177,118 +108,52 @@ NeedsHuman-style event, then answers on stdin:
   "response":{"behavior":"allow","updatedInput":{"command":"rm -rf build"}}}}
 ```
 
-Deny: `{"behavior":"deny","message":"user denied"}`. On allow, echo the tool
-`input` back as `updatedInput` (it may also be edited). `AskUserQuestion`
-control_requests carry structured questions — map to bamboo's QuestionDialog
-path rather than the permission path (`session.go:856-937`).
+拒绝：`{"behavior":"deny","message":"user denied"}`。放行时，把工具 `input` 原样回填为 `updatedInput`（也可以被编辑）。`AskUserQuestion` 的 control_request 携带结构化问题——应映射到 bamboo 的 QuestionDialog 路径而非权限路径（`session.go:856-937`）。
 
-In bamboo terms: emit a `NeedsHuman` event with `request_id`, park the pending
-approval in a map of oneshot channels, resolve it when the steer inbox delivers
-the decision — same shape as the codex app-server adapter in cc-connect
-(`appserver_session.go:542-617`).
+用 bamboo 的术语说：发出携带 `request_id` 的 `NeedsHuman` 事件，把待处理审批挂在一个由 oneshot channel 组成的 map 中，当 steer inbox 送达决策时再解决它——与 cc-connect 中 codex app-server 适配器的做法一致（`appserver_session.go:542-617`）。
 
-**Relay timeout (issue #443).** When a host bridge IS attached,
-`decide_and_respond` wraps `HostBridge::approval_call` in `tokio::time::timeout`
-bounded by `APPROVAL_RELAY_TIMEOUT` (300s). A host approver that never replies
-(crashed UI, orphaned session) no longer hangs the CLI turn forever — on
-expiry the executor denies with `"approval relay timed out after 300s;
-denying"` and the turn continues. This is distinct from `approval_call`'s
-existing error path (the reply `oneshot` sender dropped), which is still
-handled as an immediate deny.
+**中继超时（issue #443）。**当确实挂接了 host bridge 时，`decide_and_respond` 会把 `HostBridge::approval_call` 包在以 `APPROVAL_RELAY_TIMEOUT`（300 秒）为上限的 `tokio::time::timeout` 里。永不应答的宿主审批者（UI 崩溃、孤儿 session）不会再把 CLI 轮次永久挂起——到期时执行器以 `"approval relay timed out after 300s; denying"` 拒绝，轮次继续。这与 `approval_call` 既有的错误路径（应答 `oneshot` 发送端被丢弃）不同，后者仍按立即拒绝处理。
 
-## 4. Session identity & resume
+## 4. Session 身份与 resume
 
-Implemented (issue #444) in `ClaudeCodeExecutor`. `RunSpec.messages` is the
-activation discriminant (`proto.rs:28`): empty on the first activation of an
-actor, non-empty on a reactivation (`send_message`/`update`/`rerun`) that
-ships the actor's prior conversation.
+已在 `ClaudeCodeExecutor` 中实现（issue #444）。`RunSpec.messages` 是激活判别式（`proto.rs:28`）：actor 首次激活时为空，重新激活（`send_message`/`update`/`rerun`）时非空，后者会带上该 actor 之前的会话。
 
-**Durable state.** The executor persists the agent-assigned session id in the
-child's stable per-activation storage dir — resolved exactly like
-`BambooRuntimeExecutor::build` (`subagent_worker.rs:194-202`): `spec.storage_dir`
-when the parent already isolated it, else `$TMPDIR/bamboo-subagents/<child_id>`.
-Both worker factory arms (`subagent_worker.rs`, `broker_agent.rs`) resolve this
-dir and pass it into `ClaudeCodeExecutor::new`'s `state_dir` parameter.
+**持久状态。**执行器把 agent 分配的 session id 持久化在子进程稳定的按激活存储目录中——其解析方式与 `BambooRuntimeExecutor::build`（`subagent_worker.rs:194-202`）完全一致：父级已隔离时用 `spec.storage_dir`，否则用 `$TMPDIR/bamboo-subagents/<child_id>`。两个 worker 工厂分支（`subagent_worker.rs`、`broker_agent.rs`）都会解析该目录并传入 `ClaudeCodeExecutor::new` 的 `state_dir` 参数。
 
-State file: `<dir>/claude-code-session.json`
+状态文件：`<dir>/claude-code-session.json`
 
 ```json
 { "session_id": "...", "workspace": "...", "updated_at": "2026-..." }
 ```
 
-Written atomically (tmp file + `rename` in the same dir) on EVERY `system` or
-`result` frame that carries a `session_id` — a resumed session may be assigned
-a brand-new id, so this always re-captures rather than assuming stability.
-`workspace` is recorded alongside the id: Claude Code transcripts are
-machine-local under `~/.claude/projects/<hashed-workdir>/`, so a later
-activation against a DIFFERENT workspace (different project, or a different
-machine entirely) treats the persisted id as unusable.
+每一帧携带 `session_id` 的 `system` 或 `result` 都会触发原子写入（同目录下的临时文件 + `rename`）——resume 后的 session 可能被分配一个全新的 id，因此这里总是重新捕获，而不是假设它稳定。`workspace` 会与 id 一并记录：Claude Code 的转录是机器本地的，位于 `~/.claude/projects/<hashed-workdir>/` 之下，因此之后针对**另一个** workspace 的激活（不同项目，或干脆是另一台机器）会把持久化的 id 视为不可用。
 
-**Activation logic** (`ClaudeCodeExecutor::run`):
+**激活逻辑**（`ClaudeCodeExecutor::run`）：
 
-1. `messages` empty → fresh session; delete any stale state file first (a
-   `rerun` must never accidentally resume).
-2. `messages` non-empty AND the state file has an id recorded against the
-   SAME `workspace` → spawn with `--resume <id>`, sending just the live
-   assignment (the CLI already owns the transcript).
-3. `messages` non-empty but no usable id (first run on this machine, storage
-   GC'd, workspace changed) → **fallback rehydration**: the shipped history
-   is rendered into a bounded text preamble (role-tagged, `**role**: content`,
-   capped to the last ~40 messages / ~24k chars with oldest dropped first and
-   an explicit `_[truncated: N earlier message(s) omitted]_` note), clearly
-   delimited under `## Prior conversation (rehydrated)` / `## Current task`
-   headings so the model doesn't confuse rehydrated context with the live
-   task, and prepended to the assignment. The assignment's own trailing user
-   message (shipped in `messages` per the wire contract) is excluded from the
-   preamble so it isn't duplicated. A warning is logged; context is never
-   silently dropped.
-4. **Resume-failure retry:** if a `--resume` spawn exits before ever emitting
-   a terminal `result` frame (bad/GC'd session id — the CLI errors out fast),
-   the run retries ONCE without `--resume`, using the same fallback
-   rehydration as step 3, after clearing the stale state file. No retry loop
-   beyond this single attempt, and the retry only triggers for THIS specific
-   failure mode (a `--resume` attempt that never produced a result) — any
-   other error is returned as-is.
+1. `messages` 为空 → 全新 session；先删除任何过期的状态文件（`rerun` 绝不能意外 resume）。
+2. `messages` 非空且状态文件记录了针对**同一** `workspace` 的 id → 带 `--resume <id>` 派生，只发送当前 assignment（CLI 已经拥有转录）。
+3. `messages` 非空但没有可用的 id（本机首次运行、存储被 GC、workspace 变更）→ **回退再水化**：把携带的历史渲染成一段有界的文本前言（带角色标签，`**role**: content`，最多保留最近约 40 条消息/约 24k 字符，最旧的先丢弃，并附上显式的 `_[truncated: N earlier message(s) omitted]_` 说明），用 `## Prior conversation (rehydrated)` / `## Current task` 标题清晰分隔，使模型不会把再水化的上下文与当前任务混淆，然后把它置于 assignment 之前。assignment 自身的末尾用户消息（按线上契约随 `messages` 携带）会被排除在前言之外，避免重复。同时记录一条警告；上下文绝不会被静默丢弃。
+4. **resume 失败重试：**如果带 `--resume` 的派生在发出终止 `result` 帧之前就退出（session id 无效/被 GC——CLI 会很快报错），则在清除过期状态文件后，使用与第 3 步相同的回退再水化，不带 `--resume` 重试**一次**。除了这一次尝试外没有重试循环，而且该重试只针对这一特定失败模式（一次从未产出 result 的 `--resume` 尝试）——其他错误一律原样返回。
 
-**Non-goals (still).** Mid-turn steering into a genuinely new turn on the same
-session, and multimodal — unaffected by this change. Env-forwarding shipped
-as part of #443 (see §1/§6). Cross-machine resume is out of scope by
-construction (see the workspace/machine-locality note above); if the actor is
-redeployed to a different host or workspace, activation falls through to
-fallback rehydration automatically.
+**（仍然）不做的事。**轮中转向到同一 session 上真正的新轮次，以及多模态——不受本次变更影响。环境变量转发已随 #443 发布（见 §1/§6）。跨机器 resume 在构造上就不在范围内（见上文 workspace/机器局部性说明）；如果 actor 被重新部署到另一台主机或另一个 workspace，激活会自动落入回退再水化。
 
-## 5. Cancellation / shutdown
+## 5. 取消/关停
 
-Graceful 3-phase close (`session.go:1171-1228`):
+优雅的三阶段关闭（`session.go:1171-1228`）：
 
-1. close stdin (EOF lets the CLI run its Stop hooks),
-2. wait up to ~120 s for exit,
-3. SIGTERM the process group, wait 5 s, SIGKILL the group.
+1. 关闭 stdin（EOF 让 CLI 执行其 Stop hook），
+2. 最多等待约 120 秒退出，
+3. 向进程组发送 SIGTERM，等待 5 秒，再对整组 SIGKILL。
 
-There is no reliable mid-turn interrupt over this protocol (cc-connect's `/stop`
-kills the process and resumes by id). Map `CancellationToken` → full close;
-rely on `--resume` for continuation.
+在该协议上没有可靠的轮中中断手段（cc-connect 的 `/stop` 是杀掉进程后按 id resume）。把 `CancellationToken` 映射为完整关闭；延续依赖 `--resume`。
 
-## 6. Billing note
+## 6. 计费说明
 
-The spawned binary is official Claude Code with the user's own login; as of
-2026-07 subscription auth still covers `claude -p`/stream-json usage (the
-June 15 credit split was paused). Real-machine e2e confirmed this: the
-`system.init` frame reported `apiKeySource: "none"` with no key in the child
-env — the subscription is what actually gets billed.
+派生出的二进制是官方 Claude Code，使用用户自己的登录；截至 2026-07，订阅认证仍覆盖 `claude -p`/stream-json 用量（6 月 15 日的积分拆分被暂停了）。真机 e2e 证实了这一点：`system.init` 帧报告 `apiKeySource: "none"`，子进程环境中没有任何 key——真正被计费的是订阅。
 
-**Env policy (issue #443, implemented).** The executor no longer forwards the
-parent process env wholesale. `build_command` runs the child under
-`env_clear()` plus a fixed allowlist — `HOME`, `PATH`, `SHELL`, `TERM`, `LANG`,
-`LC_*` (prefix), `TMPDIR`, `USER`, `LOGNAME` — which is enough for the CLI and
-its shell tools to function but excludes every `*_API_KEY` and other ambient
-secret by construction. `forward_env: Vec<String>` on the executor spec (and
-the matching `claude_code_forward_env` config field, §8) names EXTRA variables
-to forward verbatim; forwarding `ANTHROPIC_API_KEY` this way is an EXPLICIT
-opt-in that flips billing from the subscription to the API key — never the
-implicit default.
+**环境策略（issue #443，已实现）。**执行器不再整体转发父进程环境。`build_command` 让子进程运行在 `env_clear()` 加固定白名单之下——`HOME`、`PATH`、`SHELL`、`TERM`、`LANG`、`LC_*`（前缀）、`TMPDIR`、`USER`、`LOGNAME`——这足以让 CLI 及其 shell 工具正常工作，同时在构造层面排除所有 `*_API_KEY` 和其他环境性密钥。执行器 spec 上的 `forward_env: Vec<String>`（以及对应的 `claude_code_forward_env` 配置字段，§8）指定要额外逐字转发的变量；以这种方式转发 `ANTHROPIC_API_KEY` 是一次**显式**选择，会把计费从订阅切到 API key——绝不是隐式默认。
 
-## 7. Executor shape (as implemented)
+## 7. 执行器形态（按当前实现）
 
 ```rust
 pub struct ClaudeCodeExecutor {
@@ -296,17 +161,17 @@ pub struct ClaudeCodeExecutor {
     model: Option<String>,
     permission_mode: Option<String>,
     workspace: Option<String>,
-    /// Stable per-child dir the resumed-session state file lives in — see §4.
-    /// `None` disables resume persistence (every activation is fresh).
+    /// 存放 resume session 状态文件的按子进程稳定目录——见 §4。
+    /// `None` 表示禁用 resume 持久化（每次激活都是全新的）。
     state_dir: Option<PathBuf>,
-    /// Issue #443: `false` (default) adds `--strict-mcp-config` +
-    /// `--setting-sources project`; read-only Plan uses an empty source list.
+    /// Issue #443：`false`（默认）会加上 `--strict-mcp-config` +
+    /// `--setting-sources project`；只读 Plan 使用空的来源列表。
     inherit_user_config: bool,
-    /// Issue #443: extra env var NAMES forwarded on top of the fixed
-    /// allowlist — see §1/§6.
+    /// Issue #443：在固定白名单之外额外转发的环境变量
+    /// 名称——见 §1/§6。
     forward_env: Vec<String>,
-    /// Issue #443: bound on the permission-relay `HostBridge::approval_call`
-    /// — see §3. Always `APPROVAL_RELAY_TIMEOUT` (300s) outside tests.
+    /// Issue #443：权限中继 `HostBridge::approval_call` 的上限
+    /// ——见 §3。测试之外恒为 `APPROVAL_RELAY_TIMEOUT`（300 秒）。
     relay_timeout: Duration,
 }
 
@@ -314,47 +179,36 @@ pub struct ClaudeCodeExecutor {
 impl ChildExecutor for ClaudeCodeExecutor {
     async fn run(&self, spec: RunSpec, events: EventSink,
                  steer: SteerInbox, cancel: CancellationToken) -> ChildOutcome {
-        // steer is drained for the whole activation (both possible attempts
-        // below) but not acted on — no reliable mid-turn interrupt (§5).
+        // steer 会在整个激活期间（包括下面可能的两次尝试）被排空，
+        // 但不会被响应——没有可靠的轮中中断（§5）。
         //
-        // §4 activation logic, then `run_once` (spawn → select-loop → §5
-        // shutdown) is called once, or twice on a resume-failure retry:
-        // 1. messages empty          → delete stale state; fresh spawn.
-        // 2. messages non-empty + id → spawn `--resume <id>` with just the
-        //                              live assignment.
-        // 3. messages non-empty, no id → fallback: rendered history preamble
-        //                                + assignment, fresh spawn.
-        // 4. a `--resume` spawn that exited with no `result` frame → clear
-        //    state, retry ONCE with the fallback body, no `--resume`.
+        // §4 激活逻辑，然后调用 `run_once`（spawn → select-loop →
+        // §5 关停）一次，或在 resume 失败重试时调用两次：
+        // 1. messages 为空        → 删除过期状态；全新 spawn。
+        // 2. messages 非空且有 id → 带 `--resume <id>` spawn，只发送
+        //                            当前 assignment。
+        // 3. messages 非空、无 id → 回退：渲染的历史前言 + assignment，
+        //                            全新 spawn。
+        // 4. 未产生 `result` 帧就退出的 `--resume` spawn → 清除
+        //    状态，用回退内容重试一次，不带 `--resume`。
         //
-        // Inside each `run_once` attempt, the select-loop:
-        //    - stdout line  → parse → events.emit(...)   (§2 table)
-        //      `system`/`result` with a session_id → persist state (§4)
-        //      control_request → events.emit(NeedsHuman) + park oneshot
-        //    - cancel       → §5 shutdown → ChildOutcome::Cancelled
-        //    - `result`     → §5 shutdown → ChildOutcome::Completed
+        // 在每次 `run_once` 尝试内部，select-loop：
+        //    - stdout 行   → 解析 → events.emit(...)   （§2 表格）
+        //      带 session_id 的 `system`/`result` → 持久化状态（§4）
+        //      control_request → events.emit(NeedsHuman) + 挂起 oneshot
+        //    - cancel      → §5 关停 → ChildOutcome::Cancelled
+        //    - `result`    → §5 关停 → ChildOutcome::Completed
     }
 }
 ```
 
-## 8. Config plumbing (issue #443)
+## 8. 配置管道（issue #443）
 
-`ExecutorSpec::ClaudeCode` (`bamboo-subagent::provision`) carries `binary`,
-`model`, `permission_mode`, `inherit_user_config: Option<bool>`, and
-`forward_env: Option<Vec<String>>`. Both factory arms that turn a spec into a
-running `ClaudeCodeExecutor` (`src/subagent_worker.rs`, `src/broker_agent.rs`)
-resolve `None` isolation/env fields to the hardened defaults
-(`inherit_user_config.unwrap_or(false)`, `forward_env.unwrap_or_default()`).
+`ExecutorSpec::ClaudeCode`（`bamboo-subagent::provision`）携带 `binary`、`model`、`permission_mode`、`inherit_user_config: Option<bool>` 和 `forward_env: Option<Vec<String>>`。把 spec 变成运行中 `ClaudeCodeExecutor` 的两个工厂分支（`src/subagent_worker.rs`、`src/broker_agent.rs`）都会把为 `None` 的隔离/环境字段解析为加固后的默认值（`inherit_user_config.unwrap_or(false)`、`forward_env.unwrap_or_default()`）。
 
-Two config surfaces build a `ClaudeCode` spec from `executor = "claude_code"`:
+有两个配置入口可以基于 `executor = "claude_code"` 构造 `ClaudeCode` spec：
 
-- `bamboo_config::SubagentsConfig` — the built-in local actor worker
-  (`subagents.claude_code_binary` / `_model` / `_permission_mode` /
-  `_inherit_user_config` / `_forward_env`).
-- `bamboo_engine::external_agents::config::ExternalAgentProfile` — a named
-  `externalAgents` profile using the actor protocol (same `claude_code_*`
-  field names).
+- `bamboo_config::SubagentsConfig`——内置的本地 actor worker（`subagents.claude_code_binary` / `_model` / `_permission_mode` / `_inherit_user_config` / `_forward_env`）。
+- `bamboo_engine::external_agents::config::ExternalAgentProfile`——使用 actor 协议的具名 `externalAgents` profile（相同的 `claude_code_*` 字段名）。
 
-Both are resolved into the spec in
-`crates/engine/bamboo-engine/src/external_agents/runtime.rs`
-(`build_local_actor_runner` and `build_external_child_runner` respectively).
+两者分别在 `crates/engine/bamboo-engine/src/external_agents/runtime.rs` 中被解析为 spec（对应 `build_local_actor_runner` 与 `build_external_child_runner`）。

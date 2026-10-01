@@ -1,56 +1,23 @@
-# Default Session writers after Actor initialization
+# Actor 初始化之后的默认 Session 写入者
 
-This slice (#1350, prerequisite of #1341/#925/#791) fences only default V2
-`save_session`, `save_runtime_state` including its full-save fallback, and
-`clear_session`. It does not enable production Actor activation.
+本切片（#1350，是 #1341/#925/#791 的前置）只为默认的 V2 `save_session`、`save_runtime_state`（包括其完整保存回退）和 `clear_session` 设置围栏。它不启用生产 Actor 激活。
 
-## Final authority and protected publications
+## 最终权威与受保护的发布
 
-The final lifecycle → Task → exact Session locks cover observational reads of
-Actor record/initialized marker and actual durable Session birth. Both files
-absent retain legacy compatibility. A valid matching Cold attempt-zero pair
-permits default context writes. Every record with current_attempt > 0 stays
-protected after finish, failure, cancellation or retirement. Attempt-zero
-Retired and missing-one-file/malformed/nonregular/mismatched authority are
-protected too. Reads never initialize, repair or refresh Actor authority.
+最终的 lifecycle → Task → 精确 Session 锁覆盖对 Actor 记录/初始化 marker 与实际 durable Session 出生的观察性读取。两个文件都缺失时保留旧版兼容。一对有效且匹配的 Cold attempt-zero 允许默认上下文写入。任何 current_attempt > 0 的记录在完成、失败、取消或退役后仍受保护。attempt-zero 的 Retired，以及缺一个文件/畸形/非常规文件/权威不匹配的情况同样受保护。读取绝不会初始化、修复或刷新 Actor 权威。
 
-Full saves compare complete ordered messages, provider-native transcript and
-Inbox admission from actual main; summaries, compression events and model
-context from actual runtime. Runtime-only compares only what its sidecar
-publishes: its discarded incoming messages/native/admission do not cause false
-rejection. Missing protected runtime cannot be reconstructed from embedded
-main. Equality requires actual durable values; history reads can scale with
-transcript size. Existing Root/Task/Project/birth and Supervisor checks remain.
+完整保存会比较来自实际 main 的完整有序消息、provider 原生 transcript 和 Inbox 准入，以及来自实际 runtime 的摘要、压缩事件和模型上下文。仅 runtime 的保存只比较其 sidecar 发布的内容：它丢弃的传入消息/native/准入不会导致误拒。缺失的受保护 runtime 无法从内嵌的 main 重建。相等性判定要求真实的 durable 值；历史读取的开销可能随 transcript 大小增长。既有的 Root/Task/Project/出生和 Supervisor 检查保持不变。
 
-A protected delta returns Unsupported with direct SessionAuthorityConflict,
-so existing merge/runner rejection paths suppress cache publication. It is not
-a Task retry. Exact-context control-plane saves remain independently validated.
-Clear rejects protected/ambiguous authority before attachment deletion.
+受保护的增量会返回 Unsupported 并直接附带 SessionAuthorityConflict，因此既有的 merge/runner 拒绝路径会抑制缓存发布。这不是 Task 重试。精确上下文的控制面保存仍独立校验。Clear 会在删除附件之前拒绝受保护/含糊的权威。
 
-## Physical job lifetime
+## 物理作业生命周期
 
-Each started directory preparation, proof/sidecar/main/search replacement and
-complete clear cleanup/rebuild runs in one std filesystem job owning the actual
-locks. Fields release Session, then Task, then lifecycle. Caller abort and Tokio
-runtime shutdown cannot let successor activation overtake a started job.
-Root mode passes its existing holder; no shared fair-lock re-entry is added.
+每个已启动的目录准备、proof/sidecar/main/search 替换以及完整的 clear 清理/重建，都在一个持有实际锁的 std 文件系统作业中运行。各字段按先 Session、再 Task、后 lifecycle 的顺序释放。调用方中止和 Tokio 运行时关闭都不能让后继激活超越已启动的作业。Root 模式传递其既有的持有者；不添加共享公平锁重入。
 
-Full-save still sequences Prepared → runtime → main → Committed, preserving
-fault boundaries. Cancellation can stop later async stages from starting;
-started-job ownership does not promise completion of the whole transaction.
-An error after rename may leave changed durable bytes with no confirmation.
-Windows retains existing MoveFileExW replace/write-through semantics.
+完整保存仍按 Prepared → runtime → main → Committed 的顺序执行，保留故障边界。取消可以阻止后续异步阶段启动；已启动作业的所有权并不承诺整个事务完成。重命名之后出错可能留下已变更的 durable 字节而没有确认。Windows 保留既有的 MoveFileExW 替换/直写语义。
 
-## Boundaries and evidence
+## 边界与证据
 
-Task CAS/undo/recovery (#1354), SupervisorManagement (#1355), and independently
-invoked startup migration (#1356) remain separate writers. Fenced append #1351,
-Inbox, attachments creation, Copy/delete/recreate, runtime opt-in, global cache
-ownership, remote and exactly-once guarantees are excluded. Arbitrary external
-removal of both Actor files while retaining Session is indistinguishable from
-legacy; no tombstone or new journal is introduced.
+Task CAS/撤销/恢复（#1354）、SupervisorManagement（#1355）以及独立调用的启动迁移（#1356）仍是独立的写入者。围栏化追加 #1351、Inbox、附件创建、复制/删除/重建、runtime opt-in、全局缓存所有权、远程以及 exactly-once 保证均被排除在外。保留 Session 而从外部任意删除两个 Actor 文件，与旧版情形无法区分；不引入墓碑或新 journal。
 
-Focused tests exercise real durable files, final activation after merge read,
-zero rejection callbacks, independent pre-created Stores, actual blocking-job
-barriers, FileExt lock probes, caller abort and whole-runtime shutdown. Platform
-execution evidence is recorded separately in the acceptance receipt.
+聚焦测试演练真实的 durable 文件、merge 读取后的最终激活、零拒绝回调、独立的预创建 Store、真实的阻塞作业屏障、FileExt 锁探测、调用方中止和整个运行时关闭。平台执行证据在验收回执中单独记录。

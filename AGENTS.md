@@ -1,41 +1,22 @@
-# Bamboo Agent Guidance
+# Bamboo 代理指南
 
-Read [README.md](./README.md) for the product boundary. Use this canonical Jiandu memory contract:
+阅读 [README.md](./README.md) 了解产品边界。使用以下权威的 Jiandu 记忆契约：
 
-- Session memory is continuity for the current session. Project memory holds durable project facts and decisions; Global memory holds cross-project user context.
-- Recall with a short lexical query. Use Jiandu's compact default top three `id`/summary results, then `get` only the selected item that needs full context.
-- Query before writing. Store one confirmed atomic fact with a specific title and a few useful keywords, entities, and tags.
-- Treat canonical Project memory as trusted durable project authority, but verify live repository or runtime state before acting. Treat Dream as a low-trust derived orientation snapshot, never as canonical evidence.
-- Never store secrets or tokens. Do not add embeddings, vectors, or a duplicate Bamboo persistence/index layer.
+- 会话记忆是当前会话的连续性载体。项目记忆保存持久的项目事实与决策；全局记忆保存跨项目的用户上下文。
+- 用简短的词法查询做召回。使用 Jiandu 默认的紧凑前三条 `id`/摘要结果，然后只对需要完整上下文的选中条目执行 `get`。
+- 写入前先查询。存储一条已确认的原子事实，配以明确的标题和若干有用的关键词、实体与标签。
+- 把权威项目记忆当作可信的持久项目权威，但在行动前核实实时的仓库或运行时状态。把 Dream 当作低信任的派生定位快照，绝不当作权威证据。
+- 绝不存储密钥或 token。不要添加 embedding、向量，或重复的 Bamboo 持久化/索引层。
 
-Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream snapshot bytes. Bamboo owns prompt selection and budget, optional reranking, and the model and cadence used to refresh Dream.
+Jiandu 拥有权威持久化、派生索引、词法召回和 Dream 快照字节。Bamboo 拥有提示词选择与预算、可选的重排序，以及刷新 Dream 所用的模型与节奏。
 
-## Pull Request Review
+## Pull Request 评审
 
-### Bamboo #791 integration exception
+### Bamboo #791 集成例外
 
-For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes
-precedence over the per-Issue PR and review steps below. Inventory all related
-PR heads and existing work first, then merge implemented work into one local
-integration baseline. Review integration changes locally and use focused checks
-while assembling it. Run the complete affected regression once after the
-baseline is ready, then submit one PR to `dev` and satisfy its required GitHub
-checks. Do not request or wait for GitHub Codex PR review for this epic. Close
-superseded component PRs and clean only safely merged worktrees after the final
-integration is accepted. Preserve dirty or uncertain worktrees.
+对于 #791 多 Agent epic，用户 2026-09-28 的交付指示优先于下文按 Issue 进行 PR 与评审的步骤。先盘点所有相关的 PR head 和已有工作，然后把已实现的工作合并为一个本地集成基线。在本地评审集成变更，并在组装基线时使用聚焦检查。基线就绪后运行一次完整的受影响回归，然后向 `dev` 提交一个 PR 并满足其必需的 GitHub 检查。不要为此 epic 请求或等待 GitHub Codex PR 评审。在最终集成被接受后，关闭被取代的组件 PR，并只清理已安全合并的 worktree。保留脏的或不确定的 worktree。
 
-- Every non-draft pull request that enters review must have a Codex review for
-  its current head and base. If no current review is already running or complete,
-  add a pull-request comment whose entire body is `@codex review`; do not rely
-  only on automatic review triggering.
-- Wait for the `Codex Review Summary` to finish. A 👍 reaction on the trigger or
-  an explicit Codex zero-findings result confirms a clean run; a `Completed`
-  summary alone only confirms that the run ended. Review suggestions or inline
-  comments are findings that must be resolved. Inspect the summary, review body,
-  reactions, and unresolved threads instead of treating an empty
-  `reviewDecision` or a `COMMENTED` review as approval.
-- Any head commit or base change invalidates the earlier Codex result. After the
-  update, resolve applicable findings and trigger a fresh exact-head review.
-- Green CI does not mean review passed. Add `review:agent` and remove
-  `review:needed` only after the current-head Codex review has finished with no
-  unresolved findings and the remaining acceptance and merge gates pass.
+- 每个进入评审的非草稿 pull request，都必须有针对其当前 head 和 base 的 Codex 评审。如果没有正在运行或已完成的当前评审，添加一条正文整体为 `@codex review` 的 pull request 评论；不要只依赖自动评审触发。
+- 等待 `Codex Review Summary` 完成。触发评论上的 👍 反应，或显式的 Codex 零发现结果，确认一次干净的运行；仅有 `Completed` 的总结只能确认运行已结束。评审建议或行内评论都是必须解决的发现。应检查总结、评审正文、反应和未解决线程，而不是把空的 `reviewDecision` 或 `COMMENTED` 评审当作批准。
+- 任何 head commit 或 base 变更都会使先前的 Codex 结果失效。更新之后，解决适用的发现，并触发一次针对确切 head 的新评审。
+- CI 绿灯不代表评审通过。只有在当前 head 的 Codex 评审已完成且无未解决发现、且其余验收与合并门都通过之后，才添加 `review:agent` 并移除 `review:needed`。

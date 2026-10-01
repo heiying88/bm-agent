@@ -1,11 +1,8 @@
-# Bamboo Crate Architecture
+# Bamboo crate 架构
 
-Layered Cargo workspace. Dependencies point **downward only** — no cycles.
-The HTTP server is a thin top layer; the agent loop and use-cases live in
-`bamboo-engine`; ports invert the dependency between generic tools and the
-server's `AppState`.
+分层的 Cargo workspace。依赖只**向下**指向——没有环。HTTP 服务器是薄薄的最上层；agent 循环与用例位于 `bamboo-engine`；port 通过依赖倒置连接通用工具与服务器的 `AppState`。
 
-## 1. Crate dependency layers
+## 1. crate 依赖分层
 
 ```mermaid
 flowchart TD
@@ -71,21 +68,13 @@ flowchart TD
     class ENG port;
 ```
 
-- **`bamboo-server-tools`** (green) — extracted in L1. Holds tools that are
-  generic agent capabilities. Depends only on lower crates, never on
-  `bamboo-server`/`AppState`.
-- **`bamboo-engine`** (blue) — owns the agent loop **and** the port traits that
-  let generic tools reach server runtime state without depending on the server.
-- **`bamboo-hooks`** — owns lifecycle registration, matcher evaluation,
-  deterministic dispatch, command execution, and external script runtime
-  selection. The engine owns lifecycle seams and applies returned control or
-  context effects.
+- **`bamboo-server-tools`**（绿色）——在 L1 中抽出。存放属于通用 agent 能力的工具。只依赖下层的 crate，绝不依赖 `bamboo-server`/`AppState`。
+- **`bamboo-engine`**（蓝色）——拥有 agent 循环**以及**让通用工具在不依赖服务器的前提下访问服务器运行时状态的 port trait。
+- **`bamboo-hooks`**——负责生命周期注册、匹配器求值、确定性分发、命令执行以及外部脚本运行时的选择。引擎拥有生命周期缝合点，并应用其返回的控制或上下文效果。
 
-## 2. The port pattern (dependency inversion)
+## 2. port 模式（依赖倒置）
 
-How a generic tool (`SubAgentTool`) reaches `AppState`-bound runtime state
-without depending on `bamboo-server`, and why the scheduler tool stays inside
-its subsystem instead.
+展示一个通用工具（`SubAgentTool`）如何在不依赖 `bamboo-server` 的情况下访问绑定于 `AppState` 的运行时状态，以及调度工具为何留在自己的子系统内。
 
 ```mermaid
 flowchart LR
@@ -123,32 +112,21 @@ flowchart LR
     class ADAPTER,FACTORY glue;
 ```
 
-**Reading it:**
+**解读：**
 
-- The dependency edge `SubAgentTool → AppState` is gone. It now points
-  `SubAgentTool → Port` (engine), and `Adapter → Port` (server). The arrow was
-  *inverted*: the tool and the server both depend on the engine-owned trait.
-- `ChildSessionAdapter` (purple) is the only place the `AppState` runtime state
-  is bound. It implements `ChildSessionPort` (session lifecycle: load/save/run/
-  cancel + parent-wait + active children) and `SubagentResolutionPort`
-  (subagent_type → model / metadata / prompt).
-- `ToolSurfaceFactory` is the composition root that assembles the per-surface
-  tool executors the agent runtime uses (Base / Child / WithTask / Root).
-- **`scheduler_tool`** stays *inside* `schedule_app`: it is a facade over that
-  subsystem (its args embed schedule-domain types; it returns schedule DTOs),
-  not a subsystem-independent capability. Keeping it co-located preserves
-  cohesion and makes `schedule_app` a clean slice ready to become its own crate.
+- 依赖边 `SubAgentTool → AppState` 已消失。现在指向 `SubAgentTool → Port`（engine）和 `Adapter → Port`（server）。箭头被*倒置*了：工具与服务器都依赖引擎拥有的 trait。
+- `ChildSessionAdapter`（紫色）是唯一绑定 `AppState` 运行时状态的地方。它实现了 `ChildSessionPort`（session 生命周期：加载/保存/运行/取消 + 等待父级 + 活跃子级）和 `SubagentResolutionPort`（subagent_type → 模型/元数据/prompt）。
+- `ToolSurfaceFactory` 是组合根，负责组装 agent 运行时使用的各表面工具执行器（Base / Child / WithTask / Root）。
+- **`scheduler_tool`** 留在 `schedule_app` *内部*：它是该子系统的门面（其参数内嵌调度领域类型；返回调度 DTO），而不是一个与子系统无关的能力。让它与子系统同址保留了内聚性，也使 `schedule_app` 成为一个随时可以独立成 crate 的干净切片。
 
-## 3. What L1 changed
+## 3. L1 改变了什么
 
-| | Before | After |
+| | 之前 | 之后 |
 |---|---|---|
-| Generic tools (memory, skills, compact, overlay, session_inspector) | `bamboo-server::server_tools` | `bamboo-server-tools` crate |
-| `SubAgentTool` | held concrete `Arc<ChildSessionAdapter>` | holds `Arc<dyn ChildSessionPort>` + `Arc<dyn SubagentResolutionPort>`; lives in `bamboo-server-tools` |
-| Ports | none | `ChildSessionPort` (extended) + `SubagentResolutionPort` in `bamboo-engine` |
-| Scheduler tool | `bamboo-server::tools::schedule_tasks` | `bamboo-server::schedule_app::scheduler_tool` (with its subsystem) |
+| 通用工具（memory、skills、compact、overlay、session_inspector） | `bamboo-server::server_tools` | `bamboo-server-tools` crate |
+| `SubAgentTool` | 持有具体的 `Arc<ChildSessionAdapter>` | 持有 `Arc<dyn ChildSessionPort>` + `Arc<dyn SubagentResolutionPort>`；位于 `bamboo-server-tools` |
+| port | 无 | `bamboo-engine` 中的 `ChildSessionPort`（已扩展）+ `SubagentResolutionPort` |
+| 调度工具 | `bamboo-server::tools::schedule_tasks` | `bamboo-server::schedule_app::scheduler_tool`（连同其子系统） |
 | `bamboo-server/src` | 49,465 LOC | 45,488 LOC |
 
-Future moves this sets up: **L2** sink handler orchestration into
-`engine::session_app` use-cases; **L5** lift the whole `schedule_app` slice
-(incl. its tool) into a `bamboo-schedule` crate.
+这一步为后续迁移铺路：**L2** 把 handler 编排下沉到 `engine::session_app` 用例；**L5** 把整个 `schedule_app` 切片（包括其工具）上提为独立的 `bamboo-schedule` crate。

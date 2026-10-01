@@ -1,91 +1,40 @@
-# Task runtime filesystem publication lifetime
+# Task 运行时文件系统发布生命周期
 
-Bamboo #1354 retains the existing exclusive Task transaction lock through each
-**already-started** Task runtime replacement. This covers a single CAS, either
-paired updated write, either undo write, and existing explicit or constructor
-recovery. It does not promise completion of the entire async transaction after
-caller cancellation or runtime shutdown.
+Bamboo #1354 在每个**已启动**的 Task 运行时替换期间保持既有的排他 Task 事务锁。这覆盖单次 CAS、配对更新写入的任一次、undo 写入的任一次，以及既有的显式恢复或构造器恢复。它不承诺在调用方取消或运行时关闭之后整个异步事务仍会完成。
 
-## Ownership and publication
+## 所有权与发布
 
-The private exclusive Task guard shares one lease through `Arc`. The lease owns
-the original process `OwnedRwLockWriteGuard` and original FileExt-locked file
-handle. Cloning retains this same authority; it does not acquire another lock.
-The final clone's destruction unlocks the physical file and releases the process
-gate. The ordinary shared guard and public Storage interfaces are unchanged.
+私有的排他 Task 守卫通过 `Arc` 共享同一份租约。该租约拥有原始的进程级 `OwnedRwLockWriteGuard` 与原始的 FileExt 加锁文件句柄。克隆保留的是同一权限，不会另外获取锁。最后一个克隆销毁时会解锁物理文件并释放进程门。普通共享守卫与公共 Storage 接口保持不变。
 
-Every private locked Task commit/recovery helper requires a borrowed exclusive
-guard from its existing caller. The complete runtime replacement clones that
-guard into one `spawn_blocking` closure. That closure performs the existing
-unique temporary file creation, complete write, file sync, replace, Unix parent
-directory sync, and error cleanup with synchronous filesystem calls. Its guard
-outlives every one of those operations, including cleanup when the async waiter
-has disappeared. Windows keeps the existing true replace-existing primitive.
-There is no remove-then-rename fallback introduced by this change.
+每个私有的加锁 Task 提交/恢复辅助函数都要求从其既有调用方借用排他守卫。完整的运行时替换把该守卫克隆进一个 `spawn_blocking` 闭包。该闭包以同步文件系统调用执行既有的唯一临时文件创建、完整写入、文件同步、替换、Unix 父目录同步与错误清理。其守卫比上述每一个操作都存活得更久——包括异步等待者已消失时的清理。Windows 保留既有的真实替换原语。本变更不引入先删除再重命名的回退路径。
 
-Existing constructor, copy, clear, cleanup, reset, recursive deletion, Supervisor
-bootstrap, and Root recreation callers pass their already-acquired exclusive
-Task guard through existing Task recovery. Their lifecycle/proof/copy protocols
-are not converted into new owned transactions. The default Session writer's
-existing holder shape is unchanged, and no helper reacquires its own Task lock.
+既有的构造器、复制、清空、清理、重置、递归删除、Supervisor bootstrap 与 Root 重建等调用方，会通过既有的 Task 恢复传递其已获取的排他 Task 守卫。它们的生命周期/证明/复制协议不会被转换成新的 owned 事务。默认 Session 写入者的既有持有器形态保持不变，任何辅助函数都不会重新获取自己的 Task 锁。
 
-## Existing authority and recovery remain authoritative
+## 既有权限与恢复仍具权威性
 
-Single/pair CAS still revalidate the durable Task generation and non-Task fields
-under the exclusive lock. A physical replacement is built from the just-read
-current Session, patching only Task fields. Undo still rereads the strict target
-and patches only the journal's Task list/generation. Session/Root/Project/birth
-checks, journal schema and states, fault points, durability event order, and
-pending-journal fail-closed behavior are unchanged.
+单个/配对 CAS 仍会在排他锁下重新校验持久化的 Task 世代与非 Task 字段。物理替换基于刚读取的当前 Session 构建，只修补 Task 字段。Undo 仍会重新读取严格目标，只修补 journal 的 Task 列表/世代。Session/Root/Project/出生检查、journal schema 与状态、故障点、持久化事件顺序以及 pending journal 的失败关闭行为都保持不变。
 
-If cancellation occurs during the first paired write, that started write can
-finish, but the second async write and journal finalization need not run. The
-retained pending journal continues to prevent ordinary shared access until
-existing exclusive recovery restores the pair. Cancellation during undo or
-recovery can likewise leave recovery incomplete. The completed filesystem job
-releases its lock; a later recovery call must finish the existing protocol.
+如果取消发生在第一次配对写入期间，该已启动的写入可以完成，但第二次异步写入与 journal 收尾不必执行。保留的 pending journal 会继续阻止普通共享访问，直到既有的排他恢复还原该配对。撤销或恢复期间的取消同样可能留下未完成的恢复。已完成的文件系统作业会释放其锁；后续的恢复调用必须完成既有协议。
 
-An error before replace leaves the old runtime target in place. An error after
-replace may expose the new target even though final durability failed. Neither
-case is reported as a successful durability event. Temporary cleanup remains
-best effort and preserves the original error. These outcomes are not rolled
-into an invented whole-transaction success guarantee.
+替换前的错误会保留旧的运行时目标。替换后的错误可能在最终持久化已失败的情况下暴露新目标。这两种情况都不会被报告为成功的持久化事件。临时文件清理仍是尽力而为，并保留原始错误。这些结果不会被包装成凭空创造的整事务成功保证。
 
-## Native acceptance fixtures
+## 原生验收夹具
 
-`v2/task_publication_lifetime_tests.rs` uses synchronous barriers inside the
-actual std replacement and error-cleanup path. Test-only hooks are isolated by
-Store or exact unique constructor home; there is no production hook registry.
+`v2/task_publication_lifetime_tests.rs` 在真实的 std 替换与错误清理路径内部使用同步屏障。仅测试用的钩子按 Store 或精确唯一的构造器宿主隔离；没有生产钩子注册表。
 
-The bounded matrix covers:
+有界矩阵覆盖：
 
-- single CAS, paired first/second replacement, first/second undo, explicit and
-  constructor recovery;
-- caller abort before replace, and actual Tokio `shutdown_background` or
-  `shutdown_timeout` while the native job is parked after replace;
-- errors before and after replace, plus cancellation and runtime shutdown at an
-  actual error-cleanup barrier;
-- precreated independent Stores and a separate FileExt probe showing the Task
-  lock remains held while the old job runs;
-- pending pair journals rejecting ordinary reads until existing recovery;
-- legitimate subsequent context B publication using the now-current Task
-  generation, then actual never-activated Actor claim and reopen verification
-  of summary, compression events, model-context state, history and Actor birth.
+- 单次 CAS、配对的第一次/第二次替换、第一次/第二次 undo、显式恢复与构造器恢复；
+- 替换前的调用方中止，以及原生作业在替换之后被暂停期间真实的 Tokio `shutdown_background` 或 `shutdown_timeout`；
+- 替换前与替换后的错误，以及在真实错误清理屏障处的取消与运行时关闭；
+- 预先创建的独立 Store，以及一个独立的 FileExt 探针显示旧作业运行期间 Task 锁仍被持有；
+- pending 配对 journal 在既有恢复完成之前拒绝普通读取；
+- 使用现已当前的 Task 世代进行的合法后续上下文 B 发布，随后是真实的从未激活 Actor claim，以及对摘要、压缩事件、model-context 状态、历史与 Actor 出生信息的重开校验。
 
-The fixture releases native barriers during panic cleanup. After runtime
-shutdown it uses the precreated Store for lock/recovery observation and a fresh
-Store for later publication on the replacement runtime, rather than claiming a
-terminated search worker continues to run.
+该夹具在 panic 清理期间释放原生屏障。运行时关闭之后，它用预先创建的 Store 观察锁/恢复，并用一个新 Store 在替换后的运行时上执行后续发布，而不是宣称已终止的搜索 worker 仍在运行。
 
-This document describes the implementation and acceptance design. Execution
-receipts separately identify the exact tested source, platform, and outcomes;
-source inspection alone does not establish native test success.
+本文档描述实现与验收设计。执行回执单独标明确切的受测源码、平台与结果；仅凭源码检查不能确立原生测试的成功。
 
-## Non-goals
+## 非目标
 
-No new journal, recovery state, generation, Actor classifier, global writer
-opt-in, exactly-once promise, or public protocol is added. Async journal
-publication/finalization/deactivation remain the existing protocol; this slice
-retains ownership for complete Task **runtime** replacements. Independent
-SupervisorManagement full-runtime jobs (#1355), SessionInbox jobs, input
-checkpoints, worker events, and unrelated writers remain separate scopes.
+不新增 journal、恢复状态、世代、Actor 分类器、全局写入者选择加入、exactly-once 承诺或公共协议。异步 journal 的发布/收尾/去激活仍是既有协议；本切片只为完整的 Task **运行时**替换保留所有权。独立的 SupervisorManagement 全运行时作业（#1355）、SessionInbox 作业、输入检查点、worker 事件与无关写入者仍是独立范围。

@@ -1,25 +1,25 @@
-# Session storage V3 shadow evaluation
+# Session 存储 V3 影子评估
 
-`bamboo_storage::v3::SessionStoreV3` provides an opt-in SQLite WAL store for captured session snapshots. The server and SDK continue using their existing V2 authority. Opening a V3 database does not switch a session, launch a run, modify V2 files, or migrate user data.
+`bamboo_storage::v3::SessionStoreV3` 提供一个可选开启的 SQLite WAL 存储区，用于存放已捕获的 session 快照。服务端与 SDK 继续使用既有的 V2 权威数据。打开一个 V3 数据库不会切换 session、启动 run、修改 V2 文件，也不会迁移用户数据。
 
-The store keeps messages in ordered rows and stores control state separately. A full snapshot transaction commits changed message rows together with the provider transcript and inbox admission proof. A runtime-only transaction accepts the message-free snapshot returned by `load_runtime`; it does not load or rewrite message rows or provider history.
+该存储区把消息保存在有序的行里，并将控制状态单独存放。完整快照事务会把变更的消息行连同 provider 转写（transcript）和 inbox 准入证明一并提交。仅运行时事务只接受 `load_runtime` 返回的不含消息的快照；它不会加载或改写消息行，也不会触及 provider 历史。
 
-Full snapshots use a pair of history/runtime revisions. Runtime writes compare only their runtime revision, while immutable creation identity and Project metadata revision checks remain required. History pagination includes a revision, so a client cannot silently combine pages from different histories. Independent SQLite connections compete through an immediate transaction; stale writers receive `V3Error::Conflict`.
+完整快照使用一对 history/runtime 修订号。运行时写入只比较其 runtime 修订号，但不可变的创建身份与 Project 元数据修订检查仍然必需。历史分页带有修订号，因此客户端无法悄然拼接来自不同历史的页面。多个独立的 SQLite 连接通过 immediate 事务竞争；过期的写入者会收到 `V3Error::Conflict`。
 
-## Captured-tree import
+## 捕获树导入
 
-Capture one complete logical tree as a JSON array of current `Session` values. Then run:
+把一棵完整的逻辑树捕获为当前 `Session` 值组成的 JSON 数组，然后运行：
 
 ```sh
 cargo run -p bamboo-storage --example v3_shadow -- session-tree.json shadow.sqlite
 ```
 
-The target must have no existing session ids from the import. The importer checks the root, parent closure, duplicate ids and cycles, then inserts the tree in one transaction. Any conflict rolls back the entire import. The example reloads and compares every imported snapshot using canonical JSON and reports success only when all snapshots match. This comparison describes the captured source; it is not a live cutover guarantee when another process continues writing V2.
+目标数据库中不得已存在导入所含的任何 session id。导入器会检查根、父闭包、重复 id 与环，然后在一个事务里插入整棵树。任何冲突都会回滚整个导入。该示例随后重新加载并使用规范化 JSON 比较每个导入的快照，只有全部匹配时才报告成功。这一比较描述的是被捕获的来源；当另一个进程仍在写 V2 时，它并不是在线切换保证。
 
-SQLite connections are retained by the store. The API is synchronous for offline/shadow workloads; async applications must invoke it on a blocking worker. The database has a distinct application id and schema version and rejects unrelated databases.
+SQLite 连接由存储区持有。该 API 面向离线/影子负载是同步的；异步应用必须把它放到阻塞式 worker 上调用。该数据库拥有独立的应用 id 与 schema 版本，会拒绝无关的数据库。
 
-## Current boundary
+## 当前边界
 
-This slice implements the transactional store, revisioned reads/writes, and verified shadow import. It does not select runtime read/write authority. Attachments remain unchanged message payloads or existing references; referenced files are not copied into a new attachment store. Search indexing, fork/delete lifecycle, live catch-up and authority switching remain on the current V2 path. V3 has no destructive rollback command. Do not treat disabling a future selector as a rollback procedure.
+本切片实现了事务化存储区、带修订号的读/写，以及经过校验的影子导入。它不选择运行时读写权威。附件仍是不变的消息载荷或既有引用；被引用的文件不会被复制进新的附件存储区。搜索索引、fork/删除生命周期、在线追赶与权威切换仍走当前的 V2 路径。V3 没有破坏性回滚命令。不要把禁用一个未来的选择器当作回滚流程。
 
-Tests cover V2 captured-tree equivalence, reopening, admission proof retention, per-row edits and truncation, revisioned pagination, concurrent CAS, Project/creation fences, and whole-tree rollback. Synthetic measurements must be reported with their history size and build mode; these tests establish consistency, not production performance.
+测试覆盖 V2 捕获树等价性、重新打开、准入证明保留、逐行编辑与截断、带修订号的分页、并发 CAS、Project/创建栅栏（fence），以及整树回滚。合成测量必须随附其历史规模与构建模式；这些测试确立的是一致性，而不是生产性能。

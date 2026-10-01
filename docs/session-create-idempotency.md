@@ -1,16 +1,10 @@
-# Recoverable session creation
+# 可恢复的 session 创建
 
-`POST /api/v1/sessions` supports an optional `Idempotency-Key` header so a
-client can safely recover an ambiguous timeout or lost response. Existing
-clients that omit the header retain the legacy one-request/one-session
-behavior.
+`POST /api/v1/sessions` 支持可选的 `Idempotency-Key` 头，客户端因此可以安全地恢复一次结果不明的超时或丢失的响应。省略该头的既有客户端保持旧版的“一请求一 session”行为。
 
-## API contract
+## API 契约
 
-The key must be 1–128 bytes and may contain ASCII letters, digits, `-`, `_`,
-`.` or `:`. A client should generate one opaque, non-secret key for each
-logical create action and retain it until that action reaches a terminal
-status.
+key 必须为 1–128 字节，可包含 ASCII 字母、数字、`-`、`_`、`.` 或 `:`。客户端应当为每个逻辑创建动作生成一个不透明的非机密 key，并将其保留到该动作进入终止状态。
 
 ```http
 POST /api/v1/sessions
@@ -20,27 +14,21 @@ Content-Type: application/json
 {"title":"New session"}
 ```
 
-The first successful request returns the existing `201` response:
+首次成功请求返回既有的 `201` 响应：
 
 ```json
 {"session": {"id": "..."}}
 ```
 
-An equivalent replay returns `200` with the same response shape and session
-ID. Reusing a key with a different payload returns `409` with error code
-`idempotency_key_conflict`. The fingerprint includes every caller-controlled
-`CreateSessionRequest` field (`project_id`, title lifecycle, prompt, model,
-provider, model reference, reasoning effort, Gold config and workspace), using
-recursively canonical JSON. Server defaults and runtime credentials are not
-part of the fingerprint.
+等价重放返回 `200`，响应结构相同且 session ID 相同。用同一个 key 携带不同的载荷重放会返回 `409` 与错误码 `idempotency_key_conflict`。指纹涵盖调用方可控的每个 `CreateSessionRequest` 字段（`project_id`、标题生命周期、prompt、model、provider、模型引用、推理力度、Gold 配置与 workspace），使用递归规范化 JSON。服务端默认值与运行时凭据不属于指纹。
 
-After an uncertain response, query the authenticated status endpoint:
+在响应不确定之后，查询经过认证的状态端点：
 
 ```http
 GET /api/v1/session-create-operations/550e8400-e29b-41d4-a716-446655440000
 ```
 
-It always returns `200` for a valid key:
+对有效的 key，它始终返回 `200`：
 
 ```json
 {"status":"pending"}
@@ -50,116 +38,41 @@ It always returns `200` for a valid key:
 {"status":"unknown"}
 ```
 
-Every valid-key status response carries `Cache-Control: no-store`, so a browser
-or intermediary cannot pin an early `unknown` or `pending` result. The route
-lives inside the normal `/api/v1` access-control scope. It is not a public
-recovery bypass.
+每个有效 key 的状态响应都带有 `Cache-Control: no-store`，因此浏览器或中间方无法固定早期的 `unknown` 或 `pending` 结果。该路由位于正常的 `/api/v1` 访问控制范围之内，不是公开的恢复旁路。
 
-The registry namespace is one Bamboo data directory (the current local-account
-security domain), shared by that account's authenticated devices. It does not
-currently encode an individual device or principal in the key digest. If one
-data directory is ever shared by mutually untrusted tenants, the namespace
-must first be partitioned by authenticated tenant/principal identity so equal
-client keys cannot collide or disclose another tenant's operation status.
+注册表的命名空间是一个 Bamboo 数据目录（当前的本地账户安全域），由该账户的已认证设备共享。它目前不在 key 摘要中编码单个设备或主体。如果将来一个数据目录被互不信任的租户共享，必须先按经过认证的租户/主体身份划分命名空间，使相同的客户端 key 既不会冲突，也不会泄露另一个租户的操作状态。
 
-## Durable recovery and ordering
+## 持久恢复与顺序
 
-The operation registry is independent of target session directories under
-`$BAMBOO_DATA_DIR/session-create-operations/v1`. Filenames are full SHA-256
-key digests. Records contain only the key digest, a canonical-payload digest,
-the reserved session UUID, safe terminal error data and timestamps. They never
-contain the raw key or request payload.
+操作注册表独立于目标 session 目录，位于 `$BAMBOO_DATA_DIR/session-create-operations/v1` 之下。文件名是完整的 SHA-256 key 摘要。记录只包含 key 摘要、规范化载荷摘要、预留的 session UUID、安全的终止错误数据与时间戳，绝不包含原始 key 或请求载荷。
 
-Each new key reserves and fsyncs one stable UUID before session creation.
-Matching fixed lock shards in memory and on disk serialize same-key requests
-across concurrent Bamboo processes without creating an unbounded lock-file
-registry. An idempotent POST runs its claimed core in a detached Actix task and
-the request handler awaits that task's join handle. Dropping/aborting the outer
-request future therefore does not cancel a create that already entered the
-core. The normal completion order remains:
+每个新 key 在创建 session 之前先预留并 fsync 一个稳定的 UUID。内存与磁盘上配对的固定锁分片跨并发的 Bamboo 进程串行化同 key 请求，又不会造成无界的锁文件注册表。幂等 POST 把它认领的核心逻辑放到一个分离的 Actix 任务中运行，请求处理器等待该任务的 join handle。因此，丢弃/中止外层请求 future 并不会取消一个已经进入核心的创建。正常完成顺序保持为：
 
-1. validate Project/workspace and prepare the session;
-2. durably save the authoritative session and atomically publish the rebuildable
-   global session index;
-3. populate the in-memory cache;
-4. publish the runtime workspace;
-5. durably publish `SessionCreated` to the account journal;
-6. mark the create operation succeeded and return.
+1. 校验 Project/workspace 并准备该 session；
+2. 持久保存权威 session，并原子发布可重建的全局 session 索引；
+3. 填充内存缓存；
+4. 发布运行时 workspace；
+5. 把 `SessionCreated` 持久发布到账户日志；
+6. 把创建操作标记为成功并返回。
 
-Recovery does not trust the rebuildable global index alone. It strictly reads
-the reserved root session's authoritative `session.json`; missing, corrupt and
-unreadable are distinct outcomes. Index repair rebases under one fixed
-cross-process file claim and preserves a newer live summary while correcting
-canonical identity/path. SessionRepository then performs its no-regression
-cache merge. A corrupt/read failure returns `500` and leaves the durable
-receipt unchanged for later repair.
+恢复不会只信任可重建的全局索引。它会严格读取预留根 session 的权威 `session.json`；缺失、损坏与不可读是不同的结果。索引修复在一个固定的跨进程文件认领之下变基，并在纠正规范身份/路径的同时保留较新的活跃摘要。随后 SessionRepository 执行其无回归缓存合并。损坏/读取失败返回 `500`，并保持持久回执不变，留待后续修复。
 
-Pending recovery is allowed only while the caller owns the same-key exclusive
-claim. It may finish the remaining workspace and account-feed projections,
-then mark the receipt succeeded. A status GET uses a nonblocking try-lock: when
-the POST owns the claim it immediately reports the persisted `pending` state;
-when it wins the claim it re-reads the receipt before recovering. Succeeded
-GET/POST replay performs only strict authoritative/index/cache reconciliation;
-it never republishes workspace or `SessionCreated` projections and never
-replaces a newer live cache Arc.
+只有当调用者持有同 key 独占认领时，才允许待处理恢复。它可以完成剩余的 workspace 与账户信息流投影，然后把回执标记为成功。状态 GET 使用非阻塞 try-lock：当 POST 持有认领时，它立即报告持久化的 `pending` 状态；当它赢得认领时，会先重读回执再恢复。已成功的 GET/POST 重放只执行严格的权威/索引/缓存对账；它从不再发布 workspace 或 `SessionCreated` 投影，也绝不替换较新的活跃缓存 Arc。
 
-`sessions.json` initialization, mutation and reset use the fixed index claim.
-Every mutation re-reads disk, applies its change, atomically persists, and only
-then updates that process's memory snapshot. Old/corrupt rebuilds publish a
-crash-resumable marker under the same claim, then scan with short claimed
-updates; lifecycle locks and no-regression merging prevent stale rebuild reads
-from overwriting newer summaries or resurrecting a concurrent deletion.
+`sessions.json` 的初始化、变更与重置使用固定的索引认领。每次变更都会重读磁盘、应用修改、原子持久化，然后才更新该进程的内存快照。旧/损坏的重建在同一认领之下发布一个可崩溃续跑的标记，然后以短暂的持锁更新进行扫描；生命周期锁与无回归合并防止过期的重建读取覆盖较新的摘要，或复活一个并发的删除。
 
-Account-journal sequence allocation and append are also serialized across
-processes. The writer resumes the newest underfilled journal, truncates a torn
-tail, appends, flushes and syncs the file (and syncs the directory when creating
-a new file). Session/workflow lifecycle events and `ConfigChanged` use durable
-exact-once IDs; config health events deduplicate only consecutive equal states.
-Confirmed enqueue plus durable acknowledgement share one bounded deadline.
-The FTS index remains best-effort and is not part of the success barrier.
+账户日志的序列号分配与追加同样跨进程串行化。写入者恢复最新的未填满日志，截断撕裂的尾部，追加、刷新并同步文件（创建新文件时还会同步目录）。Session/工作流生命周期事件与 `ConfigChanged` 使用持久的精确一次 ID；配置健康事件只对连续相等的状态去重。确认入队与持久确认共享一个有界截止时间。FTS 索引仍是尽力而为，不属于成功屏障。
 
-A pending reservation with no session can be retried with the same payload and
-reserved UUID. A pending or succeeded reservation with a durable session is
-reconciled to success. If a succeeded session is later deleted, replay returns
-`410 session_result_gone` and the status becomes terminal `failed`; the same
-key never silently creates a replacement during its retention window.
+没有对应 session 的待处理预留可以用相同的载荷与预留 UUID 重试。带有持久 session 的待处理或已成功预留会被对账为成功。如果已成功的 session 随后被删除，重放返回 `410 session_result_gone`，状态变为终止的 `failed`；在其保留窗口内，同一个 key 绝不会悄悄创建替代品。
 
-## Retention
+## 保留
 
-Pending reservations do not expire. Expiring one could allocate a second UUID
-for the same logical action after a long outage. Succeeded and failed receipts
-are retained for 24 hours after becoming terminal. After that window, GET
-reports the durable `expired` tombstone until it is physically pruned. A
-same-key POST may acquire the claim, remove the expired receipt and start a new
-logical operation; a later GET then observes that new operation (or `unknown`
-after deletion before reuse). Clients must finish timeout recovery within 24
-hours and must not reuse keys for unrelated work.
+待处理预留不会过期。让其过期可能在长时间故障之后为同一个逻辑动作分配第二个 UUID。成功与失败的回执在进入终止状态后保留 24 小时。该窗口过后，GET 会报告持久化的 `expired` 墓碑，直到它被物理清理。同 key 的 POST 可以获取认领、移除过期回执并开始一个新的逻辑操作；之后的 GET 观察到的是那个新操作（若删除后尚未复用，则为 `unknown`）。客户端必须在 24 小时内完成超时恢复，并且不得把 key 复用于无关的工作。
 
-On startup Bamboo first identifies expired terminal candidates without taking
-claims. It then uses a nonblocking same-key try-lock, skips busy candidates, and
-re-reads each acquired candidate before deleting only records that are still
-expired. Startup never waits on active/pending work. Pending and unexpired
-records are preserved. Corrupt records are retained with a digest-only warning
-for deliberate manual recovery rather than being silently treated as expired
-or deleted.
+启动时，Bamboo 先在不获取认领的情况下识别过期的终止候选。然后使用同 key 的非阻塞 try-lock，跳过繁忙的候选，并在删除之前重读每个已获取的候选，只删除仍然过期的记录。启动从不会等待活动/待处理的工作。待处理与未过期的记录会被保留。损坏的记录会带一条仅含摘要的警告保留，供审慎的手工恢复使用，而不是被悄悄当作过期或删除。
 
-## Observability
+## 可观测性
 
-The server emits structured `bamboo.session_create` tracing events with a
-non-sensitive 16-hex correlation prefix and fixed, low-cardinality `phase` and
-`outcome` fields. Phases cover acceptance, durable reservation, save start,
-claim acquisition, session commit, completion, replay, status recovery and
-handler termination; elapsed/save durations are recorded in milliseconds, and
-`lock_acquired` records `lock_wait_ms` separately. A `response_constructed`
-event means only that the handler produced an HTTP result; it does not claim
-that the client received the bytes. If the handler future is dropped first,
-`handler_dropped`/`cancelled_or_disconnected` records that bounded fact. It can
-result from a client abort or server cancellation and deliberately does not
-guess which one occurred. Raw keys, titles, prompts, Gold config, workspace
-paths/roots, providers and credentials are never traced by the idempotent
-create/recovery path.
+服务端发出结构化的 `bamboo.session_create` 追踪事件，带有非敏感的 16 个十六进制字符的关联前缀，以及固定的低基数 `phase` 与 `outcome` 字段。阶段覆盖接受、持久预留、保存开始、认领获取、session 提交、完成、重放、状态恢复与处理器终止；耗时/保存时长以毫秒记录，`lock_acquired` 另行记录 `lock_wait_ms`。`response_constructed` 事件只表示处理器产生了 HTTP 结果；它并不声称客户端收到了字节。如果处理器 future 先被丢弃，`handler_dropped`/`cancelled_or_disconnected` 会记录这一有界事实。它可能源自客户端中止或服务端取消，并有意不去猜测是哪一种。幂等创建/恢复路径绝不追踪原始 key、标题、prompt、Gold 配置、workspace 路径/根、provider 与凭据。
 
-These are structured traces, not persisted aggregate histograms. A monitoring
-deployment can derive counters and latency distributions from the fixed fields;
-adding a dedicated metrics-store schema is intentionally outside this API
-correctness change.
+这些是结构化追踪，不是持久化的聚合直方图。监控部署可以从固定字段推导出计数器与延迟分布；刻意不为这次 API 正确性变更添加专门的指标库 schema。

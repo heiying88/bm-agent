@@ -1,16 +1,16 @@
 ---
 name: debug
-description: Diagnose a concrete failure, regression, crash, hang, flaky test, or incorrect runtime behavior by reproducing it, testing hypotheses, and identifying the evidence-backed root cause. Use when symptoms or failing output exist; do not use for feature implementation without a failure, general code review, or a conceptual explanation.
+description: 通过复现具体故障、回归、崩溃、挂起、不稳定测试或错误的运行时行为，检验假设并找到有证据支撑的根因。当存在症状或失败输出时使用；不要用于没有故障的功能实现、一般性代码审查或概念性解释。
 ---
 
-# Debug
+# 调试
 
-Diagnose before changing code.
+先诊断，再改代码。
 
-1. Capture the exact symptom, expected behavior, environment, and smallest known trigger from the request and available artifacts.
-2. Reproduce the failure with the narrowest safe command. Establish whether it also occurs on the relevant clean baseline when that distinction matters.
-3. Form a small set of falsifiable hypotheses. Inspect logs, state transitions, call sites, and tests to eliminate alternatives.
-4. State the root cause only when evidence connects the trigger to the symptom; keep remaining hypotheses labeled as uncertain.
-5. Modify files only when the user asked for a fix. Make the smallest root-cause change and verify the reproducer first, then the affected suite.
+1. 从请求和现有产物中捕捉确切的症状、预期行为、环境以及已知最小的触发条件。
+2. 用最窄的安全命令复现故障。当这一区分重要时，确认它在相应的干净基线上是否也会出现。
+3. 提出少量可证伪的假设。检查日志、状态转换、调用点和测试，排除其他可能。
+4. 只有当证据能把触发条件与症状联系起来时才断言根因；其余假设保持“不确定”的标注。
+5. 只有当用户要求修复时才修改文件。做最小的根因修复，先验证复现用例，再跑受影响的测试套件。
 
-Report the symptom, root cause or best-supported hypothesis, evidence, change status, verification, and remaining risk. Preserve these facts across context compaction. When a tool fails or permission is denied, try safe evidence sources already in scope and describe what remains unverified.
+汇报症状、根因或证据最充分的假设、证据、变更状态、验证情况与剩余风险。在上下文压缩过程中保持这些事实不丢失。当工具失败或权限被拒时，尝试范围内已有的安全证据源，并说明哪些内容尚未验证。

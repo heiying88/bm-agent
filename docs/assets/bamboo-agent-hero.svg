@@ -24,30 +24,30 @@
   </g>
 
   <rect x="120" y="118" width="150" height="38" rx="19" fill="#1E5648"/>
-  <text x="195" y="143" text-anchor="middle" fill="#CFF7DA" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="16" font-weight="600">Rust agent runtime</text>
+  <text x="195" y="143" text-anchor="middle" fill="#CFF7DA" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="16" font-weight="600">Rust Agent 运行时</text>
 
-  <text x="120" y="236" fill="#F6FFF8" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="74" font-weight="800">Bamboo</text>
-  <text x="120" y="286" fill="#BCE8CC" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="28" font-weight="600">Structured context, tools, memory, tasks, skills, scheduler, and APIs —</text>
-  <text x="120" y="324" fill="#BCE8CC" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="28" font-weight="600">in one backend you can actually build a product on.</text>
+  <text x="120" y="236" fill="#F6FFF8" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="74" font-weight="800">Bamboo</text>
+  <text x="120" y="286" fill="#BCE8CC" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="28" font-weight="600">结构化上下文、工具、记忆、任务、技能、调度器与 API——</text>
+  <text x="120" y="324" fill="#BCE8CC" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="28" font-weight="600">全部收进一个真正能拿来做产品的后端。</text>
 
-  <text x="120" y="392" fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="20" font-weight="500">Serve it. Embed it. Extend it. Keep long-running work traceable.</text>
+  <text x="120" y="392" fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="20" font-weight="500">可部署、可嵌入、可扩展，长任务全程可追溯。</text>
 
   <g>
     <rect x="120" y="454" width="184" height="54" rx="16" fill="url(#accent)"/>
-    <text x="212" y="488" text-anchor="middle" fill="#072119" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="20" font-weight="800">Agent runtime</text>
+    <text x="212" y="488" text-anchor="middle" fill="#072119" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="20" font-weight="800">Agent 运行时</text>
 
     <rect x="320" y="454" width="168" height="54" rx="16" fill="#173F35" stroke="#2C6B59"/>
-    <text x="404" y="488" text-anchor="middle" fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="20" font-weight="700">HTTP + SSE</text>
+    <text x="404" y="488" text-anchor="middle" fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="20" font-weight="700">HTTP + SSE</text>
 
     <rect x="504" y="454" width="160" height="54" rx="16" fill="#173F35" stroke="#2C6B59"/>
-    <text x="584" y="488" text-anchor="middle" fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="20" font-weight="700">Local-first</text>
+    <text x="584" y="488" text-anchor="middle" fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="20" font-weight="700">本地优先</text>
   </g>
 
   <g>
     <circle cx="902" cy="302" r="94" fill="#102E27" stroke="#2E7563" stroke-width="2"/>
     <circle cx="902" cy="302" r="58" fill="url(#accent)"/>
-    <text x="902" y="297" text-anchor="middle" fill="#08221A" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="24" font-weight="800">Agent</text>
-    <text x="902" y="327" text-anchor="middle" fill="#08221A" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="24" font-weight="800">Loop</text>
+    <text x="902" y="297" text-anchor="middle" fill="#08221A" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="24" font-weight="800">Agent</text>
+    <text x="902" y="327" text-anchor="middle" fill="#08221A" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="24" font-weight="800">循环</text>
   </g>
 
   <g fill="#163E35" stroke="#2F6F5D">
@@ -61,14 +61,14 @@
     <rect x="642" y="252" width="112" height="44" rx="14"/>
   </g>
 
-  <g fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="18" font-weight="700">
-    <text x="815" y="176" text-anchor="middle">Context</text>
-    <text x="989" y="176" text-anchor="middle">Memory</text>
-    <text x="1105" y="280" text-anchor="middle">Tasks</text>
-    <text x="1104" y="400" text-anchor="middle">Skills</text>
+  <g fill="#D8F6E2" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="18" font-weight="700">
+    <text x="815" y="176" text-anchor="middle">上下文</text>
+    <text x="989" y="176" text-anchor="middle">记忆</text>
+    <text x="1105" y="280" text-anchor="middle">任务</text>
+    <text x="1104" y="400" text-anchor="middle">技能</text>
     <text x="989" y="496" text-anchor="middle">MCP</text>
-    <text x="815" y="496" text-anchor="middle">Tools</text>
-    <text x="700" y="400" text-anchor="middle">Scheduler</text>
+    <text x="815" y="496" text-anchor="middle">工具</text>
+    <text x="700" y="400" text-anchor="middle">调度器</text>
     <text x="698" y="280" text-anchor="middle">APIs</text>
   </g>
 
@@ -83,5 +83,5 @@
     <line x1="817" y1="271" x2="752" y2="274"/>
   </g>
 
-  <text x="120" y="566" fill="#86D8A8" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="18" font-weight="600">Built for agent products that need structure, extensibility, and operational control.</text>
+  <text x="120" y="566" fill="#86D8A8" font-family="Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif" font-size="18" font-weight="600">为强调结构性、可扩展性与可运维控制的 Agent 产品而生。</text>
 </svg>

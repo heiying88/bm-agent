@@ -1,410 +1,396 @@
-# Ergonomic SDK Plan: Promoting `SubagentProfile` into `bamboo_agent::agent`
+# 易用性 SDK 规划：将 `SubagentProfile` 提升进 `bamboo_agent::agent`
 
-**Status:** Design / implementation spec
-**Author:** Lead architect (reconciled from 6 explorer reports + direct code re-read)
-**Date:** 2026-06-04
+**状态：**设计 / 实现规格
+**作者：**首席架构师（综合 6 份 explorer 报告 + 直接重读源码）
+**日期：**2026-06-04
 
-> **Update (post-review):** The root facade (`bamboo_agent::agent`) is
-> **instruction-based, not profile-based**. The profile-sugar methods
-> (`.researcher()` / `.coder()` / `.from_profile()` etc.) and the facade's
-> `profiles` re-export were removed. The facade is now `Agent::builder()
-> .model(..).instruction(..).tools(..)` — the caller supplies their own
-> system-prompt fragment and the engine assembles the full prompt at run time.
-> The `SubagentProfile` system, `ProfileRunner`, and the profile relocation
-> (Phases 2–3) remain in `bamboo-engine` for the sub-agent / Task subsystem.
+> **评审后更新：**根门面（`bamboo_agent::agent`）是**基于 instruction 的，而不是
+> 基于 profile 的**。profile 语法糖方法（`.researcher()` / `.coder()` /
+> `.from_profile()` 等）以及门面的 `profiles` re-export 均已移除。门面现在是
+> `Agent::builder().model(..).instruction(..).tools(..)`——由调用方提供自己的
+> system-prompt 片段，引擎在运行时组装完整提示词。`SubagentProfile` 体系、
+> `ProfileRunner` 以及 profile 迁移（阶段 2–3）仍保留在 `bamboo-engine` 中，服务于
+> sub-agent / Task 子系统。
 
-## 0. Goal & guiding constraints
+## 0. 目标与指导约束
 
-Promote the existing `SubagentProfile` machinery into a first-class, ergonomic SDK
-surfaced at `bamboo_agent::agent` so library consumers can do:
+把现有的 `SubagentProfile` 机制提升为一个暴露在 `bamboo_agent::agent` 的一等、易用的 SDK，让库使用者可以这样写：
 
 ```rust
 let agent = Agent::builder().researcher().model("...").build()?;
 agent.run(&mut session, "investigate X").await?;
-// or, profile-driven child spawn:
+// 或者，profile 驱动的子 spawn：
 runner.run_profile(profile, input).await?;
 ```
 
-### Hard constraints (these override any explorer suggestion that conflicts)
+### 硬约束（与任何 explorer 建议冲突时，以这些约束为准）
 
-1. **Dependency direction is sacred:** `domain ← tools ← engine ← root facade`,
-   with `infrastructure` and `agent-core` as shared lower layers. **No reverse
-   edges.** Verified Cargo edges:
+1. **依赖方向神圣不可侵犯：**`domain ← tools ← engine ← root facade`，
+   `infrastructure` 与 `agent-core` 作为共享底层。**不允许反向边。**已核验的 Cargo 依赖边：
    - `bamboo-tools` → `bamboo-agent-core`, `bamboo-domain`, `bamboo-infrastructure`
    - `bamboo-engine` → `bamboo-domain`, `bamboo-infrastructure`, `bamboo-agent-core`, `bamboo-tools`
-   - `bamboo-server` → all of the above
-   - root crate → all of the above + `bamboo-server`
-2. **Anti-fork:** The SDK runner MUST NOT duplicate `run_spawn_job`'s 330 lines of
-   spawn/finalize logic. It MUST reuse the single canonical spawn path. The server
-   must be *rewired onto* the runner, leaving exactly one implementation.
-3. **All existing tests stay green.** No behavioral drift in events, prompts,
-   tool-policy, or model resolution.
+   - `bamboo-server` → 以上全部
+   - root crate → 以上全部 + `bamboo-server`
+2. **防分叉：**SDK runner 绝不能复制 `run_spawn_job` 那 330 行 spawn/finalize 逻辑，
+   必须复用唯一的 canonical spawn 路径。server 必须*改接到*该 runner 上，最终只留一份
+   实现。
+3. **所有既有测试保持绿。**事件、提示词、tool-policy、模型解析不得有任何行为漂移。
 
-### Contradictions found between explorers — RESOLVED
+### explorer 之间的矛盾——已解决
 
-| # | Conflict | Resolution (after re-reading code) |
+| # | 矛盾 | 解决（重新读码后） |
 |---|----------|-----------------------------------|
-| C1 | Explorer 1 proposes `sdk/runner.rs` with a fat `RuntimeDeps`/`RunOutcomeStream` (broadcast). Explorer 5 proposes `sdk/spawn.rs` extracting `run_spawn_job` into `spawn_profile_child`. | **Merge.** One module `crates/bamboo-engine/src/sdk/`. The *core* extraction is `spawn.rs` (refactor `run_spawn_job` so its body becomes a reusable `run_child_spawn(ctx, job)` taking the existing `SpawnContext` + `SpawnJob`). `runner.rs` is a thin ergonomic facade (`ProfileRunner`) over that core. **No new `RuntimeDeps` god-struct** — reuse `SpawnContext`, which already holds exactly the dependencies (agent, tools, caches, router, completion_handler). Explorer 1's 14-field `RuntimeDeps` is rejected as a redundant parallel of `SpawnContext`. |
-| C2 | Explorer 1: `ExecuteRequest` has 23 fields incl. `fast_model*`, `background_model*`, `summarization_model*`. Explorer 4: "21 optional". | **Code is authoritative.** Real `ExecuteRequest` (spawn.rs:563-587) has split provider fields: `fast_model` + `fast_model_provider`, `background_model` + `background_model_provider`, `summarization_model` + `summarization_model_provider`. Any builder must enumerate the *actual* fields. The runner sets them all `None` (matching current spawn behavior). |
-| C3 | Explorer 3: move `loader.rs` AND `builtin.rs` to engine. Explorer 6 risk note: loader could stay in server. | **Move both to `crates/bamboo-engine/src/profiles/`.** `loader.rs` only uses `std::fs`, `serde`, `thiserror`, `bamboo_domain` — all available in engine. Keeping it in server would split the profile system across crates. Server keeps a thin re-export shim for back-compat. |
-| C4 | Explorer 2: move `PolicyAwareToolExecutor` to `bamboo-tools`. Explorer 6 risk: needs injectable session cache. | **Move to `bamboo-tools`.** Verified: it depends only on `bamboo_agent_core::tools`, `bamboo_agent_core::Session`, `bamboo_domain::subagent`, `tokio::sync::RwLock` — all available in `bamboo-tools` (which already depends on `bamboo-domain`). The `Arc<RwLock<HashMap<String, Session>>>` is a ctor parameter, already injectable. No risk. |
-| C5 | Explorer 3 test-ref fix: change `crate::session_app::...` → `bamboo_engine::session_app::...`. | **Wrong after move.** Once `builtin.rs` lives *inside* `bamboo-engine`, the path stays `crate::session_app::child_session::CHILD_SYSTEM_PROMPT` (crate-relative; engine IS the owner). Do NOT change to `bamboo_engine::` (self-reference). Verified constants live at `crates/bamboo-engine/src/session_app/child_session/{helpers.rs,mod.rs}`. |
-| C6 | Explorer 2: extract pure `infer_provider(model_name) -> Option<String>` and unified `resolve_model`. Explorer 6 notes model precedence is `Config.subagent_models[id] > model_hint.model_ref > model_hint.tier`. | **Add `infer_provider` + `resolve_model` as pure helpers in `bamboo-engine/src/model_config_helper.rs`** (engine already owns `resolve_subagent_model_ref`). Do NOT move into `bamboo-tools` (would need `Config`/`ProviderRegistry`, pulling infrastructure model-routing into tools unnecessarily). Keep existing `resolve_subagent_model*` as-is; the new helpers are additive. |
-| C7 | Explorer 4/6: add `Agent::researcher()`/`.coder()` to root, requiring profile registry. | **Root facade re-exports `bamboo_engine::profiles`** (post-relocation). `.researcher()`/`.coder()`/`.from_profile()` resolve from `builtin_profiles()` and set the builder's system-prompt/tool-policy. No duplication of profile defs in root. |
+| C1 | Explorer 1 提议 `sdk/runner.rs`，带一个肥大的 `RuntimeDeps`/`RunOutcomeStream`（broadcast）。Explorer 5 提议 `sdk/spawn.rs`，把 `run_spawn_job` 抽成 `spawn_profile_child`。 | **合并。**单一模块 `crates/bamboo-engine/src/sdk/`。*核心*抽取是 `spawn.rs`（重构 `run_spawn_job`，使其主体变成可复用的 `run_child_spawn(ctx, job)`，接收现有的 `SpawnContext` + `SpawnJob`）。`runner.rs` 是覆盖在该核心之上的薄易用门面（`ProfileRunner`）。**不新增 `RuntimeDeps` 上帝结构体**——复用 `SpawnContext`，它已经恰好持有全部依赖（agent、tools、caches、router、completion_handler）。Explorer 1 的 14 字段 `RuntimeDeps` 被否决，理由是它是 `SpawnContext` 的冗余平行物。 |
+| C2 | Explorer 1：`ExecuteRequest` 有 23 个字段，含 `fast_model*`、`background_model*`、`summarization_model*`。Explorer 4："21 optional"。 | **以代码为准。**真实的 `ExecuteRequest`（spawn.rs:563-587）是拆分的 provider 字段：`fast_model` + `fast_model_provider`、`background_model` + `background_model_provider`、`summarization_model` + `summarization_model_provider`。任何 builder 都必须枚举*实际*字段。runner 把它们全部置为 `None`（与当前 spawn 行为一致）。 |
+| C3 | Explorer 3：把 `loader.rs` 和 `builtin.rs` 都移到 engine。Explorer 6 风险提示：loader 可以留在 server。 | **两个都移到 `crates/bamboo-engine/src/profiles/`。**`loader.rs` 只用 `std::fs`、`serde`、`thiserror`、`bamboo_domain`——engine 里全都有。留在 server 会把 profile 体系拆散到多个 crate。server 保留一层薄的 re-export shim 以向后兼容。 |
+| C4 | Explorer 2：把 `PolicyAwareToolExecutor` 移到 `bamboo-tools`。Explorer 6 风险：需要可注入的 session 缓存。 | **移入 `bamboo-tools`。**已核验：它只依赖 `bamboo_agent_core::tools`、`bamboo_agent_core::Session`、`bamboo_domain::subagent`、`tokio::sync::RwLock`——`bamboo-tools` 里全都有（它本来就依赖 `bamboo-domain`）。`Arc<RwLock<HashMap<String, Session>>>` 是构造函数参数，本就可注入。无风险。 |
+| C5 | Explorer 3 的测试引用修复：把 `crate::session_app::...` 改成 `bamboo_engine::session_app::...`。 | **移动之后就是错的。**一旦 `builtin.rs` 位于 `bamboo-engine` *内部*，路径保持 `crate::session_app::child_session::CHILD_SYSTEM_PROMPT`（crate 相对路径；engine 就是所有者）。不要改成 `bamboo_engine::`（自引用）。已核验常量位于 `crates/bamboo-engine/src/session_app/child_session/{helpers.rs,mod.rs}`。 |
+| C6 | Explorer 2：抽取纯函数 `infer_provider(model_name) -> Option<String>` 和统一的 `resolve_model`。Explorer 6 提示模型优先级是 `Config.subagent_models[id] > model_hint.model_ref > model_hint.tier`。 | **在 `bamboo-engine/src/model_config_helper.rs` 新增纯 helper `infer_provider` + `resolve_model`**（engine 已经拥有 `resolve_subagent_model_ref`）。不要移进 `bamboo-tools`（那需要 `Config`/`ProviderRegistry`，会把 infrastructure 的模型路由不必要地拖进 tools）。现有 `resolve_subagent_model*` 原样保留；新 helper 是纯增量。 |
+| C7 | Explorer 4/6：在根上加 `Agent::researcher()`/`.coder()`，需要 profile 注册表。 | **根门面 re-export `bamboo_engine::profiles`**（迁移之后）。`.researcher()`/`.coder()`/`.from_profile()` 从 `builtin_profiles()` 解析，并设置 builder 的 system-prompt/tool-policy。根目录不重复定义 profile。 |
 
-### Non-goals (explicitly deferred)
+### 非目标（明确推迟）
 
-- Removing the double tool-policy enforcement (schema `disabled_tools` + `PolicyAwareToolExecutor` runtime net). Keep both; document authority. (tech-debt item TD-7.)
-- Converting `ChildStatus` string literals to an enum at the wire level. Internal enum is fine; wire strings unchanged. (tech-debt TD-5.)
-- A2A/external runner changes.
+- 移除双重 tool-policy 执行（schema `disabled_tools` + `PolicyAwareToolExecutor` 运行时兜底）。两者都保留；文档写明权威归属。（技术债 TD-7。）
+- 把 `ChildStatus` 字符串字面量在 wire 层改成枚举。内部用枚举可以；wire 字符串保持不变。（技术债 TD-5。）
+- A2A/外部 runner 变更。
 
 ---
 
-## 1. Target architecture (end state)
+## 1. 目标架构（终态）
 
 ```
 bamboo-domain
-  subagent/{model.rs, registry.rs}        # SubagentProfile, ToolPolicy, disabled_tools_for_profile  (UNCHANGED)
+  subagent/{model.rs, registry.rs}        # SubagentProfile、ToolPolicy、disabled_tools_for_profile（不变）
 
 bamboo-tools
-  policy_aware.rs                          # PolicyAwareToolExecutor  (MOVED here from server)
+  policy_aware.rs                          # PolicyAwareToolExecutor（从 server 移入此处）
 
 bamboo-engine
-  model_config_helper.rs                   # + infer_provider(), + resolve_model()  (ADDITIVE)
-  profiles/{mod.rs, builtin.rs, loader.rs} # MOVED here from server/subagent_profiles
-  sdk/{mod.rs, runner.rs, spawn.rs}        # NEW: ProfileRunner + run_child_spawn core
-  runtime/execution/spawn.rs               # run_spawn_job becomes thin caller of sdk::spawn::run_child_spawn
+  model_config_helper.rs                   # + infer_provider()、+ resolve_model()（纯增量）
+  profiles/{mod.rs, builtin.rs, loader.rs} # 从 server/subagent_profiles 移入此处
+  sdk/{mod.rs, runner.rs, spawn.rs}        # 新增：ProfileRunner + run_child_spawn 核心
+  runtime/execution/spawn.rs               # run_spawn_job 变为 sdk::spawn::run_child_spawn 的薄调用方
 
 bamboo-server
-  tools/policy_aware.rs                     # DELETED → re-export shim (pub use bamboo_tools::PolicyAwareToolExecutor)
-  subagent_profiles/mod.rs                  # → re-export shim (pub use bamboo_engine::profiles::*)
-  tools/child_session_adapter.rs           # enqueue_child_run unchanged behavior; still builds SpawnJob
-                                            # (scheduler still drives run_spawn_job → now sdk core)
+  tools/policy_aware.rs                     # 删除 → re-export shim（pub use bamboo_tools::PolicyAwareToolExecutor）
+  subagent_profiles/mod.rs                  # → re-export shim（pub use bamboo_engine::profiles::*）
+  tools/child_session_adapter.rs           # enqueue_child_run 行为不变；仍构建 SpawnJob
+                                            # （scheduler 仍驱动 run_spawn_job → 现在走 sdk 核心）
 
 root crate (bamboo_agent)
-  src/agent/{mod.rs, builder.rs, tools.rs, execute_request.rs}  # ergonomic facade
-  src/lib.rs                                # cleaned re-exports + pub use agent::*
+  src/agent/{mod.rs, builder.rs, tools.rs, execute_request.rs}  # 易用门面
+  src/lib.rs                                # 清理后的 re-export + pub use agent::*
 ```
 
-**Anti-fork guarantee:** `run_spawn_job` and `ProfileRunner::run` both funnel into
-`sdk::spawn::run_child_spawn(ctx: SpawnContext, job: SpawnJob)`. There is exactly
-one spawn/execute/finalize implementation.
+**防分叉保证：**`run_spawn_job` 与 `ProfileRunner::run` 都汇入
+`sdk::spawn::run_child_spawn(ctx: SpawnContext, job: SpawnJob)`。spawn/execute/finalize
+实现全局仅此一份。
 
 ---
 
-## 2. Dependency-ordered phases
+## 2. 按依赖排序的阶段
 
-Each phase ends with a **GATE** (`cargo build` + `cargo test`). Phases are
-sequential at the gate boundary. Within a phase, steps marked **[PAR]** touch
-disjoint files and may proceed in parallel; **[SEQ]** steps are compile-dependent.
+每个阶段以一个 **GATE**（`cargo build` + `cargo test`）收尾。阶段之间在 gate 边界严格
+串行。阶段内部，标注 **[PAR]** 的步骤改动互不相交的文件，可并行推进；**[SEQ]** 步骤
+存在编译依赖，必须串行。
 
-> All cargo commands run from repo root `/Users/bigduu/Workspace/TauriProjects/zenith/bamboo`.
-> Use `cargo build --workspace` and `cargo test --workspace` (or per-crate `-p` for fast inner loops).
+> 所有 cargo 命令都从仓库根目录 `/Users/bigduu/Workspace/TauriProjects/zenith/bamboo` 运行。
+> 使用 `cargo build --workspace` 与 `cargo test --workspace`（或按 crate 用 `-p` 加快内层循环）。
 
 ---
 
-### PHASE 0 — Pre-flight tech-debt (no behavior change, lowest risk)
+### 阶段 0 — 预检技术债（无行为变化，风险最低）
 
-Pure comment/doc fixes; safe to do first and in parallel.
+纯注释/文档修正；先做最安全，且可并行。
 
-- **[PAR] S0.1** Fix stale `bamboo-application-agent` references:
+- **[PAR] S0.1** 修正过期的 `bamboo-application-agent` 引用：
   - `src/agent/mod.rs:4` → "via bamboo-engine"
   - `crates/bamboo-domain/src/session/hook_types.rs:5`
   - `crates/bamboo-domain/src/session/composition/condition.rs:4`
   - `crates/bamboo-domain/src/session/composition/mod.rs:4`
-- **[PAR] S0.2** `src/lib.rs:48` remove "Placeholder modules (will be populated during migration)" comment (module is being populated this PR).
+- **[PAR] S0.2** `src/lib.rs:48` 删除 "Placeholder modules (will be populated during migration)" 注释（该模块将随本 PR 填充）。
 
-**GATE 0:** `cargo build --workspace` (comments only; must still compile).
-
----
-
-### PHASE 1 — Bridges (no engine/runner deps yet)
-
-Two independent bridge migrations. **[PAR]** across S1.A and S1.B (disjoint files,
-disjoint crates).
-
-#### S1.A — Move `PolicyAwareToolExecutor` → `bamboo-tools`  (resolves C4)
-
-- **[SEQ] S1.A.1** Create `crates/bamboo-tools/src/policy_aware.rs`: move the full
-  module body from `crates/bamboo-server/src/tools/policy_aware.rs` (incl. tests).
-  Imports already valid in tools (`bamboo_agent_core::tools::*`, `bamboo_agent_core::Session`,
-  `bamboo_domain::subagent::{SubagentProfileRegistry, ToolPolicy}`, `tokio::sync::RwLock`).
-- **[SEQ] S1.A.2** `crates/bamboo-tools/src/lib.rs`: add `pub mod policy_aware;` and
-  `pub use policy_aware::PolicyAwareToolExecutor;`.
-- **[SEQ] S1.A.3** Replace `crates/bamboo-server/src/tools/policy_aware.rs` content
-  with a re-export shim: `pub use bamboo_tools::PolicyAwareToolExecutor;` (keeps
-  `crate::tools::PolicyAwareToolExecutor` path alive at
-  `crates/bamboo-server/src/tools/mod.rs:29` and builder.rs:240). *Alternative:* delete
-  file + change `tools/mod.rs` re-export to point at `bamboo_tools`. Shim is lower-risk.
-
-#### S1.B — Add pure model helpers in engine  (resolves C6)
-
-- **[SEQ] S1.B.1** `crates/bamboo-engine/src/model_config_helper.rs`: add
-  `pub fn infer_provider(model_name: &str) -> Option<String>` (pattern:
-  `claude*`→`anthropic`, `gpt*`/`o[0-9]*`→`openai`, `gemini*`→`gemini`, else `None`).
-  Extract the implicit pattern-matches currently scattered in resolve functions to
-  call this helper (refactor, behavior-preserving).
-- **[SEQ] S1.B.2** Add `pub fn resolve_model(model_hint: &ModelHint, provider_name: &str,
-  config: &Config, provider_registry: &Arc<ProviderRegistry>) -> Option<ResolvedModel>`
-  honoring precedence **`model_hint.model_ref` > `model_hint.tier` > fallback chain**
-  (`subagent_models[type]` → `sub_agent` → `fast` → `chat`). Reuse existing
-  `resolve_subagent_model_ref`. Keep existing `resolve_subagent_model*` untouched.
-
-**GATE 1:** `cargo build --workspace` then
-`cargo test -p bamboo-tools -p bamboo-engine -p bamboo-server`.
-Existing 9 `policy_aware` tests must pass *in their new home*; engine model tests unchanged.
+**GATE 0：**`cargo build --workspace`（只改注释；仍须可编译）。
 
 ---
 
-### PHASE 2 — Engine SDK runner (depends on Phase 1 helpers)
+### 阶段 1 — 桥接（尚不引入 engine/runner 依赖）
 
-Refactor the canonical spawn path into a reusable core, then add the ergonomic
-runner facade. **Mostly [SEQ]** (all touch `bamboo-engine/src/sdk` + `spawn.rs`).
+两个相互独立的桥接迁移。S1.A 与 S1.B 之间 **[PAR]**（文件不相交、crate 不相交）。
 
-- **[SEQ] S2.1** Create `crates/bamboo-engine/src/sdk/mod.rs` (`pub mod runner; pub mod spawn;`).
-- **[SEQ] S2.2** Create `crates/bamboo-engine/src/sdk/spawn.rs`. Move the **body** of
-  `run_spawn_job` (currently `runtime/execution/spawn.rs:320-651`) into
-  `pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), String>`.
-  Preserve EXACTLY:
-  - SubAgentStarted is emitted by the *adapter* (not here) — unchanged.
-  - Event forwarder + 5s heartbeat tasks, watchdog, runner reservation.
-  - `ExecuteRequest` construction with ALL real fields incl. split provider fields
-    (`fast_model_provider`, `background_model_provider`, `summarization_model_provider`)
-    — see C2. `disabled_tools = job.disabled_tools.map(|v| v.into_iter().collect())`.
-  - `publish_child_completion_parts` terminal path with status strings
-    `completed|cancelled|error|skipped|timeout`.
-- **[SEQ] S2.3** `runtime/execution/spawn.rs`: `run_spawn_job` becomes a 1-line
-  delegator: `crate::sdk::spawn::run_child_spawn(ctx, job).await`. (Keeps the
-  `SpawnScheduler` queue mechanics in place.) **Anti-fork checkpoint.**
-- **[SEQ] S2.4** Create `crates/bamboo-engine/src/sdk/runner.rs`:
-  - `pub struct ProfileRunner { ctx: SpawnContext }` — **reuse `SpawnContext`**, not a
-    new `RuntimeDeps` (resolves C1).
-  - `pub fn profile_runner(ctx: SpawnContext) -> ProfileRunner`.
+#### S1.A — 把 `PolicyAwareToolExecutor` 移入 `bamboo-tools`（解决 C4）
+
+- **[SEQ] S1.A.1** 新建 `crates/bamboo-tools/src/policy_aware.rs`：把
+  `crates/bamboo-server/src/tools/policy_aware.rs` 的完整模块体（含测试）移过来。
+  这些 import 在 tools 中本就合法（`bamboo_agent_core::tools::*`、`bamboo_agent_core::Session`、
+  `bamboo_domain::subagent::{SubagentProfileRegistry, ToolPolicy}`、`tokio::sync::RwLock`）。
+- **[SEQ] S1.A.2** `crates/bamboo-tools/src/lib.rs`：新增 `pub mod policy_aware;` 与
+  `pub use policy_aware::PolicyAwareToolExecutor;`。
+- **[SEQ] S1.A.3** 把 `crates/bamboo-server/src/tools/policy_aware.rs` 的内容替换为
+  re-export shim：`pub use bamboo_tools::PolicyAwareToolExecutor;`（保住
+  `crate::tools::PolicyAwareToolExecutor` 路径在 `crates/bamboo-server/src/tools/mod.rs:29`
+  与 builder.rs:240 处继续可用）。*备选：*删除文件 + 把 `tools/mod.rs` 的 re-export
+  改指向 `bamboo_tools`。shim 风险更低。
+
+#### S1.B — 在 engine 中新增纯模型 helper（解决 C6）
+
+- **[SEQ] S1.B.1** `crates/bamboo-engine/src/model_config_helper.rs`：新增
+  `pub fn infer_provider(model_name: &str) -> Option<String>`（模式：`claude*`→`anthropic`、
+  `gpt*`/`o[0-9]*`→`openai`、`gemini*`→`gemini`，否则 `None`）。把目前散落在各 resolve
+  函数里的隐式模式匹配抽出来，改调这个 helper（重构，行为不变）。
+- **[SEQ] S1.B.2** 新增 `pub fn resolve_model(model_hint: &ModelHint, provider_name: &str,
+  config: &Config, provider_registry: &Arc<ProviderRegistry>) -> Option<ResolvedModel>`，
+  遵循优先级 **`model_hint.model_ref` > `model_hint.tier` > 回退链**
+  （`subagent_models[type]` → `sub_agent` → `fast` → `chat`）。复用现有
+  `resolve_subagent_model_ref`。现有 `resolve_subagent_model*` 原样不动。
+
+**GATE 1：**`cargo build --workspace`，然后
+`cargo test -p bamboo-tools -p bamboo-engine -p bamboo-server`。
+既有 9 个 `policy_aware` 测试必须*在新家*通过；engine 模型测试不变。
+
+---
+
+### 阶段 2 — engine SDK runner（依赖阶段 1 的 helper）
+
+把 canonical spawn 路径重构成可复用核心，再加上易用的 runner 门面。**基本全为 [SEQ]**
+（都涉及 `bamboo-engine/src/sdk` + `spawn.rs`）。
+
+- **[SEQ] S2.1** 新建 `crates/bamboo-engine/src/sdk/mod.rs`（`pub mod runner; pub mod spawn;`）。
+- **[SEQ] S2.2** 新建 `crates/bamboo-engine/src/sdk/spawn.rs`。把 `run_spawn_job` 的**主体**
+  （当前在 `runtime/execution/spawn.rs:320-651`）移入
+  `pub async fn run_child_spawn(ctx: SpawnContext, job: SpawnJob) -> Result<(), String>`。
+  必须逐项原样保留：
+  - SubAgentStarted 由 *adapter* 发出（不在这里发）——不变。
+  - 事件转发器 + 5s 心跳任务、watchdog、runner 预留。
+  - `ExecuteRequest` 构造包含全部真实字段，含拆分的 provider 字段
+    （`fast_model_provider`、`background_model_provider`、`summarization_model_provider`）
+    ——见 C2。`disabled_tools = job.disabled_tools.map(|v| v.into_iter().collect())`。
+  - 带状态字符串 `completed|cancelled|error|skipped|timeout` 的
+    `publish_child_completion_parts` 终止路径。
+- **[SEQ] S2.3** `runtime/execution/spawn.rs`：`run_spawn_job` 变成一行委托：
+  `crate::sdk::spawn::run_child_spawn(ctx, job).await`。（`SpawnScheduler` 队列机制原样保留。）
+  **防分叉检查点。**
+- **[SEQ] S2.4** 新建 `crates/bamboo-engine/src/sdk/runner.rs`：
+  - `pub struct ProfileRunner { ctx: SpawnContext }`——**复用 `SpawnContext`**，不新建
+    `RuntimeDeps`（解决 C1）。
+  - `pub fn profile_runner(ctx: SpawnContext) -> ProfileRunner`。
   - `pub struct RunProfileInput { child_session_id, parent_session_id, model, /* derived */ }`
-    — minimal; the assignment prompt + system prompt already live in the persisted
-    child session (matching real spawn semantics: `initial_message` is empty, the
-    last user message in the child drives execution).
-  - `impl ProfileRunner { pub async fn run_profile(&self, profile: &SubagentProfile, input: RunProfileInput) -> Result<(), String> }`:
-    computes `disabled_tools` via `bamboo_domain::subagent::disabled_tools_for_profile(&profile.tools, &tool_names)`,
-    builds a `SpawnJob`, calls `run_child_spawn(self.ctx.clone(), job)`.
-  - Streaming variant `run_profile_stream` returns a `broadcast::Receiver<AgentEvent>`
-    obtained from `ctx.session_event_senders` for the child id (reuse existing
-    broadcast infra; do NOT invent `RunOutcomeStream`/`status_rx` mpsc — resolves C1).
-- **[SEQ] S2.5** `crates/bamboo-engine/src/lib.rs`: add `pub mod sdk;` and
-  `pub use sdk::runner::{ProfileRunner, profile_runner, RunProfileInput};`
-  `pub use sdk::spawn::run_child_spawn;`.
+    ——保持最小；任务提示词 + system prompt 已经存在于持久化的子 session 中（与真实
+    spawn 语义一致：`initial_message` 为空，由子 session 中最后一条 user 消息驱动执行）。
+  - `impl ProfileRunner { pub async fn run_profile(&self, profile: &SubagentProfile, input: RunProfileInput) -> Result<(), String> }`：
+    通过 `bamboo_domain::subagent::disabled_tools_for_profile(&profile.tools, &tool_names)`
+    计算 `disabled_tools`，构建 `SpawnJob`，调用 `run_child_spawn(self.ctx.clone(), job)`。
+  - 流式变体 `run_profile_stream` 返回 `broadcast::Receiver<AgentEvent>`，取自
+    `ctx.session_event_senders` 中该子 id（复用现有 broadcast 基础设施；不要发明
+    `RunOutcomeStream`/`status_rx` mpsc——解决 C1）。
+- **[SEQ] S2.5** `crates/bamboo-engine/src/lib.rs`：新增 `pub mod sdk;` 与
+  `pub use sdk::runner::{ProfileRunner, profile_runner, RunProfileInput};`、
+  `pub use sdk::spawn::run_child_spawn;`。
 
-**GATE 2:** `cargo build --workspace` then `cargo test -p bamboo-engine -p bamboo-server`.
-The 29 `sub_agent.rs` tests (esp. `create_emits_sub_agent_started_event_after_queueing`
-at line ~797) MUST stay green — they exercise the scheduler→`run_spawn_job`→`run_child_spawn`
-path unchanged. Add new engine tests S-T2.* (see §4).
-
----
-
-### PHASE 3 — Profiles relocation (depends on engine session_app; independent of sdk)
-
-> Could overlap Phase 2 in calendar time (different files), but gate it *after*
-> Phase 2 to keep one clean engine build gate. Steps within are **[SEQ]**.
-
-- **[SEQ] S3.1** Create `crates/bamboo-engine/src/profiles/builtin.rs`: copy from
-  `crates/bamboo-server/src/subagent_profiles/builtin.rs` verbatim. **Keep** the
-  test refs `crate::session_app::child_session::{CHILD_SYSTEM_PROMPT, PLAN_AGENT_SYSTEM_PROMPT}`
-  unchanged — they resolve correctly because engine owns `session_app` (resolves C5).
-  Update the stale module doc-comment about "(future) FilteredExecutor" → reference
-  `bamboo_tools::PolicyAwareToolExecutor`.
-- **[SEQ] S3.2** Create `crates/bamboo-engine/src/profiles/loader.rs`: move from
-  `crates/bamboo-server/src/subagent_profiles/loader.rs`. Imports unchanged
-  (`bamboo_domain::subagent::*`, `std::fs`, `thiserror`). Update doc comment about
-  "consumer typically bamboo-server".
-- **[SEQ] S3.3** Create `crates/bamboo-engine/src/profiles/mod.rs`:
-  `pub mod builtin; pub mod loader; pub use builtin::builtin_profiles; pub use loader::{load_registry, LoaderError};`.
-- **[SEQ] S3.4** `crates/bamboo-engine/src/lib.rs`: add `pub mod profiles;` +
-  `pub use profiles::{builtin_profiles, load_registry, LoaderError};`.
-- **[SEQ] S3.5** Convert `crates/bamboo-server/src/subagent_profiles/mod.rs` to a
-  shim: `pub use bamboo_engine::profiles::{builtin_profiles, load_registry, LoaderError};
-  pub mod builtin { pub use bamboo_engine::profiles::builtin::*; }` (preserves
-  `crate::subagent_profiles::builtin::builtin_profiles` at sub_agent.rs:710 and
-  `crate::subagent_profiles::load_registry` at builder.rs:228). Delete now-duplicate
-  `builtin.rs`/`loader.rs` from server.
-
-**GATE 3:** `cargo build --workspace` then
-`cargo test -p bamboo-engine -p bamboo-server`.
-Moved profile tests (6 builtin + 7 loader) run in engine and pass; server route test
-`GET /v1/subagent_profiles` (routes/tests.rs) still green.
+**GATE 2：**`cargo build --workspace`，然后 `cargo test -p bamboo-engine -p bamboo-server`。
+29 个 `sub_agent.rs` 测试（尤其是约 797 行的
+`create_emits_sub_agent_started_event_after_queueing`）必须保持绿——它们走的正是
+scheduler→`run_spawn_job`→`run_child_spawn` 这条未变路径。新增 engine 测试 S-T2.*（见 §4）。
 
 ---
 
-### PHASE 4 — Root facade (`src/agent/`) (depends on engine profiles + sdk + tools)
+### 阶段 3 — profile 迁移（依赖 engine 的 session_app；与 sdk 相互独立）
 
-All new/edited files under `src/agent/`. **[PAR]** across the three new files
-(S4.1 tools.rs, S4.2 execute_request.rs, S4.3 builder.rs are disjoint), then **[SEQ]**
-S4.4 mod.rs wires them, S4.5 lib.rs.
+> 日历时间上可与阶段 2 重叠（文件不同），但 gate 排在阶段 2 *之后*，以保持一个干净的
+> engine 构建 gate。内部步骤均为 **[SEQ]**。
 
-- **[PAR] S4.1** `src/agent/tools.rs`: `pub struct ToolSpec { name, description, disabled }`
-  + consts mapped to **real** names from `bamboo_domain::tool_names::BUILTIN_TOOL_NAMES`
-  (verify against that const array; do not hand-list). Re-export the canonical list.
-- **[PAR] S4.2** `src/agent/execute_request.rs`: `ExecuteRequestBuilder` forwarding to
-  `bamboo_engine::ExecuteRequest` with ALL real fields (3 required + the rest, incl.
-  split provider fields per C2). Defaults match current spawn defaults (`None`).
-- **[PAR] S4.3** `src/agent/builder.rs`: wrap `bamboo_engine::AgentBuilder`. Ergonomic
-  methods: `.from_profile(&SubagentProfile)` (sets system_prompt + tool policy),
-  `.researcher()`/`.coder()`/etc. (resolve via `bamboo_engine::profiles::builtin_profiles()`,
-  resolves C7), `.model()`, `.instruction()`, `.tools()`, `.api_key()`,
-  `.with_defaults_for_data_dir(PathBuf)` (assembles the 8 deps:
-  `Config::from_data_dir`/`Config::new`, `JsonlStorage::new`+`init`,
-  `SkillManager::new`+`initialize`, `MetricsCollector::spawn` with
-  `SqliteMetricsStorage` (verified to exist: `bamboo_engine::SqliteMetricsStorage`),
-  `create_provider`, `BuiltinToolExecutor::new_with_config`).
-- **[SEQ] S4.4** `src/agent/mod.rs`: replace passthrough. Define
-  `pub struct Agent { inner: Arc<AgentRuntime> }` with `from_runtime`/`builder`/`run`/
-  `run_stream`/`storage`/`persistence`; `mod builder; mod tools; mod execute_request;`
-  `pub use {builder::AgentBuilder, tools::*, execute_request::ExecuteRequestBuilder};`
-  `pub use bamboo_engine::profiles;` for consumers. Keep the existing convenience
-  type re-exports (Session, Message, etc.).
-- **[SEQ] S4.5** `src/lib.rs:63`: `pub use agent::{Agent, AgentBuilder};` (now from the
-  new wrappers). Add `pub use agent::profiles;` if desired.
+- **[SEQ] S3.1** 新建 `crates/bamboo-engine/src/profiles/builtin.rs`：从
+  `crates/bamboo-server/src/subagent_profiles/builtin.rs` 逐字复制。**保持**测试引用
+  `crate::session_app::child_session::{CHILD_SYSTEM_PROMPT, PLAN_AGENT_SYSTEM_PROMPT}`
+  不变——engine 拥有 `session_app`，因此能正确解析（解决 C5）。把过期的模块文档注释
+  "(future) FilteredExecutor" 更新为指向 `bamboo_tools::PolicyAwareToolExecutor`。
+- **[SEQ] S3.2** 新建 `crates/bamboo-engine/src/profiles/loader.rs`：从
+  `crates/bamboo-server/src/subagent_profiles/loader.rs` 移入。import 不变
+  （`bamboo_domain::subagent::*`、`std::fs`、`thiserror`）。更新
+  "consumer typically bamboo-server" 的文档注释。
+- **[SEQ] S3.3** 新建 `crates/bamboo-engine/src/profiles/mod.rs`：
+  `pub mod builtin; pub mod loader; pub use builtin::builtin_profiles; pub use loader::{load_registry, LoaderError};`。
+- **[SEQ] S3.4** `crates/bamboo-engine/src/lib.rs`：新增 `pub mod profiles;` +
+  `pub use profiles::{builtin_profiles, load_registry, LoaderError};`。
+- **[SEQ] S3.5** 把 `crates/bamboo-server/src/subagent_profiles/mod.rs` 改为 shim：
+  `pub use bamboo_engine::profiles::{builtin_profiles, load_registry, LoaderError};
+  pub mod builtin { pub use bamboo_engine::profiles::builtin::*; }`（保住
+  sub_agent.rs:710 处的 `crate::subagent_profiles::builtin::builtin_profiles` 与
+  builder.rs:228 处的 `crate::subagent_profiles::load_registry`）。从 server 删除如今
+  重复的 `builtin.rs`/`loader.rs`。
 
-**GATE 4:** `cargo build --workspace` then `cargo test --workspace`.
-Add new root SDK tests S-T4.* (see §4).
+**GATE 3：**`cargo build --workspace`，然后
+`cargo test -p bamboo-engine -p bamboo-server`。
+迁移后的 profile 测试（6 个 builtin + 7 个 loader）在 engine 中运行并通过；server
+路由测试 `GET /v1/subagent_profiles`（routes/tests.rs）保持绿。
 
 ---
 
-### PHASE 5 — Server rewire onto the runner (anti-fork enforcement)
+### 阶段 4 — 根门面（`src/agent/`）（依赖 engine 的 profiles + sdk + tools）
 
-The server already routes through `run_spawn_job` → (now) `run_child_spawn`, so the
-core is unified after Phase 2. This phase **optionally** lets `ChildSessionAdapter`
-call `ProfileRunner` directly instead of `scheduler.enqueue`, *only if it preserves
-the async-enqueue semantics and SubAgentStarted ordering*. **Conservative default:
-leave the scheduler path as-is** (it already calls the unified core) and just verify
-no second implementation exists.
+所有新增/修改文件都在 `src/agent/` 下。三个新文件之间 **[PAR]**（S4.1 tools.rs、
+S4.2 execute_request.rs、S4.3 builder.rs 互不相交），随后 **[SEQ]**：S4.4 mod.rs 负责
+接线，S4.5 lib.rs。
 
-- **[SEQ] S5.1** Audit: `grep` for any remaining inline spawn/execute/finalize logic
-  outside `sdk::spawn::run_child_spawn`. There must be none.
-- **[SEQ] S5.2** (optional) Refactor `enqueue_child_run` to construct `SpawnJob` via the
-  same `disabled_tools_for_profile` call already present (line 318-339) — no change
-  needed; document that adapter remains the SpawnJob factory + parent-wait registrar.
-- **[SEQ] S5.3** Confirm `PolicyAwareToolExecutor` still wraps child tools at
-  `builder.rs:240` via the new `bamboo_tools` path (shim makes this transparent).
+- **[PAR] S4.1** `src/agent/tools.rs`：`pub struct ToolSpec { name, description, disabled }`
+  + 常量映射到 `bamboo_domain::tool_names::BUILTIN_TOOL_NAMES` 中的**真实**名称
+  （对照该常量数组核验；不要手写清单）。re-export canonical 清单。
+- **[PAR] S4.2** `src/agent/execute_request.rs`：`ExecuteRequestBuilder` 转发到
+  `bamboo_engine::ExecuteRequest`，覆盖全部真实字段（3 个必填 + 其余，含按 C2 拆分的
+  provider 字段）。默认值与当前 spawn 默认一致（`None`）。
+- **[PAR] S4.3** `src/agent/builder.rs`：包装 `bamboo_engine::AgentBuilder`。易用方法：
+  `.from_profile(&SubagentProfile)`（设置 system_prompt + tool policy）、
+  `.researcher()`/`.coder()` 等（经 `bamboo_engine::profiles::builtin_profiles()` 解析，
+  解决 C7）、`.model()`、`.instruction()`、`.tools()`、`.api_key()`、
+  `.with_defaults_for_data_dir(PathBuf)`（组装那 8 个依赖：`Config::from_data_dir`/
+  `Config::new`、`JsonlStorage::new`+`init`、`SkillManager::new`+`initialize`、带
+  `SqliteMetricsStorage` 的 `MetricsCollector::spawn`（已核验存在：
+  `bamboo_engine::SqliteMetricsStorage`）、`create_provider`、
+  `BuiltinToolExecutor::new_with_config`）。
+- **[SEQ] S4.4** `src/agent/mod.rs`：替换纯透传。定义
+  `pub struct Agent { inner: Arc<AgentRuntime> }`，带 `from_runtime`/`builder`/`run`/
+  `run_stream`/`storage`/`persistence`；`mod builder; mod tools; mod execute_request;`、
+  `pub use {builder::AgentBuilder, tools::*, execute_request::ExecuteRequestBuilder};`、
+  为使用者提供 `pub use bamboo_engine::profiles;`。保留现有便利类型 re-export
+  （Session、Message 等）。
+- **[SEQ] S4.5** `src/lib.rs:63`：`pub use agent::{Agent, AgentBuilder};`（现在来自新
+  包装器）。需要的话新增 `pub use agent::profiles;`。
 
-**GATE 5:** `cargo test --workspace`. **CRITICAL invariant checks:**
-- SubAgentStarted emitted *after* parent-wait persisted (sub_agent.rs:797).
-- Allowlist profile child: tool not in schema (disabled_tools) AND blocked at exec
-  (policy_aware). New integration test S-T5.2.
+**GATE 4：**`cargo build --workspace`，然后 `cargo test --workspace`。
+新增根 SDK 测试 S-T4.*（见 §4）。
 
 ---
 
-### PHASE 6 — Docs
+### 阶段 5 — server 改接到 runner（防分叉落地）
 
-- **[PAR] S6.1** This document (already at `docs/design/ergonomic-sdk-plan.md`).
-- **[PAR] S6.2** Add module-level docs to `src/agent/mod.rs` and `bamboo-engine/src/sdk/mod.rs`
-  describing the public SDK surface and the anti-fork invariant.
-- **[PAR] S6.3** Update `bamboo-engine/src/profiles/{mod,loader}.rs` and
-  `bamboo-tools/src/policy_aware.rs` doc comments to reflect new homes.
+server 的路径已经流经 `run_spawn_job` →（如今）`run_child_spawn`，核心在阶段 2 之后
+就已统一。本阶段**可选地**让 `ChildSessionAdapter` 直接调用 `ProfileRunner` 而不是
+`scheduler.enqueue`，*前提是完全保住异步 enqueue 语义与 SubAgentStarted 顺序*。
+**保守默认：调度器路径维持原状**（它已调用统一核心），只需核验不存在第二份实现。
 
-**GATE 6:** `cargo doc --workspace --no-deps` (no broken intra-doc links).
+- **[SEQ] S5.1** 审计：`grep` 检查 `sdk::spawn::run_child_spawn` 之外是否还残留内联
+  spawn/execute/finalize 逻辑。必须一处不剩。
+- **[SEQ] S5.2**（可选）重构 `enqueue_child_run`，经由已有的
+  `disabled_tools_for_profile` 调用（318-339 行）构造 `SpawnJob`——无需改动；文档写明
+  adapter 仍是 SpawnJob 工厂 + 父等待登记器。
+- **[SEQ] S5.3** 确认 `PolicyAwareToolExecutor` 仍在 `builder.rs:240` 经新的
+  `bamboo_tools` 路径包装子工具（shim 让这一步保持透明）。
+
+**GATE 5：**`cargo test --workspace`。**关键不变量检查：**
+- SubAgentStarted 在父等待持久化*之后*发出（sub_agent.rs:797）。
+- Allowlist profile 子代：工具不在 schema 中（disabled_tools），且执行时被拦截
+  （policy_aware）。新增集成测试 S-T5.2。
 
 ---
 
-## 3. Parallelization summary
+### 阶段 6 — 文档
 
-| Can run in parallel | Must be sequential |
+- **[PAR] S6.1** 本文档（已在 `docs/design/ergonomic-sdk-plan.md`）。
+- **[PAR] S6.2** 给 `src/agent/mod.rs` 与 `bamboo-engine/src/sdk/mod.rs` 增加模块级文档，
+  描述公共 SDK 面与防分叉不变量。
+- **[PAR] S6.3** 更新 `bamboo-engine/src/profiles/{mod,loader}.rs` 与
+  `bamboo-tools/src/policy_aware.rs` 的文档注释，反映新归属。
+
+**GATE 6：**`cargo doc --workspace --no-deps`（无失效的 intra-doc 链接）。
+
+---
+
+## 3. 并行化小结
+
+| 可并行 | 必须串行 |
 |---------------------|--------------------|
-| S1.A vs S1.B (different crates) | Everything *within* Phase 2 (shared sdk/spawn files) |
-| S0.1 vs S0.2 | S2.2 → S2.3 (extract before delegate) |
-| S4.1 vs S4.2 vs S4.3 (disjoint new files) | S2.x → S3.x → S4.x → S5.x at every GATE |
-| S6.1 vs S6.2 vs S6.3 | S4.4 after S4.1/4.2/4.3 (mod wires them) |
+| S1.A 与 S1.B（不同 crate） | 阶段 2 *内部*的一切（共享 sdk/spawn 文件） |
+| S0.1 与 S0.2 | S2.2 → S2.3（先抽取，再委托） |
+| S4.1 与 S4.2 与 S4.3（互不相交的新文件） | 每个 GATE 处 S2.x → S3.x → S4.x → S5.x |
+| S6.1 与 S6.2 与 S6.3 | S4.4 在 S4.1/4.2/4.3 之后（mod 负责接线） |
 
-Phases are strictly ordered by the GATEs. Two developers could own S1.A and S1.B
-simultaneously; the engine-runner author (Phase 2) blocks the facade author (Phase 4).
-
----
-
-## 4. Test plan
-
-### Must-stay-green (regression)
-
-- `bamboo-domain`: all `subagent/model.rs` policy tests + `registry.rs` (8) — untouched.
-- `bamboo-tools` (post-move): the 9 `PolicyAwareToolExecutor` tests
-  (`inherit_policy_forwards_all_calls`, `allowlist_permits/blocks`,
-  `denylist_blocks/permits`, `missing_session_id_falls_through`,
-  `unknown_session_falls_through`, `missing_subagent_type_metadata_falls_through`,
-  `execute_without_context_forwards`).
-- `bamboo-engine`: `model_areas.rs` (9), `model_config_helper.rs`, child_session
-  `tests.rs` (10), runtime `tests.rs` (5).
-- `bamboo-engine` (post-move): 6 builtin-profile + 7 loader tests (incl. prompt-drift
-  cross-check against `CHILD_SYSTEM_PROMPT`/`PLAN_AGENT_SYSTEM_PROMPT`).
-- `bamboo-server`: 29 `sub_agent.rs` tests, `routes/tests.rs` profile-list smoke,
-  `policy_aware` shim re-export compiles.
-
-### New tests
-
-- **S-T1.1** `infer_provider`: claude/gpt/o-series/gemini/unknown mapping.
-- **S-T1.2** `resolve_model`: precedence `model_ref` > `tier` > fallback chain.
-- **S-T2.1** `run_child_spawn` integration: parent+child sessions, assert
-  SubAgentStarted (adapter) → SubAgentEvent → SubAgentCompleted ordering; child
-  status persisted (completed).
-- **S-T2.2** `ProfileRunner::run_profile` with Allowlist profile: assert
-  `disabled_tools` excludes non-allowlisted names (schema-level).
-- **S-T2.3** `run_profile` with `ToolPolicy::Inherit`: `disabled_tools` empty.
-- **S-T2.4** Model precedence at runner: `model_override` honored over session model.
-- **S-T2.5** Watchdog timeout → SubAgentCompleted status=`timeout` (reuse existing
-  watchdog plumbing).
-- **S-T4.1** `Agent::builder().researcher().model("m").build()` → resolved
-  system_prompt matches researcher profile + model override applied.
-- **S-T4.2** `ExecuteRequestBuilder` round-trip: all required fields enforced, all
-  optional default to `None`.
-- **S-T4.3** `with_defaults_for_data_dir(tmp)`: builds an `Agent` with a NoopProvider/
-  mock; `SkillManager.initialize` + `MetricsCollector.spawn` succeed.
-- **S-T5.2** End-to-end policy: child `subagent_type=researcher` (read-only allowlist)
-  → Edit/Write blocked at execute *and* absent from schema.
-
-> Use a Noop/mock `LLMProvider` for SDK integration tests (existing pattern in
-> model-resolution tests) to avoid network I/O.
+阶段之间由 GATE 严格排序。两名开发者可以同时认领 S1.A 与 S1.B；engine runner 作者
+（阶段 2）会阻塞门面作者（阶段 4）。
 
 ---
 
-## 5. Tech-debt cleanup (refactor-adjacent, do within the relevant phase)
+## 4. 测试计划
 
-- **TD-1 (Phase 0):** Remove 4 stale `bamboo-application-agent` comments + the
-  `src/lib.rs:48` placeholder comment.
-- **TD-2 (Phase 0/4):** Collapse the duplicate Agent re-export chain
-  (`src/lib.rs:63` → `agent/mod.rs:24` → `bamboo_engine`) into the new wrapper.
-- **TD-3 (Phase 1):** Extract scattered provider-pattern matches in
-  `model_config_helper.rs` into the single `infer_provider`.
-- **TD-4 (Phase 3):** Update builtin.rs "(future) FilteredExecutor" comment →
-  `PolicyAwareToolExecutor`; update loader.rs "consumer typically bamboo-server".
-- **TD-5 (deferred, documented):** Internal `ChildStatus` enum vs wire strings —
-  keep strings on the wire; note for future.
-- **TD-6 (Phase 4):** Add `ExecuteRequestBuilder` so consumers aren't exposed to the
-  raw multi-field `ExecuteRequest`.
-- **TD-7 (Phase 5, documented):** Double tool-policy enforcement (schema
-  `disabled_tools` is *authoritative for discovery*; `PolicyAwareToolExecutor` is the
-  *execution-time safety net*). Document; do not remove.
-- **TD-8 (Phase 2):** `disabled_tools_for_profile` needs `all_tool_names` from caller;
-  document that `SpawnContext.tools.list_tools()` is the canonical source so callers
-  stop threading a separate `tool_names: Vec<String>`.
+### 必须保持绿（回归）
+
+- `bamboo-domain`：全部 `subagent/model.rs` policy 测试 + `registry.rs`（8 个）——不动。
+- `bamboo-tools`（迁移后）：9 个 `PolicyAwareToolExecutor` 测试
+  （`inherit_policy_forwards_all_calls`、`allowlist_permits/blocks`、
+  `denylist_blocks/permits`、`missing_session_id_falls_through`、
+  `unknown_session_falls_through`、`missing_subagent_type_metadata_falls_through`、
+  `execute_without_context_forwards`）。
+- `bamboo-engine`：`model_areas.rs`（9 个）、`model_config_helper.rs`、child_session
+  `tests.rs`（10 个）、runtime `tests.rs`（5 个）。
+- `bamboo-engine`（迁移后）：6 个 builtin-profile + 7 个 loader 测试（含针对
+  `CHILD_SYSTEM_PROMPT`/`PLAN_AGENT_SYSTEM_PROMPT` 的提示词漂移交叉校验）。
+- `bamboo-server`：29 个 `sub_agent.rs` 测试、`routes/tests.rs` profile 列表冒烟、
+  `policy_aware` shim re-export 可编译。
+
+### 新增测试
+
+- **S-T1.1** `infer_provider`：claude/gpt/o-series/gemini/unknown 映射。
+- **S-T1.2** `resolve_model`：优先级 `model_ref` > `tier` > 回退链。
+- **S-T2.1** `run_child_spawn` 集成：父 + 子 session，断言 SubAgentStarted（adapter）→
+  SubAgentEvent → SubAgentCompleted 的顺序；子状态已持久化（completed）。
+- **S-T2.2** 用 Allowlist profile 跑 `ProfileRunner::run_profile`：断言 `disabled_tools`
+  排除了非白名单名称（schema 层）。
+- **S-T2.3** 用 `ToolPolicy::Inherit` 跑 `run_profile`：`disabled_tools` 为空。
+- **S-T2.4** runner 处的模型优先级：`model_override` 优先于 session 模型。
+- **S-T2.5** Watchdog 超时 → SubAgentCompleted status=`timeout`（复用现有 watchdog 管线）。
+- **S-T4.1** `Agent::builder().researcher().model("m").build()` → 解析出的
+  system_prompt 与 researcher profile 匹配 + model override 生效。
+- **S-T4.2** `ExecuteRequestBuilder` 往返：全部必填字段强制填写，全部可选默认 `None`。
+- **S-T4.3** `with_defaults_for_data_dir(tmp)`：用 NoopProvider/mock 构建出 `Agent`；
+  `SkillManager.initialize` + `MetricsCollector.spawn` 成功。
+- **S-T5.2** 端到端 policy：子代 `subagent_type=researcher`（只读白名单）→ Edit/Write
+  执行时被拦截，*且*不出现在 schema 中。
+
+> SDK 集成测试使用 Noop/mock 的 `LLMProvider`（模型解析测试中的既有模式），避免
+> 网络 I/O。
 
 ---
 
-## 6. Reverse-dependency risk register
+## 5. 技术债清理（伴随重构，在相关阶段内完成）
 
-| Risk | Mitigation |
+- **TD-1（阶段 0）：**移除 4 处过期的 `bamboo-application-agent` 注释 +
+  `src/lib.rs:48` 的占位注释。
+- **TD-2（阶段 0/4）：**把重复的 Agent re-export 链（`src/lib.rs:63` →
+  `agent/mod.rs:24` → `bamboo_engine`）收敛进新包装器。
+- **TD-3（阶段 1）：**把 `model_config_helper.rs` 中散落的 provider 模式匹配抽进唯一的
+  `infer_provider`。
+- **TD-4（阶段 3）：**把 builtin.rs 的 "(future) FilteredExecutor" 注释更新为
+  `PolicyAwareToolExecutor`；更新 loader.rs 的 "consumer typically bamboo-server"。
+- **TD-5（推迟、已记录）：**内部 `ChildStatus` 枚举 vs wire 字符串——wire 上保持字符串；
+  留档备查。
+- **TD-6（阶段 4）：**新增 `ExecuteRequestBuilder`，让使用者不必直面原始的多字段
+  `ExecuteRequest`。
+- **TD-7（阶段 5、已记录）：**双重 tool-policy 执行（schema `disabled_tools` 是
+  *发现阶段的权威*；`PolicyAwareToolExecutor` 是*执行时的安全网*）。写进文档；不要移除。
+- **TD-8（阶段 2）：**`disabled_tools_for_profile` 需要调用方传入 `all_tool_names`；
+  文档写明 `SpawnContext.tools.list_tools()` 是 canonical 来源，让调用方不再单独穿引
+  `tool_names: Vec<String>`。
+
+---
+
+## 6. 反向依赖风险登记表
+
+| 风险 | 缓解 |
 |------|-----------|
-| Moving `PolicyAwareToolExecutor` to `bamboo-tools` would fail if it pulled any `bamboo-server`/`bamboo-engine` symbol. | Verified: only `agent-core` + `domain` + tokio. Safe. No reverse edge. |
-| Moving `profiles` to engine: server still needs them → server already depends on engine. No new edge; *removes* server-owned logic. | Re-export shim keeps server paths; no circular import (domain owns the types). |
-| Root facade `.with_defaults_for_data_dir` pulling `bamboo-server` into the agent builder. | Build deps from `infrastructure`/`engine`/`tools` only. `bamboo-server` stays out of the `Agent` builder path. |
-| `sdk::runner` reusing `SpawnContext` could tempt importing server `AppState`. | `SpawnContext` lives in engine and is server-agnostic (completion_handler is a trait object). No `AppState` reference. |
-| `infer_provider`/`resolve_model` in engine needing `ProviderRegistry` (infrastructure) — fine (engine→infra exists), but must NOT land in `bamboo-tools`. | Helpers stay in engine per C6. |
+| 把 `PolicyAwareToolExecutor` 移到 `bamboo-tools`，一旦它引用任何 `bamboo-server`/`bamboo-engine` 符号就会失败。 | 已核验：只有 `agent-core` + `domain` + tokio。安全，无反向边。 |
+| 把 `profiles` 移入 engine：server 仍需要它们 → server 本就依赖 engine。无新边；*移除*的是 server 自有的逻辑。 | re-export shim 保住 server 路径；无循环 import（类型归 domain 所有）。 |
+| 根门面 `.with_defaults_for_data_dir` 把 `bamboo-server` 拖进 agent builder。 | 只从 `infrastructure`/`engine`/`tools` 构建依赖。`bamboo-server` 不得进入 `Agent` builder 路径。 |
+| `sdk::runner` 复用 `SpawnContext` 可能诱使引入 server 的 `AppState`。 | `SpawnContext` 位于 engine，与 server 无关（completion_handler 是 trait object）。无 `AppState` 引用。 |
+| engine 中的 `infer_provider`/`resolve_model` 需要 `ProviderRegistry`（infrastructure）——没问题（engine→infra 已存在），但绝不能落进 `bamboo-tools`。 | 按 C6，helper 留在 engine。 |
 
 ---
 
-## 7. Anti-fork verification checklist (run at GATE 5)
+## 7. 防分叉核验清单（在 GATE 5 执行）
 
-1. `grep -rn "ExecuteRequest {" crates/bamboo-engine/src` → only `sdk/spawn.rs`
-   (and any pre-existing root-session execute paths; sub-agent path single).
-2. `run_spawn_job` body is a single delegation to `run_child_spawn`.
-3. `ProfileRunner::run_profile` constructs `SpawnJob` + calls `run_child_spawn`; no
-   inline execute/finalize.
-4. No duplicate `builtin_profiles()` / `load_registry()` outside `bamboo-engine`
-   (server shim only re-exports).
-5. No duplicate `PolicyAwareToolExecutor` impl outside `bamboo-tools`.
+1. `grep -rn "ExecuteRequest {" crates/bamboo-engine/src` → 只应命中 `sdk/spawn.rs`
+   （以及既有的根 session execute 路径；sub-agent 路径唯一）。
+2. `run_spawn_job` 主体是对 `run_child_spawn` 的单行委托。
+3. `ProfileRunner::run_profile` 构造 `SpawnJob` + 调用 `run_child_spawn`；没有内联
+   execute/finalize。
+4. `bamboo-engine` 之外没有重复的 `builtin_profiles()` / `load_registry()`
+   （server shim 只做 re-export）。
+5. `bamboo-tools` 之外没有重复的 `PolicyAwareToolExecutor` 实现。

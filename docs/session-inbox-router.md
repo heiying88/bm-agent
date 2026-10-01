@@ -1,249 +1,92 @@
-# SessionInbox Router
+# SessionInbox 路由器
 
-`SessionInbox` is Bamboo's internal, durable message path between logical
-sessions. It is a runtime capability, not a new HTTP endpoint. User, peer,
-child-completion, actor-steer, and background-Bash producers all address the
-stable `Session.id`; process ids, worker mailbox ids, warm-pool slots, and
-execution run ids are never durable addresses.
+`SessionInbox` 是 Bamboo 内部在逻辑 session 之间传递消息的持久通道。它是一项运行时能力，而不是一个新的 HTTP 端点。用户、对端、子代完成、actor 转向以及后台 Bash 等生产者都寻址稳定的 `Session.id`；进程 id、worker mailbox id、暖池槽位和执行 run id 永远不会成为持久地址。
 
-## Components and ownership
+## 组件与归属
 
-- `SessionMessageEnvelope` is the typed domain contract. It carries the stable
-  message id, source, target `Session.id`, kind, semantic body, thread/reply
-  correlation, and retry metadata.
-- `FileSessionInbox` stores one ordered Maildir beside the authoritative
-  session. Delivery is bounded, idempotent, and coordinated across independent
-  adapters/processes by a per-session file lock.
-- `SessionMessenger` validates logical-session relationships, commits the
-  envelope with immediate per-message intent, and only then requests activation.
-  Child/Bash coordinators instead stage envelopes and explicitly release their
-  prefix after the durable wait transition permits it.
-- `SessionActivationRouter` tracks the current logical owner, safe-boundary
-  notifications, finalization, and one successor reservation.
-- The runner's safe turn boundary claims an envelope, translates it to a
-  provider-valid user message, checkpoints that message and its bounded cursor
-  together, verifies the durable typed transcript marker, then acknowledges the
-  claim.
+- `SessionMessageEnvelope` 是类型化的领域契约。它承载稳定的消息 id、来源、目标 `Session.id`、种类、语义正文、thread/reply 关联，以及重试元数据。
+- `FileSessionInbox` 在权威 session 旁边存放一个有序的 Maildir。投递是有界、幂等的，并通过每 session 一把的文件锁在独立的适配器/进程之间协调。
+- `SessionMessenger` 校验逻辑 session 之间的关系，以逐条消息的即时意图提交信封，然后才请求激活。子代/Bash 协调器则改为暂存信封，并在持久等待转换允许之后显式释放其前缀。
+- `SessionActivationRouter` 跟踪当前逻辑属主、安全边界通知、收尾处理，以及一次后继者预留。
+- runner 的安全回合边界认领一个信封，把它转换成 provider 合法的用户消息，把该消息与其有界游标一并写入检查点，校验持久化的类型化转写标记，然后确认这次认领。
 
-The transcript marker is the unbounded admission proof. The bounded cursor is
-an optimization and may evict old ids; an admitted tombstone without a matching
-typed transcript entry never authorizes deletion of the recoverable claim.
+转写标记是无界的准入证明。有界游标只是一项优化，可以逐出旧的 id；已准入的墓碑如果没有匹配的类型化转写条目，绝不能授权删除可恢复的认领。
 
-## Bounds and trust boundary
+## 上限与信任边界
 
-The default per-session limits are a **256 KiB serialized envelope**, **1,024
-pending or claimed envelopes**, and **128 claims per drain batch**. Limit
-failures are observable and fail before activation. Child terminal fields use a
-smaller inline budget and carry the full value's length and SHA-256 identity
-when the displayed value is bounded, so an oversized completion cannot strand
-a satisfied parent wait.
+默认的每 session 上限是 **256 KiB 的序列化信封**、**1,024 个待处理或已认领的信封**，以及**每个清空批次 128 个认领**。超限失败是可观测的，并且发生在激活之前。子代的终止字段使用更小的内联预算，当展示值被截断时携带完整值的长度与 SHA-256 标识，因此一个超大的完成结果不会让已满足的父级等待悬置。
 
-The new activation-intent scan additionally bounds physical Maildir bytes to
-`min(8 × max_payload_bytes + 4 KiB, 32 MiB)` (about 2 MiB with defaults).
-Immediate publication checks the actual pretty transport against the same
-bound. Scan checks metadata and then reads at most the bound plus one byte,
-so growth after stat cannot bypass it. An older staged pretty transport above
-this bound fails inspection closed and stays on disk; recovery does not repair,
-quarantine, or delete it. This guard does not change the legacy ACK readers.
+新的激活意图扫描还会把物理 Maildir 字节数限制在 `min(8 × max_payload_bytes + 4 KiB, 32 MiB)`（默认配置下约 2 MiB）。即时发布会用同一上限检查实际的 pretty 传输体。扫描先检查元数据，再至多读取上限加一个字节，因此 stat 之后的增长无法绕过它。超过该上限的较旧暂存 pretty 传输体在检查时按失败关闭处理并留在磁盘上；恢复不会修复、隔离或删除它。该防护不改变旧版 ACK 读取器。
 
-Message ids must be canonical, non-empty, at most 256 bytes, and contain no
-path separator or `..`. Maildir and admitted-receipt filenames use fixed-size
-digests; neither a message id nor a target supplied by a producer becomes a
-filesystem path. The target must resolve through the authoritative session
-store. A session source must also exist and have the same logical root as the
-target. When both sessions carry a Project id, those ids must match; a
-same-root/different-Project send fails before enqueue or activation. The
-same-root fallback when either Project id is absent is only a rolling-upgrade
-compatibility rule for older sessions.
+消息 id 必须是规范形式、非空、至多 256 字节，且不含路径分隔符或 `..`。Maildir 与准入回执的文件名使用固定长度的摘要；生产者提供的消息 id 或目标都不会变成文件系统路径。目标必须能通过权威 session 存储解析。作为来源的 session 也必须存在，并与目标拥有相同的逻辑根。当两个 session 都携带 Project id 时，这些 id 必须匹配；同根但不同 Project 的发送会在入队或激活之前失败。任一 Project id 缺失时的同根回退只是面向旧 session 的滚动升级兼容规则。
 
-Envelope kind, source, and body combinations are closed and validated. Content
-must be semantically non-empty. Provider-facing metadata cannot supply the
-reserved `session_message` proof: Bamboo writes and verifies that marker from
-the canonical typed envelope. Logs and metrics identify ids, generations, and
-failure classes, never body content or secret values.
+信封的种类、来源与正文组合是封闭集合并经过校验。内容必须在语义上非空。面向 provider 的元数据无法提供保留的 `session_message` 证明：Bamboo 会从规范的类型化信封写入并校验该标记。日志与指标只标识 id、generation 与失败类别，绝不包含正文内容或秘密值。
 
-## Delivery and activation state machine
+## 投递与激活状态机
 
-1. Validate the envelope and authorization without logging body content.
-2. Under the inbox operation lock, reject same-id/different-semantic-envelope
-   reuse, enforce payload/backlog limits, allocate a monotonic generation, and
-   commit to `new/`. Immediate delivery includes versioned, transport-owned
-   `session_inbox_activation_intent` in that same message-file publication.
-   Cancellation before the rename commits delivers neither message nor intent;
-   cancellation after it leaves both durable.
-3. The coordinator's `activation-generation` file authorizes a prefix. An
-   immediate intent authorizes **only its own message**, with either
-   `respect_specific_wait` or `interrupt_specific_wait`. Inspection and claim
-   use the same rule in `new/` and recovered `cur/`: coordinator-prefix coverage
-   **or** that message's own intent. A newer immediate message cannot release
-   an earlier staged child/Bash sibling. `activation_generation` in inspection
-   is the highest eligible generation, not permission for every preceding id;
-   `coordinator_generation` reports the explicit prefix separately.
-   Each canonical claim carries its own effective activation policy: its own
-   Interrupt intent, or coverage by both coordinator and legacy interrupt
-   prefixes. Local/remote actor delivery uses that claim policy; the aggregate
-   highest pending Interrupt generation never grants a preceding item Interrupt.
-4. If a run owns the logical session, notify that owner. Otherwise reserve one
-   runner through the host's canonical runner registry. Startup and retry use
-   durable message intent and coordinator permission, not the latest delivered
-   generation. If the process stops after rename and before requesting wakeup,
-   startup reconstructs eligibility from the still-present message itself.
-5. At a safe reasoning boundary, recover/drain into `cur/`, checkpoint the
-   provider message plus admission cursor, verify the typed transcript proof,
-   write a permanent tombstone containing the semantic digest and original
-   activation intent, then remove
-   `cur/`.
-6. Before a run becomes terminal, mark its owner finalizing. If the router has
-   a newer generation than the generation actually admitted by that run,
-   reserve one successor.
+1. 校验信封与授权，不记录正文内容。
+2. 在 inbox 操作锁下，拒绝同 id 但语义信封不同的复用，执行载荷/积压上限，分配单调递增的 generation，并提交到 `new/`。即时投递在同一次消息文件发布中包含带版本、由传输层持有的 `session_inbox_activation_intent`。重命名提交之前取消，则消息与意图都不会投递；之后取消，则两者都已持久。
+3. 协调器的 `activation-generation` 文件授权一个前缀。即时意图**只授权其自身的消息**，策略为 `respect_specific_wait` 或 `interrupt_specific_wait` 之一。检查与认领在 `new/` 与恢复出的 `cur/` 中使用同一规则：协调器前缀覆盖**或**该消息自身的意图。较新的即时消息不能释放较早暂存的子代/Bash 兄弟消息。检查中的 `activation_generation` 是符合条件的最高 generation，不是对之前每个 id 的许可；`coordinator_generation` 另行报告显式前缀。每个规范认领都携带自己的生效激活策略：自身的 Interrupt 意图，或同时被协调器与旧版 interrupt 前缀覆盖。本地/远程 actor 投递使用该认领策略；聚合的最高待处理 Interrupt generation 绝不会把 Interrupt 授予更早的条目。
+4. 如果某个 run 拥有该逻辑 session，就通知该属主。否则通过宿主的规范 runner 注册表预留一个 runner。启动与重试使用持久的消息意图与协调器许可，而不是最新投递的 generation。如果进程在重命名之后、请求唤醒之前停止，启动流程会从仍然存在的消息本身重建资格。
+5. 在安全的推理边界处，恢复/清空到 `cur/`，把 provider 消息连同准入游标写入检查点，校验类型化转写证明，写入包含语义摘要与原始激活意图的永久墓碑，然后移除 `cur/`。
+6. 在某个 run 进入终止状态之前，把其属主标记为收尾中。如果路由器持有的 generation 比该 run 实际准入的 generation 更新，则预留一个后继者。
 
-The legacy `interrupt-generation` file describes the coordinator-authorized
-prefix's interruption permission. Inspection additionally derives interruption
-from pending, eligible immediate messages' own policies, so an old interrupted
-message cannot change a later RespectSpecificWait message's policy. Immediate
-delivery never advances either coordinator watermark.
-Child and Bash completion producers use the strict policy: they can stage
-several outcomes, but publish activation only after their durable wait policy
-is satisfied. An activation request can fail after delivery commits; the error
-retains the exact receipt and reports durable delivery separately from wakeup.
-Retrying the same id, body, and intent reuses the original generation. Changing
-the body or policy, or upgrading a staged id to immediate, fails closed even
-after ACK. Legacy envelopes/receipts without intent remain staged; recovery
-does not infer their original sender's permission.
+旧版 `interrupt-generation` 文件描述协调器授权前缀的中断许可。检查还会额外从待处理、符合条件的即时消息自身策略推导中断性，因此一条较早的已中断消息不能改变后续 RespectSpecificWait 消息的策略。即时投递从不推进任何一个协调器水位。子代与 Bash 完成生产者使用严格策略：它们可以暂存多个结果，但只有在其持久等待策略满足之后才发布激活。投递提交之后激活请求仍可能失败；错误会保留确切的回执，并把持久投递与唤醒分开报告。以相同的 id、正文与意图重试会复用原来的 generation。更改正文或策略，或把暂存 id 升级为即时，即使在 ACK 之后也会按失败关闭处理。不带意图的旧版信封/回执保持暂存；恢复不会推断其原始发送者的许可。
 
-Cancellation between external runner reservation and owner publication uses an
-asynchronous exact-run rollback handshake. Coalesced deliveries are released
-only after rollback completes, so they cannot adopt an unlaunched stale slot.
-The router records the last generation for which it genuinely launched a run;
-a poison claim or persistent checkpoint failure receives one in-process
-successor attempt, not an unbounded provider hot loop. A newer generation or a
-process restart permits another bounded attempt while the original claim
-remains inspectable.
+外部 runner 预留与属主发布之间的取消使用异步的精确 run 回滚握手。合并投递只有等回滚完成后才释放，因此不会占上一个尚未启动的过期槽位。路由器记录它真正启动过 run 的最后一个 generation；毒认领（poison claim）或持续的检查点失败会获得一次进程内后继尝试，而不是无界的 provider 热循环。更新的 generation 或进程重启允许再一次有界尝试，同时原始认领仍可检查。
 
-An immediate message can be admitted ahead of an older staged outcome. When
-the coordinator later releases that older prefix, its durable monotonic prefix
-progress permits one new dispatch despite the delivery sequence hole. The
-router records the prefix seen before launch; pending work under the same
-prefix does not remove poison-generation suppression or trigger a hot loop.
+即时消息可以先于较早暂存的结果被准入。当协调器随后释放那个较早的前缀时，其持久的单调前缀进度允许一次新的派发，即便投递序列存在空洞。路由器记录启动之前看到的前缀；同一前缀下的待处理工作不会解除毒 generation 抑制，也不会触发热循环。
 
-## External actor admission handshake
+## 外部 actor 准入握手
 
-An actor activation uses the same host runner reservation as every other
-session run. After reservation, the host binds the delivery sink and claims the
-entire currently authorized prefix in generation order. Before dispatching
-`Run`, it checkpoints exactly one canonical provider message per claim into the
-authoritative host transcript, in that order. This pre-dispatch checkpoint is
-recoverable context seeding only: it does **not** advance the admission cursor,
-write an admitted tombstone, or remove the canonical `cur/` claim.
+actor 激活使用与其他所有 session run 相同的宿主 runner 预留。预留之后，宿主绑定投递汇，并按 generation 顺序认领当前已授权前缀的全部内容。在派发 `Run` 之前，它按该顺序把每个认领恰好一条规范 provider 消息写入权威宿主转写的检查点。这个派发前检查点只用于可恢复的上下文播种：它不推进准入游标、不写入已准入墓碑，也不移除规范的 `cur/` 认领。
 
-`RunSpec` carries the exact logical session identity, a fresh
-`activation_run_id`, the checkpointed context, and the ordered typed initial
-delivery batch. The worker validates target id, run id, strictly increasing
-generations, and the local activation watermark. At its first safe boundary it
-admits the batch into its local checkpoint before the first provider request,
-then confirms each envelope in order with its id, generation, target, and run
-id. Live deliveries use the same typed path and local watermark policy.
+`RunSpec` 携带确切的逻辑 session 身份、全新的 `activation_run_id`、已写入检查点的上下文，以及有序的类型化初始投递批次。worker 校验目标 id、run id、严格递增的 generation，以及本地激活水位。在第一个安全边界处，它先于第一次 provider 请求把该批次准入本地检查点，然后按顺序以各自的 id、generation、目标与 run id 确认每个信封。实时投递使用相同的类型化路径与本地水位策略。
 
-The host accepts only the next confirmation for the current run and canonical
-claim. It then checkpoints the admission cursor, verifies the exact typed
-transcript marker, writes the permanent tombstone, and acknowledges `cur/`.
-Stale, reordered, or mismatched confirmations cannot delete a claim.
+宿主只接受当前 run 与规范认领的下一个确认。随后它把准入游标写入检查点，校验确切的类型化转写标记，写入永久墓碑，并确认 `cur/`。过期、乱序或不匹配的确认都不能删除认领。
 
-If confirmation is lost, the durable host transcript and still-present
-canonical claim are the reconciliation facts. A warm worker reloads its local
-checkpoint before reconfirming. A replacement worker, including one with an
-independent local store, receives the same canonical id in the next `RunSpec`
-and preserves one context entry. The host's pre-dispatch exact-marker check
-also makes a retry non-duplicating. Only a matching confirmation advances the
-cursor and clears the backlog, so worker replacement cannot convert a
-network-level acknowledgement loss into either duplicate reasoning context or
-message loss.
+如果确认丢失，持久的宿主转写与仍然存在的规范认领就是对账依据。热 worker 在重新确认之前会重载其本地检查点。替换 worker（包括带有独立本地存储的那种）会在下一个 `RunSpec` 中收到相同的规范 id，并保留一条上下文条目。宿主派发前的精确标记检查也使重试不会重复。只有匹配的确认才会推进游标并清空积压，因此 worker 替换不会把网络层确认丢失变成重复的推理上下文或消息丢失。
 
-## Suspended sessions and completion producers
+## 挂起 session 与完成生产者
 
-Strict activation leaves a target inert while a specific durable
-`waiting_for_children` or `waiting_for_bash` ownership record remains. Explicit
-interrupt-authorized steering clears only the current reasoning gate
-(`status`, `suspension`, and `runtime.suspend_reason`) before runner
-reservation. It deliberately preserves the durable wait owner: later terminal
-events still have one coordinator, and end-of-run bookkeeping re-suspends the
-session if that wait is still armed.
+只要仍存在特定的持久 `waiting_for_children` 或 `waiting_for_bash` 属主记录，严格激活就让目标保持惰性。显式的、经中断授权的转向在 runner 预留之前只清除当前的推理门控（`status`、`suspension` 与 `runtime.suspend_reason`）。它有意保留持久等待属主：后续终止事件仍然只有唯一的协调器，而且如果该等待仍处于待命状态，run 结束时的簿记会重新挂起该 session。
 
-Background Bash completion first admits a typed envelope. If sibling waited
-shells remain, it leaves the wait armed and performs no activation. The final
-shell clears the Bash wait durably and then requests exactly one activation, so
-multiple shell completions form one ordered backlog and one final wake.
+后台 Bash 完成首先准入一个类型化信封。如果仍有处于等待中的兄弟 shell，它会让等待保持待命而不执行激活。最后一个 shell 持久清除 Bash 等待，然后恰好请求一次激活，因此多个 shell 完成会构成一个有序积压与一次最终唤醒。
 
-This issue covers waits persisted and reconciled by the host. Transporting a
-new `Suspended` state originating inside a nested actor worker, and propagating
-that ownership end to end through the actor protocol, remains explicitly
-deferred to existing **#685**. The router and actor tests here do not claim that
-worker-originated nested suspension is implemented.
+本 issue 覆盖由宿主持久化并对账的等待。把源自嵌套 actor worker 内部的新 `Suspended` 状态传输出来，并通过 actor 协议端到端传播该属主关系，仍然明确推迟到既有的 **#685**。这里的路由器与 actor 测试并不声称已实现源自 worker 的嵌套挂起。
 
-## Rolling-upgrade compatibility
+## 滚动升级兼容性
 
-Before publishing its first immediate intent, the adapter upgrades the existing
-`activation-generation` file under the same inbox lock from a legacy integer to
-`{"version":2,"generation":<unchanged coordinator prefix>}`. The new reader
-accepts both formats and subsequent prefix updates retain v2. The old integer
-reader fails closed on v2, so an old writer cannot turn a newer immediate
-message into a grant for earlier staged siblings. Cancellation before message
-rename may leave the safe format upgrade in place, without any delivered
-message or new prefix permission. Run current backends against an upgraded
-inbox; format downgrade and automatic watermark repair are unsupported.
+在发布第一个即时意图之前，适配器会在同一把 inbox 锁下，把既有的 `activation-generation` 文件从旧版整数升级为 `{"version":2,"generation":<unchanged coordinator prefix>}`。新读取器同时接受两种格式，后续前缀更新保持 v2。旧版整数读取器遇到 v2 会失败关闭，因此旧写入者无法把较新的即时消息变成对较早暂存兄弟消息的授权。消息重命名之前的取消可能让这次安全的格式升级留在原处，但不会投递任何消息，也不会产生新的前缀许可。请让当前后端运行在已升级的 inbox 上；不支持格式降级与自动水位修复。
 
-The following legacy ingress remains temporarily readable:
+以下旧版入口暂时保持可读：
 
-- `pending_injected_messages`: deterministically converted to typed runtime
-  envelopes, durably delivered, then CAS-cleared. `created_at` and `attempt`
-  are retry metadata and are excluded from the idempotency-content digest.
-  Target, source, kind, body, thread/reply edges, and correlation are immutable.
-- `ParentFrame::Message` and broker `InboxKind::Steer {text}`: converted by the
-  worker to a typed runtime-instruction envelope in its local durable inbox.
-  This old path has no canonical host claim/admission confirmation and should
-  be treated as active-run compatibility only; current host producers use
-  canonical `ParentFrame::SessionMessage`.
-- `RunSpec.logical_session = None`: accepted only for older hosts by generating
-  a per-run fallback id. Current hosts must send the exact logical child,
-  parent, and root ids.
+- `pending_injected_messages`：确定性地转换为类型化运行时信封，持久投递，然后用 CAS 清除。`created_at` 与 `attempt` 是重试元数据，不参与幂等内容摘要。目标、来源、种类、正文、thread/reply 边与关联关系都不可变。
+- `ParentFrame::Message` 与 broker 的 `InboxKind::Steer {text}`：由 worker 在其本地持久 inbox 中转换为类型化运行时指令信封。这条旧路径没有规范的宿主认领/准入确认，应当只被视为活动 run 的兼容措施；当前的宿主生产者使用规范的 `ParentFrame::SessionMessage`。
+- `RunSpec.logical_session = None`：仅为旧宿主接受，做法是生成一个每 run 的回退 id。当前宿主必须发送确切的逻辑子代、父代与根 id。
 
-Structured compatibility telemetry never contains message bodies or secret
-values:
+结构化兼容遥测绝不包含消息正文或秘密值：
 
 - `session_inbox.legacy_pending_ingress`
 - `session_inbox.legacy_broker_steer_ingress`
 - `session_inbox.legacy_actor_text_ingress`
 - `session_inbox.legacy_runspec_identity_fallback`
 
-## Observability
+## 可观测性
 
-`SessionMessagingMetricsSnapshot` exposes delivered/rejected totals, invalid
-envelopes, authorization failures, payload/backlog/storage/activation failures,
-active notifications, reserved/coalesced activations, and aggregate delivery
-latency. Inbox inspection reports pending, claimed, and latest generation
-without exposing payloads.
+`SessionMessagingMetricsSnapshot` 暴露已投递/已拒绝总数、无效信封、授权失败、载荷/积压/存储/激活失败、活动通知、已预留/已合并激活，以及聚合投递延迟。inbox 检查报告待处理、已认领与最新 generation，而不暴露载荷。
 
-Operators should alert on a growing claimed backlog, storage failures,
-activation failures, repeated poison-generation suppression, or any legacy
-ingress after the migration window begins.
+运维人员应当针对持续增长的已认领积压、存储失败、激活失败、反复出现的毒 generation 抑制，以及迁移窗口开始后出现的任何旧版入口设置告警。
 
-## Legacy removal gate
+## 旧版移除门槛
 
-Legacy readers and telemetry may be removed only when every condition below is
-met:
+只有满足以下全部条件，才能移除旧版读取器与遥测：
 
-1. The compatibility code has shipped for at least **two release trains** and
-   at least **30 days**.
-2. All four legacy-ingress telemetry events are zero for both **two complete
-   release trains** and **30 consecutive days** in supported deployments.
-3. Startup scans report zero legacy `pending_injected_messages` queues for the
-   same window.
-4. Rolling downgrade remains possible for the oldest supported release during
-   the window; removing a writer must not make rollback lose messages.
-5. CI retains old-host/new-worker, new-host/old-worker, deterministic migration
-   retry, crash-before-source-clear, and transcript-checkpoint-failure tests.
-6. Release notes announce the removal one train in advance and identify the
-   last rollback-compatible version.
+1. 兼容代码已发布至少**两个发布列车**且至少 **30 天**。
+2. 在受支持的部署中，全部四个旧版入口遥测事件在**两个完整发布列车**与**连续 30 天**内均为零。
+3. 在同一窗口内，启动扫描报告的旧版 `pending_injected_messages` 队列为零。
+4. 窗口期间，最旧的受支持版本仍可滚动降级；移除写入者不能让回滚丢失消息。
+5. CI 保留旧宿主/新 worker、新宿主/旧 worker、确定性迁移重试、源清除前崩溃，以及转写检查点失败等测试。
+6. 发布说明提前一个列车宣布移除，并指明最后一个可回滚兼容的版本。
 
-If any condition resets, restart the observation window. Removal is a separate
-reviewed change, not part of routine cleanup.
+如果任何条件被重置，就重新开始观察窗口。移除是一项单独的需评审变更，不属于例行清理。

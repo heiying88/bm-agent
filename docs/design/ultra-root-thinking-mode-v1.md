@@ -1,52 +1,23 @@
 # Ultra Root thinking mode
 
-Ultra is an independent Root product policy. It increases task-wide reasoning
-through read-only planning, narrow child execution and Root verification and
-synthesis. Each model call retains its separately resolved ordinary reasoning
-effort. Ultra is not an alias for Max or a claimed provider-native budget.
+Ultra 是一项独立的 Root 产品策略。它通过只读规划、收敛的子级执行以及 Root 的验证与综合，来提升整个任务的推理。每次模型调用都保留其单独解析的普通推理力度。Ultra 不是 Max 的别名，也不声称是 provider 原生预算。
 
-## Authority and wire contract
+## 权限与传输契约
 
-The sole durable selection remains `Session.root_orchestration_only`. Public
-`thinking_mode` is projected from `root_orchestration_only_enabled()`:
-`true` means `ultra`, and `false` means `standard`. A Child, a Session with a
-parent or a prompt-only enhancement never projects Ultra. Legacy selected
-Roots read as Ultra without migration or passive writes. Index-only list rows
-omit this detail-only field; GET detail loads durable authority and reports
-ordinary `reasoning_effort` separately.
+唯一的持久选择仍是 `Session.root_orchestration_only`。公开的 `thinking_mode` 由 `root_orchestration_only_enabled()` 投影得出：`true` 对应 `ultra`，`false` 对应 `standard`。Child、带父级的 Session 或仅提示词层面的增强永远不会投影出 Ultra。已选择该模式的 legacy Root 无需迁移或被动写入即可读作 Ultra。仅走索引的列表行会省略这个仅详情暴露的字段；GET 详情会加载持久权限，并单独报告普通的 `reasoning_effort`。
 
-- First chat may select `thinking_mode`. Existing Roots must use the recoverable
-  Root-mode operation before chat; even a same-mode selector requires that path.
-- Select/recover accepts canonical `thinking_mode`, legacy `enabled`, or both
-  when they agree. Normalize to the existing boolean request before storage.
-  Missing selectors, invalid/null modes and contradictory selectors fail.
-- Terminal responses expose `thinking_mode_at_completion` from the receipt.
-  Recovery fenced by a successor exposes `current_thinking_mode` instead. A
-  historical committed receipt does not describe the current selection.
-- Generic PATCH rejects `thinking_mode` presence, including null/invalid values,
-  before any write. It cannot bypass the mode operation.
-- `reasoning_effort: "ultra"` remains invalid. Global/provider/model-role defaults
-  cannot enable Root authority; product mode is never a provider parameter.
+- 首次聊天可以选择 `thinking_mode`。既有 Root 在聊天之前必须走可恢复的 Root 模式操作；即使选择器与当前模式相同也必须走该路径。
+- 选择/恢复接受规范的 `thinking_mode`、legacy 的 `enabled`，或两者一致时同时提供。存储之前先归一化为既有的布尔请求。缺少选择器、非法/null 模式以及相互矛盾的选择器都会失败。
+- 终端响应会从回执中暴露 `thinking_mode_at_completion`。被后继者栅栏的恢复则改为暴露 `current_thinking_mode`。历史已提交的回执并不描述当前选择。
+- 通用 PATCH 会在任何写入之前拒绝出现 `thinking_mode` 字段，包括 null/非法值。它无法绕过模式操作。
+- `reasoning_effort: "ultra"` 依然非法。全局/provider/模型角色默认值无法启用 Root 权限；产品模式永远不是 provider 参数。
 
-No second persisted field, proof version, journal or stage protocol is added.
-The existing birth token, terminal epoch/receipt and dispatch fences are kept.
+不新增第二个持久化字段、证明版本、journal 或阶段协议。保留既有的出生 token、终端 epoch/回执以及派发栅栏。
 
-## Delegated execution evidence and limits
+## 委托执行的证据与边界
 
-The focused acceptance uses the production server and Root runner, Plan tool,
-wait-before-enqueue scheduler, actor provisioning and real `bamboo subagent-worker`
-with `BambooRuntime`. Only the model endpoint is a loopback scripted SSE server.
-It observes an actual worker provider request while the Root durably waits,
-then permits the child to finish and observes Root resume/synthesis. It also
-attempts a Root Write and checks the real dispatch authority denies it.
+聚焦验收使用生产服务器与 Root runner、Plan 工具、先等待后入队的调度器、actor 供给以及带 `BambooRuntime` 的真实 `bamboo subagent-worker`。仅模型端点是 loopback 上脚本化的 SSE 服务器。它会在 Root 持久等待期间观察一次真实的 worker provider 请求，随后允许子级完成，并观察 Root 的恢复/综合。它还会尝试一次 Root Write，并检查真实的派发权限将其拒绝。
 
-Root ordinary High is explicit. The planner uses an independent model and its
-own ordinary provider default (no effort override); it receives neither Root
-High nor product Ultra. This does not prove explicit child effort overrides
-reach the worker: that pre-existing propagation gap is tracked in #1346.
+Root 的普通 High 是显式的。规划器使用独立模型及其自身的普通 provider 默认值（无力度覆盖）；它既不接收 Root High，也不接收产品级 Ultra。这并不能证明显式的子级力度覆盖会到达 worker：该既有传播缺口由 #1346 跟踪。
 
-Ultra guidance reuses existing tools; it does not enforce a persistent N-agent,
-Plan or Review stage gate for every task. Required user goals, constraints and
-acceptance criteria remain part of the assignment. Existing unsupported Plan
-executor/placement routes fail closed; this slice adds no native Ultra, remote
-propagation, new role, ContextPacket or lifecycle/recovery protocol.
+Ultra 指导复用既有工具；它不强制每个任务都设置常驻的 N-agent、Plan 或 Review 阶段门禁。必需的用户目标、约束与验收标准仍是 assignment 的一部分。既有不支持的 Plan 执行器/放置路由一律 fail closed；本切片不新增原生 Ultra、远程传播、新角色、ContextPacket 或生命周期/恢复协议。

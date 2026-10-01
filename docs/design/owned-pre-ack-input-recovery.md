@@ -1,26 +1,9 @@
-# Local Actor pre-ACK input recovery
+# 本地 Actor 的 pre-ACK 输入恢复
 
-`SubAgent.run(reset_to_last_user=false)` can recover one expired owned Inbox
-claim for an Ultra Root's zero-tool local Child. The previous activation must
-be Failed or expired, with Host-persisted local `owned-initial-release-v1`
-placement evidence. Its exact input must already be checkpointed and have no
-permanent Host ACK receipt. Missing runners do not prove that old workers stopped.
+`SubAgent.run(reset_to_last_user=false)` 可以为 Ultra Root 的零工具本地 Child 恢复一条已过期且已归属的 Inbox 认领。上一次激活必须是 Failed 或已过期，并具有 Host 持久化的本地 `owned-initial-release-v1` 放置证据。其确切输入必须已被 checkpoint，且没有永久性的 Host ACK 回执。runner 缺失并不能证明旧 worker 已停止。
 
-The normal run request reloads the current Child and preserves its history.
-The runner acquires the actual replacement Inbox owner, claims a new Actor
-attempt, and requires Storage's complete current-prefix `AlreadyCheckpointed`
-readback. Only the verified target in the worker copy loses the reserved
-bookkeeper key; Host Main remains intact and the ordinary Domain matcher is
-unchanged. Typed startup, current permission posture and actual Host ACK must
-still succeed before the existing release permits provider admission.
+正常的 run 请求会重新加载当前 Child 并保留其历史。runner 获取实际的替换 Inbox 持有者，认领一次新的 Actor 尝试，并要求 Storage 对完整的当前前缀返回 `AlreadyCheckpointed` 回读。只有 worker 副本中通过校验的目标才会失去保留的 bookkeeper 键；Host Main 保持完整，普通的 Domain 匹配器也保持不变。在既有释放逻辑允许 provider 准入之前，类型化启动、当前权限姿态与实际的 Host ACK 仍必须成功。
 
-Focused fixtures include real Store/Inbox refusal cases and a live old worker
-that remains unable to enter its provider. The native fixture uses real serve,
-SubAgent, worker and Host-persisted claims: a readable but unwritable admitted
-folder causes actual ACK failure, then cold run(false) waits for the unchanged
-physical lease to expire. It checks one correction, one replacement reply and
-ACK before replacement provider admission. These fixtures have not yet run.
+聚焦的 fixture 包含真实的 Store/Inbox 拒绝场景，以及一个始终无法进入其 provider 的存活旧 worker。原生 fixture 使用真实的 serve、SubAgent、worker 与 Host 持久化认领：一个可读但不可写的已准入目录会导致真实的 ACK 失败，随后冷启动的 run(false) 等待未变更的物理租约过期。它会在替换的 provider 准入之前检查一次纠正、一次替换回复以及 ACK。这些 fixture 尚未运行。
 
-Already released input, legacy/unknown placement provenance, live claims,
-multiple inputs, reset, read-only tools and remote recovery remain unsupported.
-This slice does not complete the broader #791, #1055 or #1341 acceptance.
+已释放的输入、legacy/未知的放置来源、存活的认领、多个输入、reset、只读工具以及远程恢复仍不受支持。本切片不完成更广泛的 #791、#1055 或 #1341 验收。

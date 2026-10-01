@@ -434,10 +434,10 @@ HashMap<ProviderId, Arc<dyn LLMProvider>>
 ### B. ModelCatalogService
 管理 provider 下可用 models：
 
-- fetch
-- refresh
-- cache
-- merge static fallback / upstream results
+- 拉取
+- 刷新
+- 缓存
+- 合并静态 fallback 与上游结果
 
 ### C. ProviderModelRouter
 给定 `ProviderModelRef`，完成：
@@ -553,11 +553,11 @@ pub trait ProviderModelExecutor: Send + Sync {
 
 ### 新职责
 
-- fetch provider models
-- cache fetched models
-- normalize provider-specific schema
-- merge manual/custom models
-- produce aggregated `ProviderCatalog`
+- 拉取 provider models
+- 缓存已拉取的 models
+- 归一化各 provider 特有的 schema
+- 合并手动/自定义 models
+- 产出聚合后的 `ProviderCatalog`
 
 ## 8.2 catalog 输出给前端的结构
 

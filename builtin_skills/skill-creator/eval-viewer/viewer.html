@@ -1,12 +1,9 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Eval Review</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@500;600&family=Lora:wght@400;500&display=swap" rel="stylesheet">
+  <title>评估结果审核</title>
   <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js" integrity="sha384-EnyY0/GSHQGSxSgMwaIPzSESbqoOLSexfnSMN2AP+39Ckmn92stwABZynq1JyzdT" crossorigin="anonymous"></script>
   <style>
     :root {
@@ -29,7 +26,7 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      font-family: 'Lora', Georgia, serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
       background: var(--bg);
       color: var(--text);
       height: 100vh;
@@ -37,7 +34,7 @@
       flex-direction: column;
     }
 
-    /* ---- Header ---- */
+    /* ---- 顶部栏 ---- */
     .header {
       background: var(--header-bg);
       color: var(--header-text);
@@ -48,7 +45,6 @@
       flex-shrink: 0;
     }
     .header h1 {
-      font-family: 'Poppins', sans-serif;
       font-size: 1.25rem;
       font-weight: 600;
     }
@@ -63,7 +59,7 @@
       text-align: right;
     }
 
-    /* ---- Main content ---- */
+    /* ---- 主内容区 ---- */
     .main {
       flex: 1;
       overflow-y: auto;
@@ -73,7 +69,7 @@
       gap: 1.25rem;
     }
 
-    /* ---- Sections ---- */
+    /* ---- 分区块 ---- */
     .section {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -81,11 +77,9 @@
       flex-shrink: 0;
     }
     .section-header {
-      font-family: 'Poppins', sans-serif;
       padding: 0.75rem 1rem;
       font-size: 0.75rem;
       font-weight: 500;
-      text-transform: uppercase;
       letter-spacing: 0.05em;
       color: var(--text-muted);
       border-bottom: 1px solid var(--border);
@@ -95,15 +89,13 @@
       padding: 1rem;
     }
 
-    /* ---- Config badge ---- */
+    /* ---- 配置徽标 ---- */
     .config-badge {
       display: inline-block;
       padding: 0.2rem 0.625rem;
       border-radius: 9999px;
-      font-family: 'Poppins', sans-serif;
       font-size: 0.6875rem;
       font-weight: 600;
-      text-transform: uppercase;
       letter-spacing: 0.03em;
       margin-left: 0.75rem;
       vertical-align: middle;
@@ -117,14 +109,14 @@
       color: #f57f17;
     }
 
-    /* ---- Prompt ---- */
+    /* ---- 提示词 ---- */
     .prompt-text {
       white-space: pre-wrap;
       font-size: 0.9375rem;
       line-height: 1.6;
     }
 
-    /* ---- Outputs ---- */
+    /* ---- 输出结果 ---- */
     .output-file {
       border: 1px solid var(--border);
       border-radius: var(--radius);
@@ -150,7 +142,7 @@
       color: var(--accent);
       text-decoration: none;
       cursor: pointer;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
       font-weight: 500;
       opacity: 0.8;
     }
@@ -217,7 +209,7 @@
       text-align: center;
     }
 
-    /* ---- Feedback ---- */
+    /* ---- 反馈 ---- */
     .prev-feedback {
       background: var(--bg);
       border: 1px solid var(--border);
@@ -231,7 +223,6 @@
     .prev-feedback-label {
       font-size: 0.7rem;
       font-weight: 600;
-      text-transform: uppercase;
       letter-spacing: 0.04em;
       margin-bottom: 0.25rem;
       color: var(--text-muted);
@@ -260,7 +251,7 @@
       min-height: 1.1em;
     }
 
-    /* ---- Grades (collapsible) ---- */
+    /* ---- 评分（可折叠） ---- */
     .grades-toggle {
       display: flex;
       align-items: center;
@@ -323,7 +314,7 @@
       padding-left: 1.5rem;
     }
 
-    /* ---- View tabs ---- */
+    /* ---- 视图切换标签 ---- */
     .view-tabs {
       display: flex;
       gap: 0;
@@ -333,7 +324,6 @@
       flex-shrink: 0;
     }
     .view-tab {
-      font-family: 'Poppins', sans-serif;
       padding: 0.625rem 1.25rem;
       font-size: 0.8125rem;
       font-weight: 500;
@@ -352,7 +342,7 @@
     .view-panel { display: none; }
     .view-panel.active { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
 
-    /* ---- Benchmark view ---- */
+    /* ---- 基准测试视图 ---- */
     .benchmark-view {
       padding: 1.5rem 2rem;
       overflow-y: auto;
@@ -373,12 +363,10 @@
       border: 1px solid var(--border);
     }
     .benchmark-table th {
-      font-family: 'Poppins', sans-serif;
       background: var(--header-bg);
       color: var(--header-text);
       font-weight: 500;
       font-size: 0.75rem;
-      text-transform: uppercase;
       letter-spacing: 0.04em;
     }
     .benchmark-table tr:hover { background: var(--bg); }
@@ -398,7 +386,6 @@
       padding: 1rem;
     }
     .benchmark-notes h3 {
-      font-family: 'Poppins', sans-serif;
       font-size: 0.875rem;
       margin-bottom: 0.75rem;
     }
@@ -418,7 +405,7 @@
       padding: 3rem;
     }
 
-    /* ---- Navigation ---- */
+    /* ---- 底部导航 ---- */
     .nav {
       display: flex;
       justify-content: space-between;
@@ -429,7 +416,6 @@
       flex-shrink: 0;
     }
     .nav-btn {
-      font-family: 'Poppins', sans-serif;
       padding: 0.5rem 1.25rem;
       border: 1px solid var(--border);
       border-radius: var(--radius);
@@ -449,7 +435,6 @@
       cursor: not-allowed;
     }
     .done-btn {
-      font-family: 'Poppins', sans-serif;
       padding: 0.5rem 1.5rem;
       border: 1px solid var(--border);
       border-radius: var(--radius);
@@ -473,7 +458,7 @@
     .done-btn.ready:hover {
       background: var(--accent-hover);
     }
-    /* ---- Done overlay ---- */
+    /* ---- 完成弹层 ---- */
     .done-overlay {
       display: none;
       position: fixed;
@@ -519,7 +504,7 @@
     .done-card button:hover {
       background: var(--bg);
     }
-    /* ---- Toast ---- */
+    /* ---- 轻提示 ---- */
     .toast {
       position: fixed;
       bottom: 5rem;
@@ -544,71 +529,71 @@
   <div id="app" style="height:100vh; display:flex; flex-direction:column;">
     <div class="header">
       <div>
-        <h1>Eval Review: <span id="skill-name"></span></h1>
-        <div class="instructions">Review each output and leave feedback below. Navigate with arrow keys or buttons. When done, copy feedback and paste into Claude Code.</div>
+        <h1>评估结果审核：<span id="skill-name"></span></h1>
+        <div class="instructions">逐条查看每个输出并在下方留下反馈。可使用方向键或按钮切换。全部完成后，复制反馈内容并粘贴回 Claude Code。</div>
       </div>
       <div class="progress" id="progress"></div>
     </div>
 
-    <!-- View tabs (only shown when benchmark data exists) -->
+    <!-- 视图切换标签（仅在有基准测试数据时显示） -->
     <div class="view-tabs" id="view-tabs" style="display:none;">
-      <button class="view-tab active" onclick="switchView('outputs')">Outputs</button>
-      <button class="view-tab" onclick="switchView('benchmark')">Benchmark</button>
+      <button class="view-tab active" onclick="switchView('outputs')">输出结果</button>
+      <button class="view-tab" onclick="switchView('benchmark')">基准测试</button>
     </div>
 
-    <!-- Outputs panel (qualitative review) -->
+    <!-- 输出结果面板（定性评审） -->
     <div class="view-panel active" id="panel-outputs">
     <div class="main">
-      <!-- Prompt -->
+      <!-- 提示词 -->
       <div class="section">
-        <div class="section-header">Prompt <span class="config-badge" id="config-badge" style="display:none;"></span></div>
+        <div class="section-header">提示词 <span class="config-badge" id="config-badge" style="display:none;"></span></div>
         <div class="section-body">
           <div class="prompt-text" id="prompt-text"></div>
         </div>
       </div>
 
-      <!-- Outputs -->
+      <!-- 输出 -->
       <div class="section">
-        <div class="section-header">Output</div>
+        <div class="section-header">输出</div>
         <div class="section-body" id="outputs-body">
-          <div class="empty-state">No output files found</div>
+          <div class="empty-state">未找到输出文件</div>
         </div>
       </div>
 
-      <!-- Previous Output (collapsible) -->
+      <!-- 上一轮输出（可折叠） -->
       <div class="section" id="prev-outputs-section" style="display:none;">
         <div class="section-header">
           <div class="grades-toggle" onclick="togglePrevOutputs()">
             <span class="arrow" id="prev-outputs-arrow">&#9654;</span>
-            Previous Output
+            上一轮输出
           </div>
         </div>
         <div class="grades-content" id="prev-outputs-content"></div>
       </div>
 
-      <!-- Grades (collapsible) -->
+      <!-- 正式评分（可折叠） -->
       <div class="section" id="grades-section" style="display:none;">
         <div class="section-header">
           <div class="grades-toggle" onclick="toggleGrades()">
             <span class="arrow" id="grades-arrow">&#9654;</span>
-            Formal Grades
+            正式评分
           </div>
         </div>
         <div class="grades-content" id="grades-content"></div>
       </div>
 
-      <!-- Feedback -->
+      <!-- 反馈 -->
       <div class="section">
-        <div class="section-header">Your Feedback</div>
+        <div class="section-header">你的反馈</div>
         <div class="section-body">
           <textarea
             class="feedback-textarea"
             id="feedback"
-            placeholder="What do you think of this output? Any issues, suggestions, or things that look great?"
+            placeholder="这个输出效果如何？有什么问题、建议，或哪些地方做得不错？"
           ></textarea>
           <div class="feedback-status" id="feedback-status"></div>
           <div class="prev-feedback" id="prev-feedback" style="display:none;">
-            <div class="prev-feedback-label">Previous feedback</div>
+            <div class="prev-feedback-label">上一轮反馈</div>
             <div id="prev-feedback-text"></div>
           </div>
         </div>
@@ -616,49 +601,60 @@
     </div>
 
     <div class="nav" id="outputs-nav">
-      <button class="nav-btn" id="prev-btn" onclick="navigate(-1)">&#8592; Previous</button>
-      <button class="done-btn" id="done-btn" onclick="showDoneDialog()">Submit All Reviews</button>
-      <button class="nav-btn" id="next-btn" onclick="navigate(1)">Next &#8594;</button>
+      <button class="nav-btn" id="prev-btn" onclick="navigate(-1)">&#8592; 上一条</button>
+      <button class="done-btn" id="done-btn" onclick="showDoneDialog()">提交全部评审</button>
+      <button class="nav-btn" id="next-btn" onclick="navigate(1)">下一条 &#8594;</button>
     </div>
-    </div><!-- end panel-outputs -->
+    </div><!-- panel-outputs 结束 -->
 
-    <!-- Benchmark panel (quantitative stats) -->
+    <!-- 基准测试面板（定量统计） -->
     <div class="view-panel" id="panel-benchmark">
       <div class="benchmark-view" id="benchmark-content">
-        <div class="benchmark-empty">No benchmark data available. Run a benchmark to see quantitative results here.</div>
+        <div class="benchmark-empty">暂无基准测试数据。运行一次基准测试后，这里会展示定量结果。</div>
       </div>
     </div>
   </div>
 
-  <!-- Done overlay -->
+  <!-- 完成弹层 -->
   <div class="done-overlay" id="done-overlay">
     <div class="done-card">
-      <h2>Review Complete</h2>
-      <p>Your feedback has been saved. Go back to your Claude Code session and tell Claude you're done reviewing.</p>
+      <h2>评审完成</h2>
+      <p>你的反馈已保存。请回到 Claude Code 会话，告诉 Claude 评审已完成。</p>
       <div class="btn-row">
-        <button onclick="closeDoneDialog()">OK</button>
+        <button onclick="closeDoneDialog()">好的</button>
       </div>
     </div>
   </div>
 
-  <!-- Toast -->
+  <!-- 轻提示 -->
   <div class="toast" id="toast"></div>
 
   <script>
-    // ---- Embedded data (injected by generate_review.py) ----
+    // ---- 内嵌数据（由 generate_review.py 注入） ----
     /*__EMBEDDED_DATA__*/
 
-    // ---- State ----
-    let feedbackMap = {};  // run_id -> feedback text
+    // ---- 状态 ----
+    let feedbackMap = {};  // run_id -> 反馈文本
     let currentIndex = 0;
     let visitedRuns = new Set();
 
-    // ---- Init ----
+    // 运行配置 ID 到中文标签的映射
+    const CONFIG_LABELS = {
+      with_skill: "启用技能",
+      without_skill: "未启用技能",
+      new_skill: "新技能",
+      old_skill: "旧技能",
+    };
+    function configLabel(config) {
+      return CONFIG_LABELS[config]
+        || config.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+    }
+
+    // ---- 初始化 ----
     async function init() {
-      // Load saved feedback from server — but only if this isn't a fresh
-      // iteration (indicated by previous_feedback being present). When
-      // previous feedback exists, the feedback.json on disk is stale from
-      // the prior iteration and should not pre-fill the textareas.
+      // 从服务器加载已保存的反馈——但仅当这不是全新一轮迭代时
+      // （以是否存在 previous_feedback 为标志）。存在上一轮反馈时，
+      // 磁盘上的 feedback.json 是上一轮的旧数据，不应回填到输入框。
       const hasPrevious = Object.keys(EMBEDDED_DATA.previous_feedback || {}).length > 0
         || Object.keys(EMBEDDED_DATA.previous_outputs || {}).length > 0;
       if (!hasPrevious) {
@@ -668,13 +664,13 @@
           if (data.reviews) {
             for (const r of data.reviews) feedbackMap[r.run_id] = r.feedback;
           }
-        } catch { /* first run, no feedback yet */ }
+        } catch { /* 首次运行，还没有反馈 */ }
       }
 
       document.getElementById("skill-name").textContent = EMBEDDED_DATA.skill_name;
       showRun(0);
 
-      // Wire up feedback auto-save
+      // 绑定反馈自动保存
       const textarea = document.getElementById("feedback");
       let saveTimeout = null;
       textarea.addEventListener("input", () => {
@@ -684,7 +680,7 @@
       });
     }
 
-    // ---- Navigation ----
+    // ---- 导航 ----
     function navigate(delta) {
       const newIndex = currentIndex + delta;
       if (newIndex >= 0 && newIndex < EMBEDDED_DATA.runs.length) {
@@ -699,41 +695,41 @@
         currentIndex === EMBEDDED_DATA.runs.length - 1;
     }
 
-    // ---- Show a run ----
+    // ---- 展示一条运行记录 ----
     function showRun(index) {
       currentIndex = index;
       const run = EMBEDDED_DATA.runs[index];
 
-      // Progress
+      // 进度
       document.getElementById("progress").textContent =
-        `${index + 1} of ${EMBEDDED_DATA.runs.length}`;
+        `第 ${index + 1} / ${EMBEDDED_DATA.runs.length} 条`;
 
-      // Prompt
+      // 提示词
       document.getElementById("prompt-text").textContent = run.prompt;
 
-      // Config badge
+      // 配置徽标
       const badge = document.getElementById("config-badge");
       const configMatch = run.id.match(/(with_skill|without_skill|new_skill|old_skill)/);
       if (configMatch) {
         const config = configMatch[1];
         const isBaseline = config === "without_skill" || config === "old_skill";
-        badge.textContent = config.replace(/_/g, " ");
+        badge.textContent = configLabel(config);
         badge.className = "config-badge " + (isBaseline ? "config-baseline" : "config-primary");
         badge.style.display = "inline-block";
       } else {
         badge.style.display = "none";
       }
 
-      // Outputs
+      // 输出
       renderOutputs(run);
 
-      // Previous outputs
+      // 上一轮输出
       renderPrevOutputs(run);
 
-      // Grades
+      // 评分
       renderGrades(run);
 
-      // Previous feedback
+      // 上一轮反馈
       const prevFb = (EMBEDDED_DATA.previous_feedback || {})[run.id];
       const prevEl = document.getElementById("prev-feedback");
       if (prevFb) {
@@ -743,31 +739,31 @@
         prevEl.style.display = "none";
       }
 
-      // Feedback
+      // 反馈
       document.getElementById("feedback").value = feedbackMap[run.id] || "";
       document.getElementById("feedback-status").textContent = "";
 
       updateNavButtons();
 
-      // Track visited runs and promote done button when all visited
+      // 记录已访问的运行记录，全部访问过后点亮完成按钮
       visitedRuns.add(index);
       const doneBtn = document.getElementById("done-btn");
       if (visitedRuns.size >= EMBEDDED_DATA.runs.length) {
         doneBtn.classList.add("ready");
       }
 
-      // Scroll main content to top
+      // 主内容区滚动回顶部
       document.querySelector(".main").scrollTop = 0;
     }
 
-    // ---- Render outputs ----
+    // ---- 渲染输出 ----
     function renderOutputs(run) {
       const container = document.getElementById("outputs-body");
       container.innerHTML = "";
 
       const outputs = run.outputs || [];
       if (outputs.length === 0) {
-        container.innerHTML = '<div class="empty-state">No output files</div>';
+        container.innerHTML = '<div class="empty-state">暂无输出文件</div>';
         return;
       }
 
@@ -775,7 +771,7 @@
         const fileDiv = document.createElement("div");
         fileDiv.className = "output-file";
 
-        // Always show file header with download link
+        // 始终显示带下载链接的文件头
         const header = document.createElement("div");
         header.className = "output-file-header";
         const nameSpan = document.createElement("span");
@@ -783,7 +779,7 @@
         header.appendChild(nameSpan);
         const dlBtn = document.createElement("a");
         dlBtn.className = "dl-btn";
-        dlBtn.textContent = "Download";
+        dlBtn.textContent = "下载";
         dlBtn.download = file.name;
         dlBtn.href = getDownloadUri(file);
         header.appendChild(dlBtn);
@@ -812,7 +808,7 @@
           a.className = "download-link";
           a.href = file.data_uri;
           a.download = file.name;
-          a.textContent = "Download " + file.name;
+          a.textContent = "下载 " + file.name;
           content.appendChild(a);
         } else if (file.type === "error") {
           const pre = document.createElement("pre");
@@ -826,7 +822,7 @@
       }
     }
 
-    // ---- XLSX rendering via SheetJS ----
+    // ---- 通过 SheetJS 渲染 XLSX ----
     function renderXlsx(container, b64Data) {
       try {
         const raw = Uint8Array.from(atob(b64Data), c => c.charCodeAt(0));
@@ -840,7 +836,7 @@
             const sheetLabel = document.createElement("div");
             sheetLabel.style.cssText =
               "font-weight:600; font-size:0.8rem; color:#b0aea5; margin-top:0.5rem; margin-bottom:0.25rem;";
-            sheetLabel.textContent = "Sheet: " + sheetName;
+            sheetLabel.textContent = "工作表：" + sheetName;
             container.appendChild(sheetLabel);
           }
 
@@ -850,11 +846,11 @@
           container.appendChild(wrapper);
         }
       } catch (err) {
-        container.textContent = "Error rendering spreadsheet: " + err.message;
+        container.textContent = "渲染电子表格失败：" + err.message;
       }
     }
 
-    // ---- Grades ----
+    // ---- 评分 ----
     function renderGrades(run) {
       const section = document.getElementById("grades-section");
       const content = document.getElementById("grades-content");
@@ -866,7 +862,7 @@
 
       const grading = run.grading;
       section.style.display = "block";
-      // Reset to collapsed
+      // 重置为折叠状态
       content.classList.remove("open");
       document.getElementById("grades-arrow").classList.remove("open");
 
@@ -875,17 +871,17 @@
 
       let html = '<div style="padding: 1rem;">';
 
-      // Summary line
+      // 汇总行
       const passRate = summary.pass_rate != null
         ? Math.round(summary.pass_rate * 100) + "%"
         : "?";
       const badgeClass = summary.pass_rate >= 0.8 ? "grade-pass" : summary.pass_rate >= 0.5 ? "" : "grade-fail";
       html += '<div class="grades-summary">';
       html += '<span class="grade-badge ' + badgeClass + '">' + passRate + '</span>';
-      html += '<span>' + (summary.passed || 0) + ' passed, ' + (summary.failed || 0) + ' failed of ' + (summary.total || 0) + '</span>';
+      html += '<span>共 ' + (summary.total || 0) + ' 项：' + (summary.passed || 0) + ' 项通过，' + (summary.failed || 0) + ' 项未通过</span>';
       html += '</div>';
 
-      // Assertions list
+      // 断言列表
       html += '<ul class="assertion-list">';
       for (const exp of expectations) {
         const statusClass = exp.passed ? "pass" : "fail";
@@ -911,7 +907,7 @@
       arrow.classList.toggle("open");
     }
 
-    // ---- Previous outputs (collapsible) ----
+    // ---- 上一轮输出（可折叠） ----
     function renderPrevOutputs(run) {
       const section = document.getElementById("prev-outputs-section");
       const content = document.getElementById("prev-outputs-content");
@@ -923,11 +919,11 @@
       }
 
       section.style.display = "block";
-      // Reset to collapsed
+      // 重置为折叠状态
       content.classList.remove("open");
       document.getElementById("prev-outputs-arrow").classList.remove("open");
 
-      // Render the files into the content area
+      // 将文件渲染到内容区
       content.innerHTML = "";
       const wrapper = document.createElement("div");
       wrapper.style.padding = "1rem";
@@ -943,7 +939,7 @@
         header.appendChild(nameSpan);
         const dlBtn = document.createElement("a");
         dlBtn.className = "dl-btn";
-        dlBtn.textContent = "Download";
+        dlBtn.textContent = "下载";
         dlBtn.download = file.name;
         dlBtn.href = getDownloadUri(file);
         header.appendChild(dlBtn);
@@ -972,7 +968,7 @@
           a.className = "download-link";
           a.href = file.data_uri;
           a.download = file.name;
-          a.textContent = "Download " + file.name;
+          a.textContent = "下载 " + file.name;
           fc.appendChild(a);
         }
 
@@ -990,7 +986,7 @@
       arrow.classList.toggle("open");
     }
 
-    // ---- Feedback (saved to server -> feedback.json) ----
+    // ---- 反馈（保存到服务器 -> feedback.json） ----
     function saveCurrentFeedback() {
       const run = EMBEDDED_DATA.runs[currentIndex];
       const text = document.getElementById("feedback").value;
@@ -1001,7 +997,7 @@
         feedbackMap[run.id] = text;
       }
 
-      // Build reviews array from map
+      // 由 map 构建评论数组
       const reviews = [];
       for (const [run_id, feedback] of Object.entries(feedbackMap)) {
         if (feedback.trim()) {
@@ -1014,17 +1010,17 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reviews, status: "in_progress" }),
       }).then(() => {
-        document.getElementById("feedback-status").textContent = "Saved";
+        document.getElementById("feedback-status").textContent = "已保存";
       }).catch(() => {
-        // Static mode or server unavailable — no-op on auto-save,
-        // feedback will be downloaded on final submit
-        document.getElementById("feedback-status").textContent = "Will download on submit";
+        // 静态模式或服务器不可用——自动保存失败时不做处理，
+        // 反馈会在最终提交时以文件形式下载
+        document.getElementById("feedback-status").textContent = "提交时下载";
       });
     }
 
-    // ---- Done ----
+    // ---- 完成 ----
     function showDoneDialog() {
-      // Save current textarea to feedbackMap (but don't POST yet)
+      // 把当前输入框内容存入 feedbackMap（但暂不 POST）
       const run = EMBEDDED_DATA.runs[currentIndex];
       const text = document.getElementById("feedback").value;
       if (text.trim() === "") {
@@ -1033,8 +1029,8 @@
         feedbackMap[run.id] = text;
       }
 
-      // POST once with status: complete — include ALL runs so the model
-      // can distinguish "no feedback" (looks good) from "not reviewed"
+      // 以 status: complete 一次性 POST——包含所有运行记录，
+      // 让模型能区分“没有反馈”（效果不错）和“未评审”
       const reviews = [];
       const ts = new Date().toISOString();
       for (const r of EMBEDDED_DATA.runs) {
@@ -1048,7 +1044,7 @@
       }).then(() => {
         document.getElementById("done-overlay").classList.add("visible");
       }).catch(() => {
-        // Server not available (static mode) — download as file
+        // 服务器不可用（静态模式）——改为下载文件
         const blob = new Blob([payload], { type: "application/json" });
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
@@ -1061,12 +1057,12 @@
     }
 
     function closeDoneDialog() {
-      // Reset status back to in_progress
+      // 状态重置回 in_progress
       saveCurrentFeedback();
       document.getElementById("done-overlay").classList.remove("visible");
     }
 
-    // ---- Toast ----
+    // ---- 轻提示 ----
     function showToast(message) {
       const toast = document.getElementById("toast");
       toast.textContent = message;
@@ -1074,9 +1070,9 @@
       setTimeout(() => toast.classList.remove("visible"), 2000);
     }
 
-    // ---- Keyboard nav ----
+    // ---- 键盘导航 ----
     document.addEventListener("keydown", (e) => {
-      // Don't capture when typing in textarea
+      // 在输入框中输入时不拦截按键
       if (e.target.tagName === "TEXTAREA") return;
 
       if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
@@ -1088,7 +1084,7 @@
       }
     });
 
-    // ---- Util ----
+    // ---- 工具函数 ----
     function getDownloadUri(file) {
       if (file.data_uri) return file.data_uri;
       if (file.data_b64) return "data:application/octet-stream;base64," + file.data_b64;
@@ -1102,7 +1098,7 @@
       return div.innerHTML;
     }
 
-    // ---- View switching ----
+    // ---- 视图切换 ----
     function switchView(view) {
       document.querySelectorAll(".view-tab").forEach(t => t.classList.remove("active"));
       document.querySelectorAll(".view-panel").forEach(p => p.classList.remove("active"));
@@ -1110,12 +1106,12 @@
       document.getElementById("panel-" + view).classList.add("active");
     }
 
-    // ---- Benchmark rendering ----
+    // ---- 基准测试渲染 ----
     function renderBenchmark() {
       const data = EMBEDDED_DATA.benchmark;
       if (!data) return;
 
-      // Show the tabs
+      // 显示切换标签
       document.getElementById("view-tabs").style.display = "flex";
 
       const container = document.getElementById("benchmark-content");
@@ -1125,16 +1121,16 @@
 
       let html = "";
 
-      // Header
-      html += "<h2 style='font-family: Poppins, sans-serif; margin-bottom: 0.5rem;'>Benchmark Results</h2>";
+      // 头部
+      html += "<h2 style='margin-bottom: 0.5rem;'>基准测试结果</h2>";
       html += "<p style='color: var(--text-muted); font-size: 0.875rem; margin-bottom: 1.25rem;'>";
       if (metadata.skill_name) html += "<strong>" + escapeHtml(metadata.skill_name) + "</strong> &mdash; ";
       if (metadata.timestamp) html += metadata.timestamp + " &mdash; ";
-      if (metadata.evals_run) html += "Evals: " + metadata.evals_run.join(", ") + " &mdash; ";
-      html += (metadata.runs_per_configuration || "?") + " runs per configuration";
+      if (metadata.evals_run) html += "评估集：" + metadata.evals_run.join("、") + " &mdash; ";
+      html += "每个配置运行 " + (metadata.runs_per_configuration || "?") + " 次";
       html += "</p>";
 
-      // Summary table
+      // 汇总表
       html += '<table class="benchmark-table">';
 
       function fmtStat(stat, pct) {
@@ -1153,35 +1149,35 @@
         return "";
       }
 
-      // Discover config names dynamically (everything except "delta")
+      // 动态发现配置名（除 "delta" 以外的所有键）
       const configs = Object.keys(summary).filter(k => k !== "delta");
       const configA = configs[0] || "config_a";
       const configB = configs[1] || "config_b";
-      const labelA = configA.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-      const labelB = configB.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+      const labelA = configLabel(configA);
+      const labelB = configLabel(configB);
       const a = summary[configA] || {};
       const b = summary[configB] || {};
       const delta = summary.delta || {};
 
-      html += "<thead><tr><th>Metric</th><th>" + escapeHtml(labelA) + "</th><th>" + escapeHtml(labelB) + "</th><th>Delta</th></tr></thead>";
+      html += "<thead><tr><th>指标</th><th>" + escapeHtml(labelA) + "</th><th>" + escapeHtml(labelB) + "</th><th>差值</th></tr></thead>";
       html += "<tbody>";
 
-      html += "<tr><td><strong>Pass Rate</strong></td>";
+      html += "<tr><td><strong>通过率</strong></td>";
       html += "<td>" + fmtStat(a.pass_rate, true) + "</td>";
       html += "<td>" + fmtStat(b.pass_rate, true) + "</td>";
       html += '<td class="' + deltaClass(delta.pass_rate) + '">' + (delta.pass_rate || "—") + "</td></tr>";
 
-      // Time (only show row if data exists)
+      // 耗时（仅有数据时显示该行）
       if (a.time_seconds || b.time_seconds) {
-        html += "<tr><td><strong>Time (s)</strong></td>";
+        html += "<tr><td><strong>耗时（秒）</strong></td>";
         html += "<td>" + fmtStat(a.time_seconds, false) + "</td>";
         html += "<td>" + fmtStat(b.time_seconds, false) + "</td>";
         html += '<td class="' + deltaClass(delta.time_seconds) + '">' + (delta.time_seconds ? delta.time_seconds + "s" : "—") + "</td></tr>";
       }
 
-      // Tokens (only show row if data exists)
+      // Token 数（仅有数据时显示该行）
       if (a.tokens || b.tokens) {
-        html += "<tr><td><strong>Tokens</strong></td>";
+        html += "<tr><td><strong>Token 数</strong></td>";
         html += "<td>" + fmtStat(a.tokens, false) + "</td>";
         html += "<td>" + fmtStat(b.tokens, false) + "</td>";
         html += '<td class="' + deltaClass(delta.tokens) + '">' + (delta.tokens || "—") + "</td></tr>";
@@ -1189,29 +1185,29 @@
 
       html += "</tbody></table>";
 
-      // Per-eval breakdown (if runs data available)
+      // 逐个评估的明细（有运行数据时显示）
       const runs = data.runs || [];
       if (runs.length > 0) {
         const evalIds = [...new Set(runs.map(r => r.eval_id))].sort((a, b) => a - b);
 
-        html += "<h3 style='font-family: Poppins, sans-serif; margin-bottom: 0.75rem;'>Per-Eval Breakdown</h3>";
+        html += "<h3 style='margin-bottom: 0.75rem;'>逐项评估明细</h3>";
 
         const hasTime = runs.some(r => r.result && r.result.time_seconds != null);
         const hasErrors = runs.some(r => r.result && r.result.errors > 0);
 
         for (const evalId of evalIds) {
           const evalRuns = runs.filter(r => r.eval_id === evalId);
-          const evalName = evalRuns[0] && evalRuns[0].eval_name ? evalRuns[0].eval_name : "Eval " + evalId;
+          const evalName = evalRuns[0] && evalRuns[0].eval_name ? evalRuns[0].eval_name : "评估 " + evalId;
 
-          html += "<h4 style='font-family: Poppins, sans-serif; margin: 1rem 0 0.5rem; color: var(--text);'>" + escapeHtml(evalName) + "</h4>";
+          html += "<h4 style='margin: 1rem 0 0.5rem; color: var(--text);'>" + escapeHtml(evalName) + "</h4>";
           html += '<table class="benchmark-table">';
-          html += "<thead><tr><th>Config</th><th>Run</th><th>Pass Rate</th>";
-          if (hasTime) html += "<th>Time (s)</th>";
-          if (hasErrors) html += "<th>Crashes During Execution</th>";
+          html += "<thead><tr><th>配置</th><th>运行</th><th>通过率</th>";
+          if (hasTime) html += "<th>耗时（秒）</th>";
+          if (hasErrors) html += "<th>执行期间崩溃次数</th>";
           html += "</tr></thead>";
           html += "<tbody>";
 
-          // Group by config and render with average rows
+          // 按配置分组渲染，并附带平均值行
           const configGroups = [...new Set(evalRuns.map(r => r.configuration))];
           for (let ci = 0; ci < configGroups.length; ci++) {
             const config = configGroups[ci];
@@ -1219,13 +1215,13 @@
             if (configRuns.length === 0) continue;
 
             const rowClass = ci === 0 ? "benchmark-row-with" : "benchmark-row-without";
-            const configLabel = config.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+            const cfgLabel = configLabel(config);
 
             for (const run of configRuns) {
               const r = run.result || {};
               const prClass = r.pass_rate >= 0.8 ? "benchmark-delta-positive" : r.pass_rate < 0.5 ? "benchmark-delta-negative" : "";
               html += '<tr class="' + rowClass + '">';
-              html += "<td>" + configLabel + "</td>";
+              html += "<td>" + cfgLabel + "</td>";
               html += "<td>" + run.run_number + "</td>";
               html += '<td class="' + prClass + '">' + ((r.pass_rate || 0) * 100).toFixed(0) + "% (" + (r.passed || 0) + "/" + (r.total || 0) + ")</td>";
               if (hasTime) html += "<td>" + (r.time_seconds != null ? r.time_seconds.toFixed(1) : "—") + "</td>";
@@ -1233,13 +1229,13 @@
               html += "</tr>";
             }
 
-            // Average row
+            // 平均值行
             const rates = configRuns.map(r => (r.result || {}).pass_rate || 0);
             const avgRate = rates.reduce((a, b) => a + b, 0) / rates.length;
             const avgPrClass = avgRate >= 0.8 ? "benchmark-delta-positive" : avgRate < 0.5 ? "benchmark-delta-negative" : "";
             html += '<tr class="benchmark-row-avg ' + rowClass + '">';
-            html += "<td>" + configLabel + "</td>";
-            html += "<td>Avg</td>";
+            html += "<td>" + cfgLabel + "</td>";
+            html += "<td>平均</td>";
             html += '<td class="' + avgPrClass + '">' + (avgRate * 100).toFixed(0) + "%</td>";
             if (hasTime) {
               const times = configRuns.map(r => (r.result || {}).time_seconds).filter(t => t != null);
@@ -1250,14 +1246,14 @@
           }
           html += "</tbody></table>";
 
-          // Per-assertion detail for this eval
+          // 该评估的逐断言明细
           const runsWithExpectations = {};
           for (const config of configGroups) {
             runsWithExpectations[config] = evalRuns.filter(r => r.configuration === config && r.expectations && r.expectations.length > 0);
           }
           const hasAnyExpectations = Object.values(runsWithExpectations).some(runs => runs.length > 0);
           if (hasAnyExpectations) {
-            // Collect all unique assertion texts across all configs
+            // 收集所有配置下出现过的去重断言文本
             const allAssertions = [];
             const seen = new Set();
             for (const config of configGroups) {
@@ -1272,10 +1268,9 @@
             }
 
             html += '<table class="benchmark-table" style="margin-top: 0.5rem;">';
-            html += "<thead><tr><th>Assertion</th>";
+            html += "<thead><tr><th>断言</th>";
             for (const config of configGroups) {
-              const label = config.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-              html += "<th>" + escapeHtml(label) + "</th>";
+              html += "<th>" + escapeHtml(configLabel(config)) + "</th>";
             }
             html += "</tr></thead><tbody>";
 
@@ -1289,7 +1284,7 @@
                   if (exp) {
                     const cls = exp.passed ? "benchmark-delta-positive" : "benchmark-delta-negative";
                     const icon = exp.passed ? "\u2713" : "\u2717";
-                    html += '<span class="' + cls + '" title="Run ' + run.run_number + ': ' + escapeHtml(exp.evidence || "") + '">' + icon + "</span> ";
+                    html += '<span class="' + cls + '" title="第 ' + run.run_number + ' 次运行：' + escapeHtml(exp.evidence || "") + '">' + icon + "</span> ";
                   } else {
                     html += "— ";
                   }
@@ -1303,10 +1298,10 @@
         }
       }
 
-      // Notes
+      // 说明
       if (notes.length > 0) {
         html += '<div class="benchmark-notes">';
-        html += "<h3>Analysis Notes</h3>";
+        html += "<h3>分析说明</h3>";
         html += "<ul>";
         for (const note of notes) {
           html += "<li>" + escapeHtml(note) + "</li>";
@@ -1317,7 +1312,7 @@
       container.innerHTML = html;
     }
 
-    // ---- Start ----
+    // ---- 启动 ----
     init();
     renderBenchmark();
   </script>

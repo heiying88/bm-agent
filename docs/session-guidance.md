@@ -1,39 +1,16 @@
-# Queued user messages
+# 排队的用户消息
 
-The composer can submit text and images while a run is active. These messages use
-`POST /api/v1/sessions/{session_id}/guidance` rather than modifying the running
-transcript directly. The request includes a stable `id`, `text`, optional `images`
-(the ordinary chat image shape), and `mode`:
+当某个 run 处于活动状态时，输入框仍可提交文本与图片。这些消息使用 `POST /api/v1/sessions/{session_id}/guidance`，而不是直接修改正在运行的转写。请求包含稳定的 `id`、`text`、可选的 `images`（普通聊天的图片结构）以及 `mode`：
 
-- `after_round` (default): admit before the next available model call.
-- `after_run`: leave the message pending while its recorded activation run owns
-  the session, then admit it under a successor run. This is a run boundary, not a
-  condition that the entire Goal has been achieved.
+- `after_round`（默认）：在下一次可用的模型调用之前准入。
+- `after_run`：在其记录的激活 run 拥有该 session 期间让消息保持待处理，随后在一个后继 run 下准入。这是一个 run 边界，并不表示整个 Goal 已经达成。
 
-The queue uses the normal durable inbox and single-owner activation router.
-Finalization checks authorized pending work as well as the transcript cursor, so
-later round messages cannot hide an earlier deferred message. The existing
-one-successor-per-generation guard remains in effect for failing checkpoints.
-Deferred messages respect specific child or background-task waits.
+该队列使用正常的持久 inbox 与单属主激活路由器。收尾检查既会检查转写游标，也会检查已授权的待处理工作，因此较晚回合的消息无法掩盖较早的延迟消息。既有的“每 generation 仅一个后继者”防护对失败的检查点仍然生效。延迟消息尊重特定的子代或后台任务等待。
 
-Images are stored in the existing attachment directory. Immutable content and
-MIME produce repeatable attachment references so replaying a submission preserves
-its identity. Inbox envelopes contain multimodal parts with attachment references;
-the normal per-round image preparation resolves them for the provider. The HTTP
-body limit is unchanged and a queued message accepts at most 16 images.
+图片存储在既有的附件目录中。不变的内容与 MIME 会产生可重复的附件引用，因此重放一次提交仍会保持其身份。inbox 信封包含带附件引用的多模态部件；正常的每回合图片准备会为 provider 解析它们。HTTP 主体上限不变，一条排队消息至多接受 16 张图片。
 
-`GET` on the same route lists pending text, mode, image attachment ids and creation
-time. `DELETE /guidance/{id}` withdraws an unclaimed message. Cancellation retains
-the deduplication receipt; attachments are retained because another message may
-reference the same content.
+同一路由上的 `GET` 会列出待处理文本、mode、图片附件 id 与创建时间。`DELETE /guidance/{id}` 撤回一条尚未被认领的消息。取消会保留去重回执；附件仍会保留，因为其他消息可能引用相同的内容。
 
-The UI keeps accepted items in a collapsed queue menu with image previews. It
-clears composer text and attachments only after a matching acknowledgement and
-only when their draft revisions are unchanged. Retry receipts store a payload
-fingerprint, not image bytes, in browser session storage. Queued content survives
-reload through the server inbox; unsubmitted image drafts remain browser-local.
+UI 把已接受的条目保存在带图片预览的折叠队列菜单中。只有在收到匹配的确认、且它们的草稿修订未变化时，它才会清空输入框文本与附件。重试回执在浏览器 session storage 中存储载荷指纹而不是图片字节。排队内容经由服务端 inbox 在重新加载后仍然保留；未提交的图片草稿仍留在浏览器本地。
 
-Goal commands use the existing chat command handler. `/goal` opens the settings
-for the current session; `/goal <objective>` sets and advances a goal, and control
-commands such as `/goal off` and `/goal clear` follow the server's response without
-starting an unwanted execution.
+Goal 命令使用既有的聊天命令处理器。`/goal` 打开当前 session 的设置；`/goal <objective>` 设定并推进目标，而 `/goal off`、`/goal clear` 等控制命令只跟随服务端响应，不会启动多余的执行。

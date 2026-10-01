@@ -1,16 +1,16 @@
 ---
 name: plan
-description: Build an executable implementation, migration, or rollout plan from read-only repository exploration, including constraints, dependencies, ordered changes, verification, risks, and rollback points. Use when the user asks for a plan or decomposition before implementation; do not use when they want a small change implemented now, a status summary, or a general explanation.
+description: 基于只读的仓库探索，制定可执行的实现、迁移或发布计划，涵盖约束、依赖、有序的变更、验证、风险与回滚点。当用户要求在实现之前先出计划或做拆解时使用；当用户想立刻实现一个小改动、要状态总结或一般性解释时不要使用。
 ---
 
-# Plan
+# 规划
 
-Explore without modifying files or external state.
+在不修改文件或外部状态的前提下探索。
 
-1. Define the desired outcome, scope, non-goals, and acceptance criteria from the request.
-2. Inspect repository instructions, current implementation, tests, interfaces, and related work. Resolve inexpensive factual unknowns from source before asking questions.
-3. Identify dependencies, sequencing constraints, compatibility boundaries, data migrations, permissions, and rollout or rollback needs.
-4. Produce ordered, implementation-ready steps. Name concrete files or components, describe the contract changed at each step, and attach verification to the step that creates the risk.
-5. Call out assumptions, open decisions, and failure modes. Ask only when a missing decision would materially change the plan.
+1. 从请求中界定期望结果、范围、非目标和验收标准。
+2. 检查仓库指令、当前实现、测试、接口和相关工作。先从源码解决低成本的事实性未知，再考虑提问。
+3. 识别依赖、顺序约束、兼容性边界、数据迁移、权限，以及发布或回滚需求。
+4. 产出有序、可直接实施的步骤。指明具体的文件或组件，描述每一步改变的契约，并把验证附着到产生风险的那一步。
+5. 明确指出假设、未决决策和失败模式。只有当缺失的决策会实质改变计划时才提问。
 
-Do not edit code, claim implementation is complete, or turn the plan into hidden execution. If tools or permissions limit exploration, mark affected steps as provisional. Preserve the outcome, constraints, decisions, and remaining questions across context compaction.
+不要编辑代码、不要宣称实现已完成，也不要把计划变成暗中执行。如果工具或权限限制了探索，将受影响的步骤标记为暂定。在上下文压缩过程中保持结果、约束、决策和剩余问题不丢失。

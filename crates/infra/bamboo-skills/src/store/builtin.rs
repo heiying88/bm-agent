@@ -321,9 +321,9 @@ mod tests {
                 .find(|bundle| bundle.skill.id == id)
                 .unwrap_or_else(|| panic!("missing {id} builtin"));
             let description = bundle.skill.description.to_lowercase();
-            assert!(description.contains("use "), "{id} needs positive triggers");
+            assert!(description.contains("使用"), "{id} needs positive triggers");
             assert!(
-                description.contains("do not use"),
+                description.contains("不要"),
                 "{id} needs negative trigger boundaries"
             );
             assert!(!bundle.skill.prompt.is_empty(), "{id} needs instructions");

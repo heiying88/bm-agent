@@ -1,17 +1,17 @@
 ---
 name: review
-description: Review code changes, pull requests, patches, or a scoped code area for actionable correctness, security, compatibility, and test risks with file and line evidence. Use for review or audit requests; do not use for general proofreading, feature implementation, or debugging a reported failure when the user wants a fix.
+description: 对代码变更、pull request、补丁或指定范围的代码区域进行审查，围绕正确性、安全、兼容性与测试风险给出可执行的发现，并附文件和行号证据。用于审查或审计类请求；不要用于一般性校对、功能实现，或用户希望修复问题时的故障排查。
 ---
 
-# Review
+# 审查
 
-Review the requested scope without changing it unless the user explicitly asks for fixes.
+审查请求的范围，除非用户明确要求修复，否则不要修改它。
 
-1. Resolve the exact diff, files, revision, and repository instructions in scope.
-2. Read enough surrounding code, tests, and public contracts to judge behavior rather than style in isolation.
-3. Check correctness, data loss, security boundaries, concurrency, error handling, compatibility, and missing tests in proportion to risk.
-4. Validate suspected problems with concrete control flow, a focused command, or another direct source of evidence. For language, library, or runtime semantics, run a minimal reproducer or consult authoritative documentation instead of relying on memory. This is a hard gate: if neither verification path is available, omit the claim or state it only as an unverified coverage limit, never as a finding. Do not report speculation as a finding.
-5. Distinguish defects from documented behavior and unspecified caller expectations. Do not report a language primitive's normal semantics, a hypothetical contract, or a style preference unless the reviewed code or its callers establish that the behavior is wrong.
-6. Report only actionable findings, ordered by severity. Give each finding a precise file and line, impact, trigger, and evidence. Calibrate severity to demonstrated reachability and impact; do not label a local panic or edge case critical without evidence of a critical boundary.
+1. 确定范围内的确切 diff、文件、修订版本以及仓库指令。
+2. 阅读足够的周边代码、测试和公开契约，以便判断行为，而不是孤立地评判风格。
+3. 按风险比例检查正确性、数据丢失、安全边界、并发、错误处理、兼容性以及测试缺失。
+4. 用具体的控制流、聚焦的命令或其他直接证据源验证疑似问题。对于语言、库或运行时语义，运行最小复现或查阅权威文档，而不是依赖记忆。这是一条硬性门槛：如果两条验证路径都不可用，就省略该论断，或只将其作为未验证的覆盖局限来说明，绝不作为发现。不要把猜测当作发现上报。
+5. 区分缺陷与已文档化的行为、以及未明确规定的调用方预期。除非受审代码或其调用方证明该行为是错的，否则不要上报语言原语的正常语义、假想的契约或风格偏好。
+6. 只上报可执行的发现，按严重程度排序。每条发现给出精确的文件与行号、影响、触发条件和证据。严重程度要与已证实的可达性和影响相称；没有关键边界证据时，不要把局部 panic 或边缘情况标为 critical。
 
-If no actionable findings remain, say so plainly. Always summarize validation performed and residual risks or untested paths. If tools, permissions, or missing artifacts limit coverage, identify the limit instead of implying a complete review.
+如果没有剩余的可执行发现，就直说。始终总结已执行的验证、残余风险或未测试的路径。如果工具、权限或缺失的产物限制了覆盖范围，要指出该限制，而不是暗示完成了完整审查。

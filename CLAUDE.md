@@ -1,3 +1,3 @@
-# Claude Guidance
+# Claude 指南
 
-Read [README.md](./README.md) and [AGENTS.md](./AGENTS.md), then follow their canonical Jiandu memory contract. Do not revive Bamboo-owned memory storage, indexes, Dream bytes, embeddings, compatibility layers, or a duplicated action catalog.
+阅读 [README.md](./README.md) 和 [AGENTS.md](./AGENTS.md)，并遵循其中权威的 Jiandu 记忆契约。不要复活 Bamboo 自有的记忆存储、索引、Dream 字节、embedding、兼容层，或重复的动作目录。
