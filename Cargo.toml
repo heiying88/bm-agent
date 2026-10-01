@@ -1,0 +1,263 @@
+[workspace]
+members = [
+    ".",
+    # Core — types + interfaces
+    "crates/core/bamboo-domain",
+    "crates/core/bamboo-agent-core",
+    # Infra — independent services
+    "crates/infra/bamboo-config",
+    "crates/infra/bamboo-llm",
+    "crates/infra/bamboo-storage",
+    "crates/infra/bamboo-a2a",
+    "crates/infra/bamboo-infrastructure",
+    "crates/infra/bamboo-memory",
+    "crates/infra/bamboo-metrics",
+    "crates/infra/bamboo-notification",
+    "crates/infra/bamboo-hooks",
+    "crates/infra/bamboo-skills",
+    "crates/infra/bamboo-mcp",
+    "crates/infra/bamboo-plugin",
+    "crates/infra/bamboo-plugin-protocol",
+    "crates/infra/bamboo-projects",
+    "crates/infra/bamboo-permission",
+    "crates/infra/bamboo-compression",
+    "crates/infra/bamboo-subagent",
+    "crates/infra/bamboo-analytics",
+    # Engine — core logic
+    "crates/engine/bamboo-engine",
+    "crates/engine/bamboo-tools",
+    # App — executables + entry points
+    "crates/app/bamboo-server",
+    "crates/app/bamboo-server-tools",
+    "crates/app/bamboo-sdk",
+    "crates/app/bamboo-tui",
+    "crates/app/bamboo-client-core",
+    "crates/app/bamboo-broker",
+    "examples/tool-event-recorder",
+]
+# Bare `cargo build`/`test`/`check` (no `-p`/`--workspace`) operate on these.
+# `bamboo-analytics` is intentionally omitted: it is a dev-only analysis tool
+# that links the heavy bundled DuckDB engine, so it stays out of default builds
+# (including release builds that run a bare `cargo build`). It is still a full
+# workspace member, so `cargo build -p bamboo-analytics` and its `report`
+# example work on demand. NOTE: an explicit `cargo build --workspace` overrides
+# this and DOES build it — add `--exclude bamboo-analytics` there to skip it.
+default-members = [
+    ".",
+    # Core — types + interfaces
+    "crates/core/bamboo-domain",
+    "crates/core/bamboo-agent-core",
+    # Infra — independent services
+    "crates/infra/bamboo-config",
+    "crates/infra/bamboo-llm",
+    "crates/infra/bamboo-storage",
+    "crates/infra/bamboo-a2a",
+    "crates/infra/bamboo-infrastructure",
+    "crates/infra/bamboo-memory",
+    "crates/infra/bamboo-metrics",
+    "crates/infra/bamboo-notification",
+    "crates/infra/bamboo-hooks",
+    "crates/infra/bamboo-skills",
+    "crates/infra/bamboo-mcp",
+    "crates/infra/bamboo-plugin",
+    "crates/infra/bamboo-plugin-protocol",
+    "crates/infra/bamboo-projects",
+    "crates/infra/bamboo-permission",
+    "crates/infra/bamboo-compression",
+    "crates/infra/bamboo-subagent",
+    # Engine — core logic
+    "crates/engine/bamboo-engine",
+    "crates/engine/bamboo-tools",
+    # App — executables + entry points
+    "crates/app/bamboo-server",
+    "crates/app/bamboo-server-tools",
+    "crates/app/bamboo-sdk",
+    "crates/app/bamboo-tui",
+    "crates/app/bamboo-client-core",
+    "crates/app/bamboo-broker",
+]
+resolver = "2"
+
+[workspace.package]
+# Placeholder. The release-train rewrites this one line to the date-based release
+# version at publish time; all members inherit via `version.workspace = true`.
+# Do NOT hardcode a real version here.
+version = "0.0.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+sha2 = "0.10"
+hex = "0.4"
+
+[package]
+name = "bamboo-agent"
+version.workspace = true
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+authors = ["mugeng.du@gmail.com"]
+description = "A fully self-contained AI agent backend framework with built-in web services, multi-LLM provider support, and comprehensive tool execution"
+homepage = "https://github.com/bigduu/Bamboo-agent"
+repository = "https://github.com/bigduu/Bamboo-agent"
+documentation = "https://docs.rs/bamboo-agent"
+readme = "README.md"
+keywords = ["ai", "agent", "llm", "automation", "mcp"]
+categories = [
+    "artificial-intelligence",
+    "development-tools",
+    "web-programming",
+    "asynchronous",
+]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "README.md",
+    "build.rs",
+    "src/**/*",
+]
+
+[dependencies]
+# Workspace crates
+bamboo-domain = { path = "crates/core/bamboo-domain" }
+bamboo-infrastructure = { path = "crates/infra/bamboo-infrastructure" }
+bamboo-config = { path = "crates/infra/bamboo-config" }
+bamboo-llm = { path = "crates/infra/bamboo-llm" }
+bamboo-storage = { path = "crates/infra/bamboo-storage" }
+bamboo-agent-core = { path = "crates/core/bamboo-agent-core" }
+bamboo-engine = { path = "crates/engine/bamboo-engine" }
+bamboo-tools = { path = "crates/engine/bamboo-tools" }
+bamboo-server = { path = "crates/app/bamboo-server" }
+bamboo-sdk = { path = "crates/app/bamboo-sdk" }
+bamboo-subagent = { path = "crates/infra/bamboo-subagent" }
+bamboo-broker = { path = "crates/app/bamboo-broker" }
+bamboo-mcp = { path = "crates/infra/bamboo-mcp" }
+bamboo-skills = { path = "crates/infra/bamboo-skills" }
+bamboo-memory = { path = "crates/infra/bamboo-memory" }
+bamboo-metrics = { path = "crates/infra/bamboo-metrics" }
+bamboo-tui = { path = "crates/app/bamboo-tui" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+# Bamboo's inbound face is intentionally HTTP/1.1-only. Keep Actix's ordinary
+# default surface except for `http2`: Actix 4 still resolves the vulnerable
+# `h2 0.3` line (RUSTSEC-2026-0258), while Bamboo's WSS transport uses the
+# HTTP/1.1 Upgrade protocol. Outbound provider clients retain HTTP/2 through
+# Reqwest's patched `h2 0.4` dependency.
+actix-web = { version = "4", default-features = false, features = [
+    "macros",
+    "compress-brotli",
+    "compress-gzip",
+    "compress-zstd",
+    "cookies",
+    "unicode",
+    "compat",
+    "ws",
+] }
+actix-cors = "0.7"
+actix-files = "0.6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "1.1"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utilities
+dirs = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+cron = "0.17"
+regex = "1"
+colored = "2"
+glob = "0.3"
+globset = "0.4"
+walkdir = "2"
+url = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+async-stream = "0.3"
+tokio-stream = "0.1"
+tokio-util = "0.7"
+eventsource-stream = "0.2"
+eventsource-client = "0.17"
+bytes = "1"
+
+# Concurrency utilities
+dashmap = "6"
+parking_lot = "0.12"
+
+# HTTP client (for LLM providers)
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "native-tls", "charset", "http2", "system-proxy"] }
+reqwest-middleware = { version = "0.5", features = ["json", "form"] }
+reqwest-retry = "0.9"
+
+# Encryption
+aes-gcm = "0.11"
+sha2 = "0.11"
+hex = "0.4"
+rand = "0.10"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+
+# Process management
+sysinfo = "0.39"
+libc = "0.2"
+
+# Database
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
+
+[target.'cfg(windows)'.dependencies]
+# Windows-only OCR via WinRT. Used by the `hooks.image_fallback.mode="ocr"` preflight hook.
+rust_ocr = "0.1.5"
+# Windows sidecar orphan guard: OpenProcess + WaitForSingleObject on the parent shell.
+windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_Foundation"] }
+
+[[bin]]
+name = "bamboo"
+path = "src/bin/bamboo.rs"
+
+[dev-dependencies]
+async-trait = "0.1"
+tempfile = "3"
+wiremock = "0.6"
+tokio-test = "0.4"
+mockall = "0.15"
+http = "1"
+actix-rt = "2"
+serde_json = "1"
+bamboo-infrastructure = { path = "crates/infra/bamboo-infrastructure", features = ["test-utils"] }
+bamboo-config = { path = "crates/infra/bamboo-config", features = ["test-utils"] }
+bamboo-agent-core = { path = "crates/core/bamboo-agent-core" }
+bamboo-engine = { path = "crates/engine/bamboo-engine" }
+bamboo-metrics = { path = "crates/infra/bamboo-metrics" }
+bamboo-mcp = { path = "crates/infra/bamboo-mcp" }
+bamboo-skills = { path = "crates/infra/bamboo-skills" }
+bamboo-server-tools = { path = "crates/app/bamboo-server-tools" }
+bamboo-notification = { path = "crates/infra/bamboo-notification" }
+bamboo-projects = { path = "crates/infra/bamboo-projects" }
+
+[profile.release]
+opt-level = 3
+lto = true

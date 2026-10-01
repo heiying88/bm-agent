@@ -1,0 +1,79 @@
+[package]
+name = "bamboo-engine"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Execution engine and orchestration for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
+bamboo-llm = { path = "../../infra/bamboo-llm" }
+bamboo-config = { path = "../../infra/bamboo-config" }
+bamboo-storage = { path = "../../infra/bamboo-storage" }
+bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-a2a = { path = "../../infra/bamboo-a2a" }
+bamboo-memory = { path = "../../infra/bamboo-memory" }
+bamboo-metrics = { path = "../../infra/bamboo-metrics" }
+bamboo-hooks = { path = "../../infra/bamboo-hooks" }
+bamboo-skills = { path = "../../infra/bamboo-skills" }
+bamboo-mcp = { path = "../../infra/bamboo-mcp" }
+bamboo-compression = { path = "../../infra/bamboo-compression" }
+bamboo-subagent = { path = "../../infra/bamboo-subagent" }
+# The message bus (light deps: tokio-tungstenite only) — the actor runner drives
+# local children over it via BrokerChildLink, unifying local + remote transport.
+bamboo-broker = { path = "../../app/bamboo-broker" }
+bamboo-tools = { path = "../../engine/bamboo-tools" }
+serde = { workspace = true }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+regex = "1"
+dashmap = "6"
+arc-swap = "1.9"
+crossbeam-skiplist = "0.1.3"
+parking_lot = "0.12"
+fs2 = "0.4"
+base64 = "0.23"
+imagesize = { version = "0.15", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+sha2 = "0.11"
+hex = "0.4"
+colored = "2"
+globset = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "native-tls", "charset", "http2", "system-proxy"] }
+tokio-stream = "0.1"
+url = "2"
+toml = "1.1"
+dirs = "6"
+libc = "0.2"
+rand = "0.10"
+sysinfo = "0.39"
+bytes = "1"
+
+[target.'cfg(windows)'.dependencies]
+rust_ocr = "0.1.5"
+
+[dev-dependencies]
+tempfile = "3"
+mockall = "0.15"
+wiremock = "0.6"
+tokio-test = "0.4"
+http = "1"
+
+[features]
+test-utils = []
+# Write the per-call token-usage JSONL sidecar (for the bamboo-analytics dev
+# tool). The emit is also active automatically in any debug build, so dev
+# `cargo run`/tests get it for free; this feature is the explicit escape hatch
+# to force it on in a `--release` build. Off (and silent) in release otherwise.
+token-usage-log = []

@@ -1,0 +1,281 @@
+use bamboo_domain::{reasoning::ReasoningEffort, ProviderModelRef, RootThinkingMode};
+use serde::{Deserialize, Serialize};
+
+/// Request payload for creating a new chat message.
+///
+/// # Fields
+///
+/// * `message` - The user's message content
+/// * `session_id` - Optional session ID. If not provided, a new UUID will be generated
+/// * `system_prompt` - Optional custom system prompt. If empty, uses the default
+/// * `enhance_prompt` - Optional additional prompt instructions appended to the system prompt
+/// * `root_orchestration_prompt` - Explicit root-only delegation guidance selection
+/// * `root_orchestration_only` - Explicit Root tool authority selection
+/// * `workspace_path` - Optional workspace path to include in the system prompt
+/// * `selected_skill_ids` - Optional explicit skill IDs selected for this request
+/// * `model` - Optional model identifier (e.g., "gpt-4o-mini", "claude-3-opus").
+///   When absent or empty, the server falls back to its resolved default model
+///   (issue #480) — the same resolution `GET /api/v1/execute/defaults` reports.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatRequest {
+    pub message: String,
+    pub session_id: Option<String>,
+    /// Stable first-class Project membership for a newly-created session.
+    /// Existing sessions cannot be reassigned through chat.
+    #[serde(default)]
+    pub project_id: Option<bamboo_domain::ProjectId>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub enhance_prompt: Option<String>,
+    /// Set `true` or `false` to change the durable root delegation mode;
+    /// omission keeps the Session's prior selection.
+    #[serde(default)]
+    pub root_orchestration_prompt: Option<bool>,
+    /// Set `true` or `false` to change the durable Root tool surface;
+    /// omission keeps the prior selection. Child sessions cannot set it.
+    #[serde(default)]
+    pub root_orchestration_only: Option<bool>,
+    /// Root product selection for first chat. Existing Roots use the
+    /// recoverable mode operation; per-call reasoning remains independent.
+    #[serde(default, deserialize_with = "RootThinkingMode::deserialize_selection")]
+    pub thinking_mode: Option<RootThinkingMode>,
+    #[serde(default)]
+    pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub selected_skill_ids: Option<Vec<String>>,
+    /// Authoritative typed workflow selection. Bamboo resolves instructions.
+    #[serde(default)]
+    pub workflow_selection: Option<bamboo_skills::WorkflowSelection>,
+    /// Explicit session opt-in for model-started orchestration workflows.
+    #[serde(default)]
+    pub orchestration_opt_in: Option<bool>,
+    /// Optional image attachments (data URLs) associated with this message.
+    #[serde(default)]
+    pub images: Option<Vec<ChatImage>>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model_ref: Option<ProviderModelRef>,
+    /// Optional per-session execution-profile override for a newly-created
+    /// chat. Existing sessions retain their stored value unless changed via
+    /// the CAS-guarded session PATCH endpoint.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Optional initial session-scoped permission mode for a newly-created
+    /// chat (`default` | `bypass` | `auto`). Existing sessions are never
+    /// reassigned through chat; later changes go through the CAS-guarded
+    /// session PATCH endpoint. When omitted on a new session, the durable
+    /// permission-policy default is stamped instead.
+    #[serde(default)]
+    pub permission_mode: Option<bamboo_domain::SessionPermissionMode>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ChatImage {
+    pub base64: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default, rename = "type")]
+    pub mime_type: Option<String>,
+}
+
+/// Response returned after successfully creating a chat message.
+///
+/// # Fields
+///
+/// * `session_id` - The session identifier for subsequent API calls
+/// * `stream_url` - URL endpoint to stream agent events (SSE)
+/// * `status` - Current status of the chat session
+/// * `goal_command` - Present when the message was a `/goal` control command
+#[derive(Debug, Serialize)]
+pub struct ChatResponse {
+    /// Unique session identifier for this conversation
+    pub session_id: String,
+    /// SSE endpoint URL to receive real-time agent events
+    pub stream_url: String,
+    /// Current session status (e.g., "streaming")
+    pub status: String,
+    /// Present when the message was a `/goal` control command handled server-side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_command: Option<super::handler::GoalCommandResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_request_deserialization_minimal() {
+        let json = r#"{"message":"Hello","model":"gpt-4"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "Hello");
+        assert_eq!(req.model.as_deref(), Some("gpt-4"));
+        assert!(req.session_id.is_none());
+        assert!(req.system_prompt.is_none());
+        assert!(req.images.is_none());
+        assert!(req.root_orchestration_prompt.is_none());
+        assert!(req.root_orchestration_only.is_none());
+    }
+
+    #[test]
+    fn root_orchestration_prompt_requires_an_explicit_boolean_selection() {
+        let enabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"delegate","root_orchestration_prompt":true}"#)
+                .expect("enable selection");
+        assert_eq!(enabled.root_orchestration_prompt, Some(true));
+        let disabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"continue","root_orchestration_prompt":false}"#)
+                .expect("disable selection");
+        assert_eq!(disabled.root_orchestration_prompt, Some(false));
+    }
+
+    #[test]
+    fn root_orchestration_only_requires_an_explicit_boolean_selection() {
+        let enabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"delegate","root_orchestration_only":true}"#)
+                .expect("enable selection");
+        assert_eq!(enabled.root_orchestration_only, Some(true));
+        let disabled: ChatRequest =
+            serde_json::from_str(r#"{"message":"continue","root_orchestration_only":false}"#)
+                .expect("disable selection");
+        assert_eq!(disabled.root_orchestration_only, Some(false));
+    }
+
+    #[test]
+    fn test_chat_request_deserialization_full() {
+        let json = r#"{
+            "message":"Hello",
+            "session_id":"sess-123",
+            "system_prompt":"Be helpful",
+            "enhance_prompt":"Be concise",
+            "workspace_path":"/home/user",
+            "selected_skill_ids":["pdf","skill-creator"],
+            "model":"claude-3"
+        }"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "Hello");
+        assert_eq!(req.session_id, Some("sess-123".to_string()));
+        assert_eq!(req.system_prompt, Some("Be helpful".to_string()));
+        assert_eq!(req.enhance_prompt, Some("Be concise".to_string()));
+        assert_eq!(req.workspace_path, Some("/home/user".to_string()));
+        assert_eq!(
+            req.selected_skill_ids,
+            Some(vec!["pdf".to_string(), "skill-creator".to_string()])
+        );
+        assert_eq!(req.model.as_deref(), Some("claude-3"));
+    }
+
+    #[test]
+    fn test_chat_request_with_images() {
+        let json = r#"{
+            "message":"Check this",
+            "model":"gpt-4",
+            "images":[{"base64":"aGVsbG8=","name":"test.png","size":1024,"type":"image/png"}]
+        }"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.images.is_some());
+        let images = req.images.unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].base64, "aGVsbG8=");
+        assert_eq!(images[0].name, Some("test.png".to_string()));
+        assert_eq!(images[0].size, Some(1024));
+        assert_eq!(images[0].mime_type, Some("image/png".to_string()));
+    }
+
+    #[test]
+    fn test_chat_image_deserialization_minimal() {
+        let json = r#"{"base64":"YWJj"}"#;
+        let img: ChatImage = serde_json::from_str(json).unwrap();
+        assert_eq!(img.base64, "YWJj");
+        assert!(img.name.is_none());
+        assert!(img.size.is_none());
+        assert!(img.mime_type.is_none());
+    }
+
+    #[test]
+    fn test_chat_request_debug() {
+        let req = ChatRequest {
+            message: "Test".to_string(),
+            session_id: None,
+            project_id: None,
+            system_prompt: None,
+            enhance_prompt: None,
+            root_orchestration_prompt: None,
+            root_orchestration_only: None,
+            thinking_mode: None,
+            workspace_path: None,
+            selected_skill_ids: None,
+            workflow_selection: None,
+            orchestration_opt_in: None,
+            images: None,
+            model: Some("gpt-4".to_string()),
+            provider: None,
+            model_ref: None,
+            reasoning_effort: Some(ReasoningEffort::High),
+            permission_mode: None,
+        };
+        let debug_str = format!("{:?}", req);
+        assert!(debug_str.contains("ChatRequest"));
+        assert!(debug_str.contains("Test"));
+        assert!(debug_str.contains("High"));
+    }
+
+    #[test]
+    fn test_chat_image_debug() {
+        let img = ChatImage {
+            base64: "test".to_string(),
+            name: Some("image.png".to_string()),
+            size: Some(2048),
+            mime_type: Some("image/png".to_string()),
+        };
+        let debug_str = format!("{:?}", img);
+        assert!(debug_str.contains("ChatImage"));
+    }
+
+    #[test]
+    fn test_chat_response_serialization() {
+        let resp = ChatResponse {
+            session_id: "sess-456".to_string(),
+            stream_url: "/stream/sess-456".to_string(),
+            status: "streaming".to_string(),
+            goal_command: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("sess-456"));
+        assert!(json.contains("/stream/sess-456"));
+        assert!(json.contains("streaming"));
+        assert!(!json.contains("goal_command"));
+    }
+
+    #[test]
+    fn test_chat_response_debug() {
+        let resp = ChatResponse {
+            session_id: "test".to_string(),
+            stream_url: "/stream".to_string(),
+            status: "active".to_string(),
+            goal_command: None,
+        };
+        let debug_str = format!("{:?}", resp);
+        assert!(debug_str.contains("ChatResponse"));
+    }
+
+    #[test]
+    fn test_chat_request_empty_message() {
+        let json = r#"{"message":"","model":"gpt-4"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.message, "");
+    }
+
+    #[test]
+    fn test_chat_request_special_characters() {
+        let json = r#"{"message":"Hello\nWorld\t!","model":"gpt-4"}"#;
+        let req: ChatRequest = serde_json::from_str(json).unwrap();
+        assert!(req.message.contains('\n'));
+        assert!(req.message.contains('\t'));
+    }
+}

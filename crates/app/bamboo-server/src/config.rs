@@ -1,0 +1,1501 @@
+//! Server configuration utilities
+//!
+//! This module provides functions to configure security headers and CORS policies
+//! for the Actix-web server based on the deployment environment.
+//!
+//! # Security Headers
+//!
+//! The server applies production-ready security headers:
+//! - X-Frame-Options: DENY
+//! - X-Content-Type-Options: nosniff
+//! - X-XSS-Protection: 1; mode=block
+//! - Referrer-Policy: strict-origin-when-cross-origin
+//! - Content-Security-Policy: Customizable CSP
+//!
+//! # CORS Configuration
+//!
+//! CORS policies are automatically adjusted based on bind address:
+//! - **localhost**: Development mode with permissive CORS
+//! - **0.0.0.0**: Docker production mode (localhost only via reverse proxy)
+//! - **Custom**: Restrictive CORS for specific addresses
+
+use actix_cors::Cors;
+use actix_web::body::MessageBody;
+use actix_web::dev::{ServiceFactory, ServiceRequest, ServiceResponse};
+use actix_web::http::header;
+use actix_web::middleware::{Condition, DefaultHeaders, Next};
+use actix_web::App;
+use std::collections::HashSet;
+use std::net::IpAddr;
+use tracing::info;
+use tracing::warn;
+
+use crate::rate_limit::{KeyExtractor, RateLimit, RateLimiterConfig, SimpleKeyExtractionError};
+
+/// Default sustained per-IP request rate (requests/second) for the production
+/// (network-exposed) server. Overridable via `BAMBOO_RATE_LIMIT_PER_SECOND`.
+const DEFAULT_RATE_LIMIT_PER_SECOND: u64 = 10;
+/// Default per-IP burst allowance. Overridable via `BAMBOO_RATE_LIMIT_BURST`.
+const DEFAULT_RATE_LIMIT_BURST: u32 = 20;
+
+/// Rate-limiter key extractor. Defaults to the TCP peer IP (non-spoofable), but
+/// can be switched to an OPT-IN `X-Forwarded-For` mode for reverse-proxy
+/// deployments where the peer IP is always the proxy (which would otherwise
+/// collapse the per-IP limit to global). #169.
+///
+/// SECURITY: XFF mode is only safe behind a trusted proxy — a directly-reachable
+/// server trusting XFF lets any client spoof its key and bypass the limiter. It
+/// is therefore off unless `BAMBOO_RATE_LIMIT_TRUST_XFF` is set, and it fails
+/// CLOSED to the peer IP whenever the header is absent, unparseable, or shorter
+/// than the configured trusted-hop count (so a rogue/short XFF can't inject a key).
+#[derive(Clone, Debug)]
+pub struct ClientIpKeyExtractor {
+    trust_xff: bool,
+    /// Number of trusted proxies between us and the client. The real client is
+    /// the `trusted_hops`-th entry from the RIGHT of `X-Forwarded-For` (each proxy
+    /// appends the peer it saw as the request travels outward-to-inward).
+    trusted_hops: usize,
+}
+
+impl ClientIpKeyExtractor {
+    /// The default, non-spoofable peer-IP extractor.
+    #[cfg(test)]
+    fn peer_ip() -> Self {
+        Self {
+            trust_xff: false,
+            trusted_hops: 1,
+        }
+    }
+
+    fn client_ip_from_xff(&self, req: &ServiceRequest) -> Option<IpAddr> {
+        let hops = self.trusted_hops.max(1);
+        // Consider EVERY `X-Forwarded-For` header line, in order, not just the
+        // first: some proxies append a second header line rather than extending
+        // the comma-joined value, and reading only the first could let an
+        // attacker-supplied line win. Flatten all lines into one ordered list of
+        // entries (client-first ... nearest-proxy-last).
+        let entries: Vec<&str> = req
+            .headers()
+            .get_all("x-forwarded-for")
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|line| line.split(','))
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        // Fail closed: a header with fewer entries than the trusted hop count is
+        // not the shape a trusted proxy chain produces, so don't trust it.
+        if entries.len() < hops {
+            return None;
+        }
+        parse_forwarded_ip(entries[entries.len() - hops])
+    }
+}
+
+impl KeyExtractor for ClientIpKeyExtractor {
+    type Key = IpAddr;
+    type KeyExtractionError = SimpleKeyExtractionError;
+
+    fn extract(&self, req: &ServiceRequest) -> Result<Self::Key, Self::KeyExtractionError> {
+        if self.trust_xff {
+            if let Some(client) = self.client_ip_from_xff(req) {
+                return Ok(mask_ipv6_prefix(client));
+            }
+            // else: fall through to the peer IP (fail closed).
+        }
+        let ip = req.peer_addr().map(|socket| socket.ip()).ok_or_else(|| {
+            SimpleKeyExtractionError::new("Could not extract peer IP address from request")
+        })?;
+        Ok(mask_ipv6_prefix(ip))
+    }
+}
+
+/// Rate-limit IPv6 clients per /56 prefix rather than per address (customers are
+/// often handed a whole prefix), mirroring `PeerIpKeyExtractor`. IPv4 is unchanged.
+fn mask_ipv6_prefix(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[7..16].fill(0);
+            IpAddr::V6(octets.into())
+        }
+        v4 => v4,
+    }
+}
+
+/// Parse one `X-Forwarded-For` entry into an IP, tolerating a `host:port` or
+/// bracketed-IPv6 form some proxies emit.
+fn parse_forwarded_ip(s: &str) -> Option<IpAddr> {
+    let s = s.trim();
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
+        return Some(sa.ip());
+    }
+    // Bracketed IPv6 without a port, e.g. "[::1]".
+    let unbracketed = s.strip_prefix('[').and_then(|x| x.strip_suffix(']'))?;
+    unbracketed.parse::<IpAddr>().ok()
+}
+
+fn rate_limiter_config(
+    per_second: u64,
+    burst: u32,
+    key_extractor: ClientIpKeyExtractor,
+) -> RateLimiterConfig<ClientIpKeyExtractor> {
+    // One cell replenishes every `1000 / per_second` ms (>=1), allowing `per_second`
+    // sustained req/s with a `burst` bucket. Clamp to >=1 so a bad env value can't
+    // produce a zero period/burst (which `RateLimiterConfig::new` would panic on).
+    let ms_per_request = (1000 / per_second.max(1)).max(1);
+    RateLimiterConfig::new(
+        std::time::Duration::from_millis(ms_per_request),
+        burst.max(1),
+        key_extractor,
+    )
+}
+
+/// Build the per-IP rate-limiter config applied to the PRODUCTION (network-bound)
+/// server via the [`crate::rate_limit`] middleware. Throttles each client IP to
+/// `BAMBOO_RATE_LIMIT_PER_SECOND` (default 10) req/s with a `BAMBOO_RATE_LIMIT_BURST`
+/// (default 20) burst, returning 429 Too Many Requests when exceeded. Desktop
+/// (localhost) mode does not apply it. #13.
+///
+/// Keys on the TCP PEER IP by default (non-spoofable). Behind a reverse proxy
+/// every client shares the proxy's IP, collapsing the per-IP limit to global; set
+/// `BAMBOO_RATE_LIMIT_TRUST_XFF=1` to key on `X-Forwarded-For` instead (with
+/// `BAMBOO_RATE_LIMIT_TRUSTED_HOPS`, default one hop). #169. XFF mode is OPT-IN
+/// because trusting the header when NOT behind a trusted proxy lets any client
+/// spoof its rate-limit key; see [`ClientIpKeyExtractor`].
+pub fn build_rate_limiter() -> RateLimiterConfig<ClientIpKeyExtractor> {
+    let per_second = std::env::var("BAMBOO_RATE_LIMIT_PER_SECOND")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RATE_LIMIT_PER_SECOND);
+    let burst = std::env::var("BAMBOO_RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_RATE_LIMIT_BURST);
+
+    let trust_xff = std::env::var("BAMBOO_RATE_LIMIT_TRUST_XFF")
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false);
+    let trusted_hops = std::env::var("BAMBOO_RATE_LIMIT_TRUSTED_HOPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(1);
+
+    if trust_xff {
+        warn!(
+            "Rate limiter is trusting X-Forwarded-For (trusted_hops={trusted_hops}). \
+             Only enable this when the server is reachable exclusively through a trusted \
+             reverse proxy — otherwise clients can spoof their rate-limit key."
+        );
+    }
+
+    rate_limiter_config(
+        per_second,
+        burst,
+        ClientIpKeyExtractor {
+            trust_xff,
+            trusted_hops,
+        },
+    )
+}
+
+/// True when `bind` is a loopback/desktop address, for which the per-IP DoS
+/// rate limiter ([`build_rate_limiter`], #13) is intentionally SKIPPED. The
+/// desktop sidecar serves the local frontend, which legitimately bursts ~45
+/// hashed `/assets/*` requests on load and would otherwise trip the 429 limit
+/// (`burst` default 20). Mirrors the loopback special-casing already used for
+/// CORS; network binds (`0.0.0.0`) are still throttled.
+///
+/// Classification is via [`IpAddr::is_loopback`] (so the whole `127.0.0.0/8`
+/// range, not just `127.0.0.1`, and a bracketed IPv6 literal like `[::1]` are
+/// correctly recognized) plus a literal `"localhost"` match, since that's a
+/// hostname rather than an address `IpAddr` can parse. #428: previously this
+/// was a strict string allowlist (`127.0.0.1` / `localhost` / `::1`), so e.g.
+/// `127.0.0.2` or `[::1]` were misclassified as non-loopback — which failed
+/// SAFE (the limiter was applied) but was still wrong.
+pub fn is_loopback_bind(bind: &str) -> bool {
+    let candidate = bind.trim();
+    let unbracketed = candidate
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(candidate);
+
+    if unbracketed.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    unbracketed
+        .parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Bind-aware limiter guard (#169 part 3).
+///
+/// The per-IP rate limiter (#13) is what protects a network-exposed bind from a
+/// DoS flood. Some serve paths (notably [`crate::server::WebService::start_with_bind`])
+/// never install the limiter, and every bind-accepting path takes an arbitrary
+/// `bind` string — so a caller COULD start an unthrottled server on `0.0.0.0`
+/// (or another routable interface) and silently re-open the surface #13 closed.
+///
+/// This guard rejects exactly that combination: a NON-loopback bind with NO
+/// limiter applied. Loopback binds (see [`is_loopback_bind`]) are exempt because
+/// the desktop sidecar intentionally runs un-throttled to serve its local
+/// frontend — so this never weakens the established localhost behavior. Paths
+/// that DO apply the limiter pass `limiter_applied = true` and are always
+/// accepted, regardless of bind.
+pub fn require_limiter_for_nonloopback(bind: &str, limiter_applied: bool) -> Result<(), String> {
+    if !limiter_applied && !is_loopback_bind(bind) {
+        return Err(format!(
+            "refusing to serve on non-loopback bind '{bind}' without a rate limiter: it would \
+             run unthrottled and re-open the per-IP DoS surface closed by #13. Use a \
+             limiter-applying serve path (e.g. start_with_bind_and_static / run_with_bind) or \
+             bind to loopback (127.0.0.1 / localhost / ::1)."
+        ));
+    }
+    Ok(())
+}
+
+// Keep the default CSP reasonably strict while remaining compatible with the Lotus UI runtime.
+// Lotus + Ant Design inject runtime styles, so `style-src 'unsafe-inline'` is required for the
+// current frontend bundle. Keep scripts strict (no `unsafe-eval`) and allow operators to override
+// via `BAMBOO_CSP` when needed.
+const DEFAULT_CSP: &str = concat!(
+    "default-src 'self'; ",
+    "base-uri 'self'; ",
+    "object-src 'none'; ",
+    "frame-ancestors 'none'; ",
+    "script-src 'self'; ",
+    "style-src 'self' 'unsafe-inline'; ",
+    "img-src 'self' data: blob: https:; ",
+    "font-src 'self' data:; ",
+    "connect-src 'self' ws: wss: http://127.0.0.1:* http://localhost:* http://bodhi.bigduu.com:9562 https://bodhi.bigduu.com:9562; ",
+    "form-action 'self';"
+);
+
+fn normalize_csp_source_token(token: &str) -> Option<String> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with("'") {
+        return Some(trimmed.to_string());
+    }
+
+    normalize_origin(trimmed).or_else(|| Some(trimmed.to_string()))
+}
+
+fn parse_csp_connect_src_append(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c.is_ascii_whitespace())
+        .filter_map(normalize_csp_source_token)
+        .collect()
+}
+
+fn append_connect_src_sources(base_csp: &str, extra_sources: &[String]) -> String {
+    if extra_sources.is_empty() {
+        return base_csp.to_string();
+    }
+
+    let connect_src_marker = "connect-src ";
+    if let Some(start) = base_csp.find(connect_src_marker) {
+        let value_start = start + connect_src_marker.len();
+        if let Some(relative_end) = base_csp[value_start..].find(';') {
+            let value_end = value_start + relative_end;
+            let existing_value = base_csp[value_start..value_end].trim();
+            let mut merged = if existing_value.is_empty() {
+                String::new()
+            } else {
+                existing_value.to_string()
+            };
+
+            for source in extra_sources {
+                if merged.split_whitespace().any(|token| token == source) {
+                    continue;
+                }
+                if !merged.is_empty() {
+                    merged.push(' ');
+                }
+                merged.push_str(source);
+            }
+
+            let mut result = String::with_capacity(base_csp.len() + merged.len() + 1);
+            result.push_str(&base_csp[..value_start]);
+            result.push_str(&merged);
+            result.push_str(&base_csp[value_end..]);
+            return result;
+        }
+    }
+
+    base_csp.to_string()
+}
+
+fn resolve_default_csp() -> String {
+    const ENV_KEY: &str = "BAMBOO_CSP_CONNECT_SRC";
+
+    let extra_sources = match std::env::var(ENV_KEY) {
+        Ok(raw) => parse_csp_connect_src_append(&raw),
+        Err(_) => Vec::new(),
+    };
+
+    if !extra_sources.is_empty() {
+        info!(
+            "Extending CSP connect-src via {} with {} source(s)",
+            ENV_KEY,
+            extra_sources.len()
+        );
+    }
+
+    append_connect_src_sources(DEFAULT_CSP, &extra_sources)
+}
+
+fn resolve_csp_header_value(override_value: Option<&str>) -> header::HeaderValue {
+    let default_csp = resolve_default_csp();
+    let csp = override_value.unwrap_or(default_csp.as_str());
+    match header::HeaderValue::from_str(csp) {
+        Ok(v) => v,
+        Err(e) => {
+            // Avoid failing to start due to a malformed override; fall back to the safe default.
+            warn!(
+                "Invalid BAMBOO_CSP value ({}); falling back to DEFAULT_CSP",
+                e
+            );
+            header::HeaderValue::from_str(default_csp.as_str())
+                .unwrap_or_else(|_| header::HeaderValue::from_static(DEFAULT_CSP))
+        }
+    }
+}
+
+/// CORS allowlist sourced from env vars.
+///
+/// Supported entries:
+/// - Exact origins: `https://app.example.com`, `http://localhost:5173`
+/// - Hosts (any scheme/port): `app.example.com`, `127.0.0.1`
+/// - Wildcard subdomains (any scheme/port): `*.example.com`
+#[derive(Debug, Clone, Default)]
+struct CorsAllowlist {
+    exact_origins: HashSet<String>,
+    hosts: Vec<HostPattern>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HostPattern {
+    Exact(String),
+    Suffix(String), // stored with leading dot, e.g. ".example.com"
+}
+
+fn normalize_origin(origin: &str) -> Option<String> {
+    let url = url::Url::parse(origin).ok()?;
+
+    let scheme = url.scheme().to_ascii_lowercase();
+    let host = url.host()?;
+    let host_str = match host {
+        url::Host::Domain(d) => d.to_ascii_lowercase(),
+        url::Host::Ipv4(v4) => v4.to_string(),
+        url::Host::Ipv6(v6) => format!("[{v6}]"),
+    };
+
+    let port = url.port();
+    let default_port = match scheme.as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
+    let port = match (port, default_port) {
+        (Some(p), Some(d)) if p == d => None,
+        (p, _) => p,
+    };
+
+    Some(match port {
+        Some(p) => format!("{scheme}://{host_str}:{p}"),
+        None => format!("{scheme}://{host_str}"),
+    })
+}
+
+fn parse_cors_allowlist(raw: &str) -> CorsAllowlist {
+    let mut allow = CorsAllowlist::default();
+
+    for item in raw.split(',') {
+        let token = item.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        if token.contains("://") {
+            // Exact origin match. Normalize to an origin-like form so common inputs
+            // (trailing slashes, explicit :443, etc.) still match real Origin headers.
+            match normalize_origin(token) {
+                Some(origin) => {
+                    allow.exact_origins.insert(origin);
+                }
+                None => {
+                    warn!(
+                        "Invalid CORS origin entry '{}'; expected an origin like https://app.example.com",
+                        token
+                    );
+                }
+            }
+            continue;
+        }
+
+        // Host-based match.
+        let host = token.to_ascii_lowercase();
+        if let Some(rest) = host.strip_prefix("*.") {
+            // Wildcard subdomains.
+            if !rest.is_empty() {
+                allow.hosts.push(HostPattern::Suffix(format!(".{rest}")));
+            }
+        } else {
+            allow.hosts.push(HostPattern::Exact(host));
+        }
+    }
+
+    allow
+}
+
+fn parse_cors_allowlist_env() -> CorsAllowlist {
+    // Comma-separated list. Examples:
+    //   BAMBOO_CORS_ALLOW_ORIGINS="https://app.example.com,http://localhost:5173,*.example.com"
+    //   BAMBOO_CORS_ALLOW_ORIGINS="app.example.com,127.0.0.1"
+    const ENV_KEY: &str = "BAMBOO_CORS_ALLOW_ORIGINS";
+
+    let raw = match std::env::var(ENV_KEY) {
+        Ok(v) => v,
+        Err(_) => return CorsAllowlist::default(),
+    };
+
+    let allow = parse_cors_allowlist(&raw);
+
+    if !allow.exact_origins.is_empty() || !allow.hosts.is_empty() {
+        info!(
+            "CORS allowlist enabled via BAMBOO_CORS_ALLOW_ORIGINS ({} exact origin(s), {} host pattern(s))",
+            allow.exact_origins.len(),
+            allow.hosts.len()
+        );
+    }
+
+    allow
+}
+
+fn is_allowed_by_allowlist(origin: &str, allow: &CorsAllowlist) -> bool {
+    if let Some(normalized) = normalize_origin(origin) {
+        if allow.exact_origins.contains(&normalized) {
+            return true;
+        }
+    }
+
+    // Keep a strict string match fallback (covers unusual schemes like tauri://).
+    if allow.exact_origins.contains(origin) {
+        return true;
+    }
+
+    // Try to parse a host from the origin. Origin header values are serialized origins like:
+    // - https://app.example.com
+    // - http://127.0.0.1:5173
+    // - http://[::1]:5173
+    let url = match url::Url::parse(origin) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+
+    let host = match url.host_str() {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return false,
+    };
+
+    for pat in &allow.hosts {
+        match pat {
+            HostPattern::Exact(h) => {
+                if &host == h {
+                    return true;
+                }
+            }
+            HostPattern::Suffix(suffix) => {
+                if host.ends_with(suffix) {
+                    // Ensure we only match subdomains, not the apex itself when suffix is ".example.com".
+                    // (host == "example.com" should not match ".example.com".)
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+fn is_local_dev_origin(o: &str) -> bool {
+    o.starts_with("http://localhost:")
+        || o.starts_with("http://127.0.0.1:")
+        || o.starts_with("https://localhost:")
+        || o.starts_with("https://127.0.0.1:")
+        || o.starts_with("http://mac.local:")
+        || o.starts_with("https://mac.local:")
+        || o.starts_with("http://bodhi.bigduu.com:")
+        || o.starts_with("https://bodhi.bigduu.com:")
+        || o.starts_with("http://[::1]:")
+        || o.starts_with("https://[::1]:")
+}
+
+/// Build security headers middleware for production deployments
+///
+/// Applies standard security headers to all HTTP responses:
+/// - Prevents clickjacking (X-Frame-Options)
+/// - Prevents MIME type sniffing (X-Content-Type-Options)
+/// - Enables XSS protection (X-XSS-Protection)
+/// - Controls referrer information (Referrer-Policy)
+/// - Restricts resource loading (Content-Security-Policy)
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use actix_web::App;
+/// use bamboo_agent::server::config::build_security_headers;
+///
+/// let app = App::new()
+///     .wrap(build_security_headers());
+/// ```
+pub fn build_security_headers() -> DefaultHeaders {
+    let csp_override = std::env::var("BAMBOO_CSP").ok();
+    let csp_value = resolve_csp_header_value(csp_override.as_deref());
+
+    DefaultHeaders::new()
+        .add(("X-Frame-Options", "DENY"))
+        .add(("X-Content-Type-Options", "nosniff"))
+        .add(("X-XSS-Protection", "1; mode=block"))
+        .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
+        // Note: customize at runtime via `BAMBOO_CSP` if your frontend requires a relaxed policy.
+        .add((header::CONTENT_SECURITY_POLICY, csp_value))
+}
+
+/// Long-cache content-hashed frontend assets at the proxy/CDN edge.
+///
+/// Vite emits hashed filenames under `/assets/` (e.g. `main-B6snAd4S.css`), so
+/// they are inherently immutable — any content change yields a NEW filename.
+/// Tagging them `immutable, max-age=1y` lets Cloudflare and browsers cache them
+/// at the edge instead of round-tripping every chunk through the tunnel to
+/// origin. Besides being faster, this removes the transient per-asset failures
+/// (an occasional reset of one of many parallel preload requests over a
+/// cloudflared tunnel) that surface in the browser as Vite's
+/// "Unable to preload CSS for …" / "Failed to fetch dynamically imported module".
+///
+/// Only `/assets/*` is affected; `index.html` and API routes are left untouched
+/// so they always serve fresh (a new deploy must be picked up immediately).
+pub async fn add_asset_cache_headers<B: MessageBody + 'static>(
+    req: ServiceRequest,
+    next: Next<B>,
+) -> Result<ServiceResponse<B>, actix_web::Error> {
+    let is_asset = req.path().starts_with("/assets/");
+    let mut res = next.call(req).await?;
+    if is_asset {
+        res.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    }
+    Ok(res)
+}
+
+/// Build CORS middleware based on bind address and port
+///
+/// Automatically configures CORS policy based on deployment environment:
+///
+/// # Development Mode (localhost)
+///
+/// When binding to `127.0.0.1`, `localhost`, or `::1`:
+/// - Allows all origins, methods, and headers
+/// - Suitable for local development
+/// - Safe because server is only accessible locally
+///
+/// # Docker Production Mode (0.0.0.0)
+///
+/// When binding to `0.0.0.0`:
+/// - Only allows `http://localhost:{port}`
+/// - Requires reverse proxy for external access
+/// - Restrictive CORS for security
+///
+/// # Custom Address
+///
+/// For any other bind address:
+/// - Only allows that specific address
+/// - Most restrictive configuration
+///
+/// # Arguments
+///
+/// * `bind_addr` - The address the server binds to
+/// * `port` - The port number the server listens on
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use actix_web::HttpServer;
+/// use bambooagent::server::config::build_cors;
+///
+/// let cors = build_cors("127.0.0.1", 9562);
+/// // Use cors middleware in HttpServer
+/// ```
+pub fn build_cors(bind_addr: &str, port: u16) -> Cors {
+    let allowlist = parse_cors_allowlist_env();
+
+    let cors = if bind_addr == "127.0.0.1" || bind_addr == "localhost" || bind_addr == "::1" {
+        // Development/Desktop mode. Keep origins permissive for local/Tauri callers, but do not
+        // combine wildcard `Access-Control-Allow-Origin: *` with credentialed requests. The Lotus
+        // client sends `credentials: "include"` so browsers require a concrete echoed Origin.
+        info!("CORS configured for development mode: allowing local/Tauri origins (+ optional allowlist)");
+        Cors::default()
+            .allowed_origin_fn(move |origin, _req_head| {
+                let o = match origin.to_str() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+
+                if is_allowed_by_allowlist(o, &allowlist) {
+                    return true;
+                }
+
+                if is_local_dev_origin(o) {
+                    return true;
+                }
+
+                o == "tauri://localhost"
+                    || o == "https://tauri.localhost"
+                    || o == "http://tauri.localhost"
+            })
+            .allow_any_method()
+            .allow_any_header()
+            .supports_credentials()
+            .max_age(3600)
+    } else if bind_addr == "0.0.0.0" {
+        // Docker/sidecar mode.
+        //
+        // We still want to restrict origins to "local" callers, but ports and schemes
+        // can differ between:
+        // - Vite dev server (http://127.0.0.1:5173, http://localhost:5173)
+        // - Tauri webview (tauri://localhost, https://tauri.localhost)
+        // - Reverse proxy setups (http://localhost:{port})
+        //
+        // Accept any localhost/loopback origin (any port) and common Tauri origins.
+        info!("CORS configured for 0.0.0.0 bind: allowing localhost/loopback origins (+ optional allowlist)");
+        Cors::default()
+            .allowed_origin_fn(move |origin, _req_head| {
+                let o = match origin.to_str() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+
+                // Explicit allowlist (for remote UI domains, etc).
+                if is_allowed_by_allowlist(o, &allowlist) {
+                    return true;
+                }
+
+                // Common local HTTP(S) dev origins (any port).
+                if is_local_dev_origin(o) {
+                    return true;
+                }
+
+                // Tauri webview origins (vary by version/config).
+                if o == "tauri://localhost"
+                    || o == "https://tauri.localhost"
+                    || o == "http://tauri.localhost"
+                {
+                    return true;
+                }
+
+                // Some setups might load the UI from the same port as the backend.
+                if o == format!("http://localhost:{port}")
+                    || o == format!("http://127.0.0.1:{port}")
+                {
+                    return true;
+                }
+
+                false
+            })
+            // This server is commonly used as a local relay for multiple upstream clients
+            // (OpenAI/Anthropic/Gemini). Avoid CORS preflight failures by not restricting methods.
+            .allow_any_method()
+            // OpenAI's official JS client sends additional `x-stainless-*` headers which would
+            // otherwise fail preflight; keep headers permissive while origin stays locked down.
+            .allow_any_header()
+            .supports_credentials()
+            .max_age(3600)
+    } else {
+        // Custom bind address - restrictive by default, but allow explicit env allowlist.
+        info!(
+            "CORS configured for custom bind address: {} (+ optional allowlist)",
+            bind_addr
+        );
+        let bind_host = bind_addr.to_ascii_lowercase();
+        let allowlist = allowlist.clone();
+        Cors::default()
+            .allowed_origin_fn(move |origin, _req_head| {
+                let o = match origin.to_str() {
+                    Ok(v) => v,
+                    Err(_) => return false,
+                };
+
+                if is_allowed_by_allowlist(o, &allowlist) {
+                    return true;
+                }
+
+                // Allow same-host origins (any scheme/port) for the bind address itself.
+                // This keeps the default "tight" without requiring users to enumerate ports.
+                let url = match url::Url::parse(o) {
+                    Ok(u) => u,
+                    Err(_) => return false,
+                };
+                let Some(host) = url.host_str() else {
+                    return false;
+                };
+                host.eq_ignore_ascii_case(&bind_host)
+            })
+            .allow_any_method()
+            .allow_any_header()
+            .supports_credentials()
+            .max_age(3600)
+    };
+
+    // Session metadata mutations use ETag as their If-Match CAS token. The
+    // browser workbench also needs active tab, frame sequence, epoch, and geometry headers
+    // when its frontend and Bamboo use different local origins.
+    cors.expose_headers([
+        header::ETAG,
+        header::HeaderName::from_static("x-frame-seq"),
+        header::HeaderName::from_static("x-tab-id"),
+        header::HeaderName::from_static("x-page-epoch"),
+        header::HeaderName::from_static("x-viewport-width"),
+        header::HeaderName::from_static("x-viewport-height"),
+    ])
+}
+
+/// Apply the Governor (rate limiter) + CORS middleware pair to `app`, IN THE
+/// ORDER THAT MATTERS (#169 part 2, #428).
+///
+/// Governor is wrapped first (the INNER layer) and `build_cors` second (the
+/// OUTER layer). This ordering is load-bearing: (1) a genuine CORS preflight
+/// is short-circuited by CORS and never reaches Governor, so it isn't counted
+/// against the rate-limit bucket; and (2) a 429 from Governor propagates back
+/// OUT through CORS, which adds `Access-Control-Allow-Origin` so a browser
+/// receives a readable 429 instead of an opaque network error. Reversing the
+/// two wraps regresses both (see the `governor_inside_cors_*` /
+/// `governor_outside_cors_regression_*` tests below).
+///
+/// This is the ONE place the wrap order is spelled out — every production app
+/// factory (`entrypoints.rs`, `web_service.rs`) AND the ordering-invariant
+/// regression tests call this helper instead of each re-declaring the two
+/// `.wrap()` calls inline. That means a future edit can no longer swap the
+/// order in just one of those call sites without also changing this function,
+/// and changing this function is exactly what the regression tests cover
+/// (#428 — prior to this, the tests built their own hand-rolled `App` with the
+/// order spelled out separately from production, so a production-only swap
+/// would NOT have failed them).
+pub fn wrap_governor_and_cors<T, B>(
+    app: App<T>,
+    rate_limiter: &RateLimiterConfig<ClientIpKeyExtractor>,
+    apply_rate_limit: bool,
+    bind_addr: &str,
+    port: u16,
+) -> App<
+    impl ServiceFactory<
+        ServiceRequest,
+        Config = (),
+        Response = ServiceResponse<impl MessageBody>,
+        Error = actix_web::Error,
+        InitError = (),
+    >,
+>
+where
+    T: ServiceFactory<
+            ServiceRequest,
+            Config = (),
+            Response = ServiceResponse<B>,
+            Error = actix_web::Error,
+            InitError = (),
+        > + 'static,
+    B: MessageBody + 'static,
+{
+    app.wrap(Condition::new(
+        apply_rate_limit,
+        RateLimit::new(rate_limiter),
+    ))
+    .wrap(build_cors(bind_addr, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_config_clamps_degenerate_values() {
+        // 0 per_second / 0 burst would make finish() reject; the clamps keep it
+        // valid (no panic).
+        let _ = rate_limiter_config(0, 0, ClientIpKeyExtractor::peer_ip());
+        let _ = rate_limiter_config(1000, 1, ClientIpKeyExtractor::peer_ip());
+    }
+
+    #[test]
+    fn loopback_binds_skip_rate_limiter() {
+        // Desktop sidecar binds must be exempt (frontend bursts asset requests);
+        // network-exposed binds must stay throttled.
+        for b in ["127.0.0.1", "localhost", "::1"] {
+            assert!(
+                is_loopback_bind(b),
+                "{b} should be loopback (limiter skipped)"
+            );
+        }
+        for b in ["0.0.0.0", "192.168.1.10", "::"] {
+            assert!(!is_loopback_bind(b), "{b} should be throttled");
+        }
+    }
+
+    #[test]
+    fn loopback_binds_recognizes_full_loopback_range_and_bracketed_ipv6() {
+        // #428: a strict `127.0.0.1`/`localhost`/`::1` string allowlist
+        // misclassifies other loopback forms as non-loopback (failing safe,
+        // but wrong). Classifying via `IpAddr::is_loopback` fixes it.
+        for b in ["127.0.0.2", "127.255.255.255", "[::1]", "LOCALHOST"] {
+            assert!(is_loopback_bind(b), "{b} is a loopback address/host");
+        }
+    }
+
+    #[actix_web::test]
+    async fn asset_cache_headers_only_tag_hashed_assets() {
+        use actix_web::http::header::CACHE_CONTROL;
+        use actix_web::{test, web, App, HttpResponse};
+
+        let app = test::init_service(
+            App::new()
+                .wrap(actix_web::middleware::from_fn(add_asset_cache_headers))
+                .route(
+                    "/assets/main-abc123.css",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                )
+                .route(
+                    "/index.html",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                ),
+        )
+        .await;
+
+        // A hashed `/assets/*` file gets the immutable long-cache header.
+        let req = test::TestRequest::get()
+            .uri("/assets/main-abc123.css")
+            .to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(
+            res.headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=31536000, immutable"),
+        );
+
+        // `index.html` (and anything outside `/assets/`) must stay fresh so a new
+        // deploy is picked up immediately — no long-cache header added.
+        let req = test::TestRequest::get().uri("/index.html").to_request();
+        let res = test::call_service(&app, req).await;
+        assert!(
+            res.headers().get(CACHE_CONTROL).is_none(),
+            "non-asset routes must not be long-cached"
+        );
+    }
+
+    #[actix_web::test]
+    async fn rate_limiter_throttles_with_429_after_burst() {
+        use crate::rate_limit::RateLimit;
+        use actix_web::http::StatusCode;
+        use actix_web::{test, web, App, HttpResponse};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // burst=2: the first two requests from an IP pass, the rest are throttled.
+        let conf = rate_limiter_config(1, 2, ClientIpKeyExtractor::peer_ip());
+        let app = test::init_service(
+            App::new()
+                .wrap(RateLimit::new(&conf))
+                .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 9999);
+        let (mut saw_ok, mut saw_429) = (false, false);
+        for _ in 0..6 {
+            let req = test::TestRequest::get().uri("/").peer_addr(ip).to_request();
+            match test::call_service(&app, req).await.status() {
+                StatusCode::OK => saw_ok = true,
+                StatusCode::TOO_MANY_REQUESTS => saw_429 = true,
+                other => panic!("unexpected status {other}"),
+            }
+        }
+        assert!(saw_ok, "requests within the burst must pass");
+        assert!(saw_429, "requests beyond the burst must be 429'd (#13)");
+
+        // A DIFFERENT client IP has its OWN bucket — proving per-IP keying (a
+        // global bucket would 429 this too); guards against a regression to a
+        // global key extractor.
+        let other_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 8888);
+        let req = test::TestRequest::get()
+            .uri("/")
+            .peer_addr(other_ip)
+            .to_request();
+        assert_eq!(
+            test::call_service(&app, req).await.status(),
+            StatusCode::OK,
+            "a different IP gets its own fresh bucket (per-IP, not global)"
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_default_ignores_xff_and_uses_peer_ip() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        // Default (trust_xff = false): a client-supplied XFF must be ignored so it
+        // can't spoof its rate-limit key on a directly-exposed server.
+        let ke = ClientIpKeyExtractor::peer_ip();
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 5000);
+        let req = test::TestRequest::get()
+            .peer_addr(peer)
+            .insert_header(("x-forwarded-for", "1.2.3.4"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&req).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_xff_uses_rightmost_at_one_hop_not_client_prefix() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        // trusted_hops = 1: only the entry OUR proxy appended (rightmost) is
+        // trusted; a client prepending a fake IP can't change the key.
+        let ke = ClientIpKeyExtractor {
+            trust_xff: true,
+            trusted_hops: 1,
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000); // proxy
+        let req = test::TestRequest::get()
+            .peer_addr(peer)
+            .insert_header(("x-forwarded-for", "1.1.1.1, 2.2.2.2"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&req).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_xff_two_hops_takes_second_from_right() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let ke = ClientIpKeyExtractor {
+            trust_xff: true,
+            trusted_hops: 2,
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let req = test::TestRequest::get()
+            .peer_addr(peer)
+            .insert_header(("x-forwarded-for", "1.1.1.1, 2.2.2.2, 3.3.3.3"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&req).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_xff_fails_closed_to_peer_when_header_too_short_or_absent() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let ke = ClientIpKeyExtractor {
+            trust_xff: true,
+            trusted_hops: 2,
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+
+        // Fewer entries than trusted hops → not a trusted-proxy shape → peer IP.
+        let short = test::TestRequest::get()
+            .peer_addr(peer)
+            .insert_header(("x-forwarded-for", "9.9.9.9"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&short).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+
+        // No XFF at all → peer IP.
+        let none = test::TestRequest::get().peer_addr(peer).to_srv_request();
+        assert_eq!(
+            ke.extract(&none).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+        );
+    }
+
+    #[actix_web::test]
+    async fn key_extractor_xff_flattens_multiple_header_lines_in_order() {
+        use actix_web::test;
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        // A proxy chain that appends a SECOND header line rather than extending
+        // the comma-joined value: the entries must be treated as one ordered list
+        // (client-first ... proxy-last), so 1-hop still selects the true rightmost
+        // entry authored by the nearest proxy — not the first line's value.
+        let ke = ClientIpKeyExtractor {
+            trust_xff: true,
+            trusted_hops: 1,
+        };
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5000);
+        let req = test::TestRequest::get()
+            .peer_addr(peer)
+            .append_header(("x-forwarded-for", "1.1.1.1"))
+            .append_header(("x-forwarded-for", "2.2.2.2"))
+            .to_srv_request();
+        assert_eq!(
+            ke.extract(&req).unwrap(),
+            IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))
+        );
+    }
+
+    #[test]
+    fn parse_forwarded_ip_handles_bare_port_and_bracketed_forms() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        assert_eq!(
+            parse_forwarded_ip("1.2.3.4"),
+            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
+        );
+        assert_eq!(
+            parse_forwarded_ip("1.2.3.4:5678"),
+            Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))
+        );
+        assert_eq!(
+            parse_forwarded_ip("[::1]:9000"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            parse_forwarded_ip("[::1]"),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(parse_forwarded_ip("not-an-ip"), None);
+    }
+
+    #[test]
+    fn mask_ipv6_prefix_zeroes_lower_bytes_and_leaves_ipv4() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(mask_ipv6_prefix(v4), v4);
+
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6));
+        // /56: first 7 bytes preserved, remaining 9 zeroed.
+        assert_eq!(
+            mask_ipv6_prefix(v6),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0))
+        );
+    }
+
+    // --- #169 part 2: preflight/CORS-safe 429 -----------------------------------
+    //
+    // These build the REAL production wrap order (Governor registered *before*
+    // CORS, i.e. Governor is the INNER wrap and CORS is OUTER) and a browser
+    // request, then assert what a browser actually receives. `probe!` drains the
+    // burst with `gets` GETs (allowed Origin) then sends one CORS preflight,
+    // yielding `(last_get_status, last_get_has_acao, preflight_status)`.
+    macro_rules! probe_cors_and_preflight {
+        ($app:expr, $ip:expr, $origin:expr, $gets:expr) => {{
+            use actix_web::http::header;
+            use actix_web::test;
+
+            let mut status = actix_web::http::StatusCode::OK;
+            let mut has_acao = false;
+            for _ in 0..$gets {
+                let res = test::call_service(
+                    &$app,
+                    test::TestRequest::get()
+                        .uri("/")
+                        .peer_addr($ip)
+                        .insert_header((header::ORIGIN, $origin))
+                        .to_request(),
+                )
+                .await;
+                status = res.status();
+                has_acao = res
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+            }
+
+            let pre = test::call_service(
+                &$app,
+                test::TestRequest::default()
+                    .method(actix_web::http::Method::OPTIONS)
+                    .uri("/")
+                    .peer_addr($ip)
+                    .insert_header((header::ORIGIN, $origin))
+                    .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
+                    .to_request(),
+            )
+            .await;
+
+            (status, has_acao, pre.status())
+        }};
+    }
+
+    /// A browser can only read the session CAS token and frame metadata when
+    /// CORS explicitly exposes their headers. Exercise the real session route behind the production
+    /// CORS middleware for every bind-mode branch, while keeping the existing
+    /// permissive request-header policy available to `If-Match` preflights.
+    #[actix_web::test]
+    async fn cors_exposes_session_etag_for_every_bind_mode() {
+        use crate::routes::configure_routes;
+        use crate::AppState;
+        use actix_web::http::{header, Method, StatusCode};
+        use actix_web::{test, web, App};
+        use bamboo_agent_core::Session;
+        use tempfile::tempdir;
+
+        let temp_dir = tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let state = web::Data::new(
+            AppState::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("app state"),
+        );
+        let session_id = "cors-etag-session";
+        let mut session = Session::new(session_id, "model");
+        state.save_and_cache_session(&mut session).await;
+
+        for (bind_addr, origin) in [
+            ("127.0.0.1", "http://127.0.0.1:1420"),
+            ("0.0.0.0", "http://127.0.0.1:1420"),
+            ("192.0.2.10", "http://192.0.2.10:1420"),
+        ] {
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .wrap(build_cors(bind_addr, 9562))
+                    .configure(configure_routes),
+            )
+            .await;
+
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&format!("/api/v1/sessions/{session_id}"))
+                    .insert_header((header::ORIGIN, origin))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "bind {bind_addr}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ETAG)
+                    .and_then(|value| value.to_str().ok()),
+                Some("\"0\""),
+                "the real session response must still carry its CAS token for bind {bind_addr}"
+            );
+
+            let exposed = response
+                .headers()
+                .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>();
+            assert!(
+                exposed
+                    .iter()
+                    .any(|value| value.eq_ignore_ascii_case("etag")),
+                "ETag must be browser-readable for bind {bind_addr}; exposed={exposed:?}"
+            );
+            for name in [
+                "x-frame-seq",
+                "x-tab-id",
+                "x-page-epoch",
+                "x-viewport-width",
+                "x-viewport-height",
+            ] {
+                assert!(
+                    exposed.iter().any(|value| value.eq_ignore_ascii_case(name)),
+                    "{name} must be browser-readable for bind {bind_addr}; exposed={exposed:?}"
+                );
+            }
+            assert_eq!(
+                exposed.len(),
+                6,
+                "only the CAS and browser frame headers are exposed for bind {bind_addr}"
+            );
+
+            let preflight = test::call_service(
+                &app,
+                test::TestRequest::default()
+                    .method(Method::OPTIONS)
+                    .uri(&format!("/api/v1/sessions/{session_id}"))
+                    .insert_header((header::ORIGIN, origin))
+                    .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "PATCH"))
+                    .insert_header((
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "content-type, if-match",
+                    ))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                preflight.status(),
+                StatusCode::OK,
+                "existing PATCH preflight behavior must remain intact for bind {bind_addr}"
+            );
+            let allowed_headers = preflight
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            assert!(
+                allowed_headers
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case("if-match")),
+                "If-Match must remain allowed for bind {bind_addr}; allowed={allowed_headers}"
+            );
+        }
+
+        state.shutdown().await;
+    }
+
+    /// The production order — enforced by the shared [`wrap_governor_and_cors`]
+    /// helper (Governor inner, CORS outer) and used by BOTH the real app
+    /// factories (`entrypoints.rs`, `web_service.rs`) and this test — must give
+    /// a browser a READABLE 429: the throttled response carries
+    /// `Access-Control-Allow-Origin`, and a CORS preflight is NOT counted
+    /// against the bucket (CORS answers it before it reaches Governor).
+    ///
+    /// Because this test calls the SAME helper the production factories call
+    /// (rather than hand-rolling the wrap order itself, #428), a future edit
+    /// that swaps the wrap order in `wrap_governor_and_cors` — the only place
+    /// production spells the order out — fails this test.
+    #[actix_web::test]
+    async fn governor_inside_cors_makes_429_cors_readable_and_exempts_preflight() {
+        use actix_web::http::StatusCode;
+        use actix_web::{test, web, App, HttpResponse};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // burst=1: the 2nd GET from an IP is throttled.
+        let conf = rate_limiter_config(1, 1, ClientIpKeyExtractor::peer_ip());
+        let app = test::init_service(
+            wrap_governor_and_cors(
+                App::new(),
+                &conf,
+                /* apply_rate_limit */ true,
+                "0.0.0.0",
+                9562,
+            )
+            .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 9999);
+        let (get_status, get_has_acao, preflight_status) =
+            probe_cors_and_preflight!(app, ip, "http://localhost:5173", 2);
+
+        assert_eq!(
+            get_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the 2nd GET past the burst must be throttled (#13 guarantee intact)"
+        );
+        assert!(
+            get_has_acao,
+            "a 429 must carry Access-Control-Allow-Origin so a browser sees a readable 429, \
+             not an opaque network error (#169 part 2)"
+        );
+        assert_ne!(
+            preflight_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a CORS preflight must NOT be throttled — it never reaches Governor (#169 part 2)"
+        );
+    }
+
+    /// Guards the ordering as load-bearing: the REVERSED order
+    /// (`.wrap(build_cors).wrap(Governor)` → Governor OUTSIDE CORS) is the pre-fix
+    /// state that motivated #169 — a 429 escapes without CORS headers and the
+    /// preflight is throttled. If a refactor ever flips the wrap order back
+    /// inside [`wrap_governor_and_cors`], the positive test above breaks; this
+    /// test intentionally does NOT use that helper — it hand-rolls the WRONG
+    /// order to document *why* the order matters, by asserting the broken
+    /// behavior that would result.
+    #[actix_web::test]
+    async fn governor_outside_cors_regression_drops_cors_and_throttles_preflight() {
+        use crate::rate_limit::RateLimit;
+        use actix_web::http::StatusCode;
+        use actix_web::{test, web, App, HttpResponse};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let conf = rate_limiter_config(1, 1, ClientIpKeyExtractor::peer_ip());
+        let app = test::init_service(
+            App::new()
+                .wrap(build_cors("0.0.0.0", 9562)) // inner (WRONG)
+                .wrap(RateLimit::new(&conf)) // outer (WRONG)
+                .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 9999);
+        let (get_status, get_has_acao, preflight_status) =
+            probe_cors_and_preflight!(app, ip, "http://localhost:5173", 2);
+
+        assert_eq!(
+            get_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "still a 429 in the wrong order..."
+        );
+        assert!(
+            !get_has_acao,
+            "...but WITHOUT CORS headers — the browser-opaque failure #169 part 2 fixes"
+        );
+        assert_eq!(
+            preflight_status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "and the preflight IS throttled in the wrong order (counted against the bucket)"
+        );
+    }
+
+    // --- #169 part 3: bind-aware limiter guard ----------------------------------
+
+    #[test]
+    fn require_limiter_rejects_nonloopback_without_limiter() {
+        // The dangerous combination: a routable bind with no limiter → rejected.
+        for b in ["0.0.0.0", "192.168.1.10", "::"] {
+            assert!(
+                require_limiter_for_nonloopback(b, false).is_err(),
+                "{b} without a limiter must be rejected (#169 part 3)"
+            );
+        }
+    }
+
+    #[test]
+    fn require_limiter_allows_loopback_and_limited_binds() {
+        // Loopback with no limiter is preserved (desktop sidecar, intentionally
+        // un-throttled) — the guard must NOT weaken it.
+        for b in ["127.0.0.1", "localhost", "::1"] {
+            assert!(
+                require_limiter_for_nonloopback(b, false).is_ok(),
+                "{b} loopback must stay allowed without a limiter (desktop behavior)"
+            );
+        }
+        // A non-loopback bind IS allowed once a limiter is applied.
+        for b in ["0.0.0.0", "192.168.1.10"] {
+            assert!(
+                require_limiter_for_nonloopback(b, true).is_ok(),
+                "{b} with a limiter applied must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn default_csp_allows_browser_frames_without_relaxing_scripts() {
+        assert!(DEFAULT_CSP.contains("script-src 'self'"));
+        assert!(DEFAULT_CSP.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(DEFAULT_CSP.contains("img-src 'self' data: blob: https:;"));
+        assert!(!DEFAULT_CSP.contains("unsafe-eval"));
+    }
+
+    #[test]
+    fn connect_src_append_normalizes_explicit_origins() {
+        let sources = parse_csp_connect_src_append(
+            "https://bodhi.bigduu.com:9562, http://bodhi.bigduu.com:9562/",
+        );
+        assert_eq!(
+            sources,
+            vec![
+                "https://bodhi.bigduu.com:9562".to_string(),
+                "http://bodhi.bigduu.com:9562".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_connect_src_sources_extends_default_csp() {
+        let csp = append_connect_src_sources(
+            DEFAULT_CSP,
+            &[
+                "https://bodhi.bigduu.com:9562".to_string(),
+                "http://bodhi.bigduu.com:9562".to_string(),
+            ],
+        );
+
+        assert!(csp.contains("connect-src 'self' ws: wss:"));
+        assert!(csp.contains("https://bodhi.bigduu.com:9562"));
+        assert!(csp.contains("http://bodhi.bigduu.com:9562"));
+    }
+
+    #[test]
+    fn invalid_override_falls_back_to_default() {
+        // Header values cannot contain newlines.
+        let v = resolve_csp_header_value(Some("default-src 'self'\nscript-src 'self'"));
+        let rendered = v.to_str().expect("header should be valid utf-8");
+        assert!(rendered.contains("connect-src 'self' ws: wss:"));
+        assert!(rendered.contains("http://127.0.0.1:*"));
+        assert!(rendered.contains("http://localhost:*"));
+        assert!(rendered.contains("http://bodhi.bigduu.com:9562"));
+        assert!(rendered.contains("https://bodhi.bigduu.com:9562"));
+        assert!(rendered.contains("style-src 'self' 'unsafe-inline'"));
+    }
+
+    #[test]
+    fn cors_allowlist_parses_hosts_and_origins() {
+        let allow = parse_cors_allowlist(
+            "https://app.example.com/, app.example2.com, *.example.net , http://localhost:5173",
+        );
+        assert!(allow.exact_origins.contains("https://app.example.com"));
+        assert!(allow.exact_origins.contains("http://localhost:5173"));
+        assert!(allow
+            .hosts
+            .contains(&HostPattern::Exact("app.example2.com".to_string())));
+        assert!(allow
+            .hosts
+            .contains(&HostPattern::Suffix(".example.net".to_string())));
+    }
+
+    #[test]
+    fn cors_allowlist_matches_exact_and_wildcard_hosts() {
+        let mut allow = CorsAllowlist::default();
+        allow
+            .exact_origins
+            .insert("https://app.example.com".to_string());
+        allow
+            .hosts
+            .push(HostPattern::Exact("app2.example.com".to_string()));
+        allow
+            .hosts
+            .push(HostPattern::Suffix(".example.net".to_string()));
+
+        assert!(is_allowed_by_allowlist("https://app.example.com", &allow));
+        assert!(is_allowed_by_allowlist(
+            "https://app.example.com:443",
+            &allow
+        ));
+        assert!(is_allowed_by_allowlist(
+            "http://app2.example.com:5173",
+            &allow
+        ));
+        assert!(is_allowed_by_allowlist("https://x.example.net", &allow));
+        assert!(!is_allowed_by_allowlist("https://example.net", &allow));
+        assert!(!is_allowed_by_allowlist("https://evil.com", &allow));
+    }
+
+    #[test]
+    fn local_dev_origin_allows_mac_local_and_bodhi_domain() {
+        assert!(is_local_dev_origin("http://mac.local:1420"));
+        assert!(is_local_dev_origin("https://mac.local:1420"));
+        assert!(is_local_dev_origin("http://bodhi.bigduu.com:9562"));
+        assert!(is_local_dev_origin("https://bodhi.bigduu.com:9562"));
+        assert!(!is_local_dev_origin("http://evil.com:1420"));
+    }
+}

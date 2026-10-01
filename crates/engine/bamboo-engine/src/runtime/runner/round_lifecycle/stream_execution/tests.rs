@@ -1,0 +1,4938 @@
+// Test env-lock is a std Mutex intentionally held across .await to serialize env access.
+#![allow(clippy::await_holding_lock)]
+
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use async_trait::async_trait;
+use futures::stream;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    context_management_telemetry, discard_latest_interrupted_assistant_output, execute_llm_stream,
+    LlmStreamFrame, INTERRUPTED_ASSISTANT_OUTPUT_KIND,
+};
+use bamboo_agent_core::agent::types::{ConversationSummary, TaskItem, TaskItemStatus, TaskList};
+use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
+use bamboo_agent_core::{
+    AgentError, AgentEvent, Message, ProviderPromptUsage, Role, Session, TokenBudgetUsage,
+};
+use bamboo_compression::{
+    BudgetStrategy, PreparedContext, TokenBudget, TokenCounter, TokenUsageBreakdown,
+};
+use bamboo_llm::{
+    Config, LLMChunk, LLMProvider, LLMRequestOptions, LLMStream, ProviderVisibleToolFootprint,
+    ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind,
+};
+use bamboo_metrics::storage::MetricsStorage;
+use chrono::Utc;
+
+use super::super::PromptMemoryExposureFrame;
+
+#[test]
+fn interrupted_retry_rollback_returns_exact_removed_visible_message_id() {
+    let mut session = Session::new("retry-rollback", "model");
+    let mut interrupted = Message::assistant("partial visible text", None);
+    interrupted.id = "visible-attempt-1".to_string();
+    interrupted.metadata = Some(serde_json::json!({
+        "runtime_kind": INTERRUPTED_ASSISTANT_OUTPUT_KIND,
+    }));
+    session.add_message(interrupted.clone());
+
+    let removed = discard_latest_interrupted_assistant_output(&mut session, None);
+    assert_eq!(removed.as_deref(), Some("visible-attempt-1"));
+    assert!(session.messages.is_empty());
+
+    session.add_message(interrupted);
+    let protected =
+        discard_latest_interrupted_assistant_output(&mut session, Some("visible-attempt-1"));
+    assert!(protected.is_none());
+    assert_eq!(session.messages.len(), 1);
+}
+
+fn isolate_prompt_safe_env_cache() -> MutexGuard<'static, ()> {
+    let guard = crate::runtime::tests::env_cache_lock_acquire();
+    let empty_data_dir = tempfile::tempdir().expect("temp dir for empty config");
+    let _ = Config::from_data_dir(Some(empty_data_dir.path().to_path_buf()));
+    guard
+}
+
+struct MockLlmProvider {
+    chunks: Vec<LLMChunk>,
+    requested_messages: Mutex<Vec<Message>>,
+    requested_session_id: Mutex<Option<String>>,
+    requested_previous_response_id: Mutex<Option<String>>,
+    requested_reasoning_summary: Mutex<Option<String>>,
+    requested_store: Mutex<Option<bool>>,
+    requested_include: Mutex<Option<Vec<String>>>,
+    requested_text_verbosity: Mutex<Option<String>>,
+    requested_instructions: Mutex<Option<String>>,
+    requested_required_tool: Mutex<Option<String>>,
+    requested_parallel_tool_calls: Mutex<Option<bool>>,
+    requested_tool_names: Mutex<Vec<String>>,
+    /// Set when the engine routed this request through the canonical
+    /// `chat_stream_ir` entry point.
+    ir_invoked: Mutex<bool>,
+    ir_call_count: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for MockLlmProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        panic!("chat_stream should not be called directly in this test");
+    }
+
+    async fn chat_stream_ir(
+        &self,
+        ir: &bamboo_llm::PromptIR,
+        tools: &[bamboo_agent_core::tools::ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        *self.ir_invoked.lock().expect("ir_invoked lock") = true;
+        self.ir_call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Faithful Responses-provider adapter: derive the flat messages AND the
+        // Responses wire options (instructions / input_messages / previous_response_id)
+        // from the IR, exactly like the OpenAI/Copilot overrides — so the captured
+        // request reflects what a real adapter sends, not an engine pre-bake.
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
+        } else {
+            ir.flatten()
+        };
+        let mut effective_options = options.cloned().unwrap_or_default();
+        effective_options.responses =
+            Some(ir.responses_request_options(effective_options.responses.as_ref()));
+        self.chat_stream_with_options(
+            &messages,
+            tools,
+            max_output_tokens,
+            model,
+            Some(&effective_options),
+        )
+        .await
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        *self.requested_messages.lock().expect("messages lock") = messages.to_vec();
+        *self.requested_session_id.lock().expect("session_id lock") =
+            options.and_then(|value| value.session_id.clone());
+        *self
+            .requested_previous_response_id
+            .lock()
+            .expect("previous_response_id lock") = options
+            .and_then(|value| value.responses.as_ref())
+            .and_then(|value| value.previous_response_id.clone());
+        *self
+            .requested_reasoning_summary
+            .lock()
+            .expect("reasoning_summary lock") = options
+            .and_then(|value| value.responses.as_ref())
+            .and_then(|value| value.reasoning_summary.clone());
+        *self.requested_store.lock().expect("store lock") = options
+            .and_then(|value| value.responses.as_ref())
+            .and_then(|value| value.store);
+        *self.requested_include.lock().expect("include lock") = options
+            .and_then(|value| value.responses.as_ref())
+            .and_then(|value| value.include.clone());
+        *self
+            .requested_text_verbosity
+            .lock()
+            .expect("text_verbosity lock") = options
+            .and_then(|value| value.responses.as_ref())
+            .and_then(|value| value.text_verbosity.clone());
+        *self
+            .requested_instructions
+            .lock()
+            .expect("instructions lock") = options
+            .and_then(|value| value.responses.as_ref())
+            .and_then(|value| value.instructions.clone());
+        *self
+            .requested_required_tool
+            .lock()
+            .expect("required_tool lock") = options.and_then(|value| value.required_tool.clone());
+        *self
+            .requested_parallel_tool_calls
+            .lock()
+            .expect("parallel_tool_calls lock") =
+            options.and_then(|value| value.parallel_tool_calls);
+        *self.requested_tool_names.lock().expect("tool names lock") = tools
+            .iter()
+            .map(|schema| schema.function.name.clone())
+            .collect();
+
+        let items = self
+            .chunks
+            .clone()
+            .into_iter()
+            .map(Ok::<LLMChunk, bamboo_llm::provider::LLMError>);
+        Ok(Box::pin(stream::iter(items)))
+    }
+}
+
+fn mock_llm(chunks: Vec<LLMChunk>) -> Arc<MockLlmProvider> {
+    Arc::new(MockLlmProvider {
+        chunks,
+        requested_messages: Mutex::new(Vec::new()),
+        requested_session_id: Mutex::new(None),
+        requested_previous_response_id: Mutex::new(None),
+        requested_reasoning_summary: Mutex::new(None),
+        requested_store: Mutex::new(None),
+        requested_include: Mutex::new(None),
+        requested_text_verbosity: Mutex::new(None),
+        requested_instructions: Mutex::new(None),
+        requested_required_tool: Mutex::new(None),
+        requested_parallel_tool_calls: Mutex::new(None),
+        requested_tool_names: Mutex::new(Vec::new()),
+        ir_invoked: Mutex::new(false),
+        ir_call_count: std::sync::atomic::AtomicUsize::new(0),
+    })
+}
+
+fn provider_visible_schema(
+    name: &str,
+    description: impl Into<String>,
+    parameters: serde_json::Value,
+) -> ToolSchema {
+    ToolSchema {
+        schema_type: "function".to_string(),
+        function: FunctionSchema {
+            name: name.to_string(),
+            description: description.into(),
+            parameters,
+        },
+    }
+}
+
+fn test_config(system_prompt: &str) -> crate::runtime::config::AgentLoopConfig {
+    crate::runtime::config::AgentLoopConfig {
+        model_name: Some("test-model".to_string()),
+        system_prompt: Some(system_prompt.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn context_management_telemetry_tracks_effective_strategy_and_latest_boundary() {
+    let mut session = Session::new("telemetry-context", "test-model");
+    session.reset_model_context_epoch(bamboo_domain::ModelContextResetReason::Compression);
+
+    let mut first = bamboo_domain::CompressionEvent::new(
+        2,
+        1,
+        80.0,
+        60.0,
+        0,
+        bamboo_domain::CompressionTriggerType::Manual,
+        0.0,
+        None,
+        0,
+    );
+    first.id = "archive-event-1".to_string();
+    first.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+    let mut latest = bamboo_domain::CompressionEvent::new(
+        2,
+        1,
+        82.0,
+        58.0,
+        0,
+        bamboo_domain::CompressionTriggerType::CriticalOverflow,
+        0.0,
+        None,
+        0,
+    );
+    latest.id = "archive-event-2".to_string();
+    latest.kind = bamboo_domain::CompressionEventKind::RetrievalWindow;
+    session.compression_events.extend([first, latest]);
+
+    let mut config = test_config("system");
+    config.context_management.strategy = bamboo_config::ContextManagementStrategy::RetrievalWindow;
+    let telemetry = context_management_telemetry(&session, &config);
+    assert_eq!(telemetry.strategy, "retrieval_window");
+    assert_eq!(telemetry.model_context_epoch, 1);
+    assert_eq!(
+        telemetry.model_context_reset_reason.as_deref(),
+        Some("compression")
+    );
+    assert_eq!(telemetry.retrieval_archive_event_count, 2);
+    assert_eq!(
+        telemetry.latest_retrieval_archive_event_id.as_deref(),
+        Some("archive-event-2")
+    );
+    assert_eq!(
+        telemetry.latest_retrieval_archive_trigger_type.as_deref(),
+        Some("critical_overflow")
+    );
+
+    config.context_management.retrieval_window.fallback_strategy =
+        bamboo_config::ContextManagementFallbackStrategy::Summary;
+    session.conversation_summary = Some(ConversationSummary::new("fallback", 4, 100));
+    assert_eq!(
+        context_management_telemetry(&session, &config).strategy,
+        "summary"
+    );
+}
+
+async fn prompt_exposure_metrics(
+    session_id: &str,
+    round_id: &str,
+) -> (
+    tempfile::TempDir,
+    bamboo_metrics::MetricsCollector,
+    Arc<bamboo_metrics::SqliteMetricsStorage>,
+) {
+    let directory = tempfile::tempdir().expect("metrics tempdir");
+    let storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+        directory.path().join("metrics.db"),
+    ));
+    storage.init().await.expect("initialize metrics storage");
+    storage
+        .upsert_session_start(session_id, "test-model", Utc::now())
+        .await
+        .expect("insert owning session");
+    storage
+        .insert_round_start(round_id, session_id, "test-model", Utc::now())
+        .await
+        .expect("insert owning round");
+    let collector = bamboo_metrics::MetricsCollector::spawn(storage.clone(), 90);
+    (directory, collector, storage)
+}
+
+async fn wait_for_prompt_exposure(
+    storage: &bamboo_metrics::SqliteMetricsStorage,
+    round_id: &str,
+) -> bamboo_metrics::types::PromptMemoryExposureObservation {
+    for _ in 0..100 {
+        if let Some(observation) = storage
+            .prompt_memory_exposure(round_id)
+            .await
+            .expect("query prompt-memory exposure")
+        {
+            return observation;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("prompt-memory observation was not persisted");
+}
+
+async fn assert_no_prompt_exposure_after_collector_barrier(
+    collector: &bamboo_metrics::MetricsCollector,
+    storage: &bamboo_metrics::SqliteMetricsStorage,
+    session_id: &str,
+    round_id: &str,
+) {
+    const BARRIER_MESSAGE_COUNT: u32 = 42_077_107;
+    collector.session_message_count(session_id, BARRIER_MESSAGE_COUNT, Utc::now());
+    for _ in 0..100 {
+        let barrier_reached = storage
+            .session_detail(session_id)
+            .await
+            .expect("query collector barrier")
+            .is_some_and(|detail| detail.session.message_count == BARRIER_MESSAGE_COUNT);
+        if barrier_reached {
+            assert!(storage
+                .prompt_memory_exposure(round_id)
+                .await
+                .expect("query prompt-memory exposure after barrier")
+                .is_none());
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("metrics collector barrier was not observed");
+}
+
+/// The system field that a base prompt resolves to once the framework-invariant
+/// agent directives are folded in — mirrors what `build_stable_prompt_frame_*`
+/// produces for a bare base (no workspace/env/skill/tool-guide contexts).
+fn expected_system_field(base: &str) -> String {
+    crate::runtime::runner::prompt_context::append_core_agent_directives(
+        base,
+        crate::runtime::context::CORE_AGENT_DIRECTIVES,
+    )
+}
+
+fn assert_session_identity_message(message: &Message, session_id: &str) {
+    let encoded_session_id =
+        serde_json::to_string(session_id).expect("test Session ID is JSON serializable");
+    assert!(matches!(message.role, Role::User));
+    assert!(message.content.contains("context_type: session_identity"));
+    assert!(message
+        .content
+        .contains(&format!("Current Session ID: {encoded_session_id}")));
+}
+
+#[test]
+fn system_remainder_none_when_persisted_base_absorbed_by_directive_system() {
+    // Persisted System message holds the base WITHOUT directives; the assembled
+    // system field is that same base WITH the framework directives appended. The
+    // base is fully absorbed by the system field, so no duplicate system message
+    // is re-emitted into the conversation.
+    let persisted = bamboo_agent_core::Message::system("You are Bodhi. Do good work.");
+    let stable = expected_system_field("You are Bodhi. Do good work.");
+    assert!(super::derive_system_remainder_message(&persisted, &stable).is_none());
+}
+
+#[test]
+fn system_remainder_none_when_bare_base_is_prefix_of_context_bearing_system() {
+    // Production shape: the persisted System message is the bare configured base
+    // (contexts are injected only at request time), while the assembled system
+    // field appends framework contexts (workspace/skill/tool-guide/env). The bare
+    // base is fully contained at the head, so it is absorbed — no redundant
+    // re-emission of the base into the conversation. (This would FAIL before the
+    // subset-prefix fix, which re-emitted the whole base every round.)
+    let persisted = bamboo_agent_core::Message::system("You are Bodhi. Do good work.");
+    let stable = "You are Bodhi. Do good work.\n\nWorkspace path: /tmp/x\n\n## Skill\nuse it";
+    assert!(super::derive_system_remainder_message(&persisted, stable).is_none());
+}
+
+#[test]
+fn system_remainder_keeps_genuinely_extra_persisted_content() {
+    // The persisted base carries trailing content not present in the system field.
+    // Stripping directives from both sides must NOT swallow that genuine extra —
+    // it is re-emitted as a remainder message.
+    let persisted = bamboo_agent_core::Message::system("Base.\n\nExtra operator note.");
+    let stable = expected_system_field("Base.");
+    let remainder = super::derive_system_remainder_message(&persisted, &stable)
+        .expect("genuinely-extra persisted content must be re-emitted");
+    assert!(remainder.content.contains("Extra operator note"));
+}
+
+#[test]
+fn system_remainder_strips_legacy_goal_block() {
+    // The goal now rides the volatile tail (built from the active goal). A legacy
+    // persisted System message still carrying a `<!-- BAMBOO_GOAL_START -->` block
+    // must NOT resurface it in the SystemRemainder run (it would duplicate the
+    // active volatile-tail goal). Once stripped, only the bare base remains, which
+    // matches the system field → no remainder.
+    let goal_block = "<!-- BAMBOO_GOAL_START -->\nSHIP THE RELEASE\n<!-- BAMBOO_GOAL_END -->";
+    let persisted = bamboo_agent_core::Message::system(format!("Base.\n\n{goal_block}"));
+    let stable = expected_system_field("Base.");
+    assert!(
+        super::derive_system_remainder_message(&persisted, &stable).is_none(),
+        "legacy goal block must be stripped from the remainder (goal rides the volatile tail)"
+    );
+}
+
+fn usage(summary_tokens: u32, total_tokens: u32) -> TokenUsageBreakdown {
+    TokenUsageBreakdown {
+        system_tokens: 10,
+        summary_tokens,
+        window_tokens: total_tokens
+            .saturating_sub(10)
+            .saturating_sub(summary_tokens),
+        total_tokens,
+        budget_limit: 100,
+    }
+}
+
+#[tokio::test]
+async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-1", "test-model");
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system")],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![LLMChunk::Token("hi".to_string()), LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-1",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    assert!(stream_output.response_id.is_none());
+    assert_eq!(stream_output.content, "hi");
+    assert!(stream_output.reasoning_content.is_empty());
+    assert!(session.token_usage.is_some());
+    assert_eq!(
+        session
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.max_context_tokens),
+        Some(400_000)
+    );
+
+    let requested_messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
+    assert_eq!(requested_messages.len(), 2);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-1");
+    assert_eq!(
+        requested_messages[0].content,
+        expected_system_field("system")
+    );
+    assert_eq!(
+        llm.requested_instructions
+            .lock()
+            .expect("instructions lock")
+            .as_deref(),
+        Some(expected_system_field("system").as_str())
+    );
+
+    let first = event_rx.recv().await.expect("budget event expected");
+    assert!(matches!(first, AgentEvent::TokenBudgetUpdated { .. }));
+
+    let second = event_rx
+        .recv()
+        .await
+        .expect("visible message identity expected");
+    let visible_message = stream_output
+        .visible_message
+        .as_ref()
+        .expect("visible token must carry a stable identity");
+    assert!(matches!(
+        second,
+        AgentEvent::VisibleMessageStart {
+            message_id,
+            created_at,
+        } if message_id == visible_message.message_id && created_at == visible_message.created_at
+    ));
+
+    let third = event_rx.recv().await.expect("token event expected");
+    assert!(matches!(third, AgentEvent::Token { content } if content == "hi"));
+    assert_eq!(
+        llm.requested_text_verbosity
+            .lock()
+            .expect("text_verbosity lock")
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        llm.requested_include.lock().expect("include lock").clone(),
+        Some(vec!["reasoning.encrypted_content".to_string()])
+    );
+    assert_eq!(
+        llm.requested_reasoning_summary
+            .lock()
+            .expect("reasoning_summary lock")
+            .as_deref(),
+        Some("auto")
+    );
+    assert_eq!(
+        llm.requested_session_id
+            .lock()
+            .expect("session_id lock")
+            .as_deref(),
+        Some("session-stream-1")
+    );
+}
+
+#[tokio::test]
+async fn prompt_exposure_starts_only_after_successful_provider_bootstrap() {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum BoundaryCase {
+        BootstrapError,
+        PreCancelled,
+        StreamError,
+    }
+
+    struct BoundaryProvider(BoundaryCase);
+
+    #[async_trait]
+    impl LLMProvider for BoundaryProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            match self.0 {
+                BoundaryCase::BootstrapError => Err(bamboo_llm::provider::LLMError::Api(
+                    "injected bootstrap error".to_string(),
+                )),
+                BoundaryCase::PreCancelled => Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)]))),
+                BoundaryCase::StreamError => Ok(Box::pin(stream::iter(vec![Err(
+                    bamboo_llm::provider::LLMError::Stream("injected frame error".to_string()),
+                )]))),
+            }
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    for case in [
+        BoundaryCase::BootstrapError,
+        BoundaryCase::PreCancelled,
+        BoundaryCase::StreamError,
+    ] {
+        let session_id = format!("prompt-exposure-boundary-{case:?}");
+        let round_id = format!("{session_id}-run-test-round-1");
+        let (_metrics_dir, collector, storage) =
+            prompt_exposure_metrics(&session_id, &round_id).await;
+        let mut config = test_config("system");
+        config.metrics_collector = Some(collector.clone());
+        let provenance = crate::runtime::runner::prompt_context::PromptMemoryExposureProvenance::supported_empty_for_test(None);
+        let prepared_context = PreparedContext {
+            messages: vec![Message::system("system")],
+            token_usage: usage(0, 22),
+            truncation_occurred: false,
+            segments_removed: 0,
+            compressed_message_ids: Vec::new(),
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+        };
+        let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+        let cancel = CancellationToken::new();
+        if case == BoundaryCase::PreCancelled {
+            cancel.cancel();
+        }
+        let provider: Arc<dyn LLMProvider> = Arc::new(BoundaryProvider(case));
+        let mut session = Session::new(&session_id, "test-model");
+
+        let result = execute_llm_stream(
+            &mut session,
+            &config,
+            &provider,
+            &prepared_context,
+            &[],
+            &LlmStreamFrame {
+                event_tx: &event_tx,
+                cancel_token: &cancel,
+                session_id: &session_id,
+                model: "test-model",
+                provider_name: None,
+                provider_type: None,
+                reasoning_effort: None,
+                max_context_tokens: 400_000,
+                max_output_tokens: 128,
+                prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                    round_id: &round_id,
+                    provenance: &provenance,
+                }),
+            },
+        )
+        .await;
+        assert!(result.is_err(), "{case:?} must fail the stream execution");
+
+        if case == BoundaryCase::StreamError {
+            assert!(wait_for_prompt_exposure(storage.as_ref(), &round_id)
+                .await
+                .project_items
+                .is_empty());
+        } else {
+            assert_no_prompt_exposure_after_collector_barrier(
+                &collector,
+                storage.as_ref(),
+                &session_id,
+                &round_id,
+            )
+            .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn ledger_checkpoint_failure_stops_before_provider_dispatch() {
+    struct FailOncePersistence(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for FailOncePersistence {
+        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+            let attempt = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                Err(std::io::Error::other("injected ledger checkpoint failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "session-ledger-checkpoint-failure";
+    let round_id = "session-ledger-checkpoint-failure-run-test-round-1";
+    let mut session = Session::new(session_id, "test-model");
+    let assistant = Message::assistant("prior native response", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    let native_item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::Provider,
+        bamboo_domain::ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type":"tool_search_call","id":"tsc_checkpoint_search","execution":"client","call_id":"checkpoint_search",
+            "status":"completed","arguments":{"query":"orders"}
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![native_item])
+        .unwrap();
+    session.model_context_state = Some(bamboo_domain::ModelContextState {
+        cache_scope_sha256: Some("stale-scope".to_string()),
+        transcript_item_sha256: vec!["stale-transcript".to_string()],
+        ..Default::default()
+    });
+    let previous_model_context = session.model_context_state.clone();
+    let previous_provider_transcript = session.provider_transcript.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let mut config = test_config("system");
+    let persistence = Arc::new(FailOncePersistence(std::sync::atomic::AtomicUsize::new(0)));
+    config.persistence = Some(persistence.clone());
+    let (_metrics_dir, collector, storage) = prompt_exposure_metrics(session_id, round_id).await;
+    config.metrics_collector = Some(collector.clone());
+    let provenance = crate::runtime::runner::prompt_context::PromptMemoryExposureProvenance::supported_empty_for_test(None);
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let result = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id,
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                round_id,
+                provenance: &provenance,
+            }),
+        },
+    )
+    .await;
+    let Err(error) = result else {
+        panic!("ledger state must be durable before provider dispatch");
+    };
+
+    assert!(error
+        .to_string()
+        .contains("model-context ledger checkpoint failed before provider dispatch"));
+    assert!(!*llm.ir_invoked.lock().expect("ir_invoked lock"));
+    assert!(llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .is_empty());
+    assert_eq!(
+        session.model_context_state, previous_model_context,
+        "failed checkpoint must roll the in-memory ledger transaction back"
+    );
+    assert_eq!(
+        session.provider_transcript, previous_provider_transcript,
+        "native invalidation and model-context reset must roll back together"
+    );
+    assert_no_prompt_exposure_after_collector_barrier(
+        &collector,
+        storage.as_ref(),
+        session_id,
+        round_id,
+    )
+    .await;
+
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id,
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                round_id,
+                provenance: &provenance,
+            }),
+        },
+    )
+    .await
+    .expect("retry checkpoints the same deterministic ledger before dispatch");
+    assert_eq!(
+        persistence.0.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "retry must persist both the restored candidate and its stable reprepare after the injected failure"
+    );
+    assert!(*llm.ir_invoked.lock().expect("ir_invoked lock"));
+    assert_eq!(
+        wait_for_prompt_exposure(storage.as_ref(), round_id)
+            .await
+            .recall_outcome,
+        bamboo_metrics::types::PromptMemoryRecallOutcome::Disabled
+    );
+}
+
+#[tokio::test]
+async fn append_safe_ledger_checkpoint_reprepares_from_merged_durable_suffix() {
+    struct ConcurrentAppendPersistence {
+        durable: Mutex<Session>,
+        saves: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for ConcurrentAppendPersistence {
+        async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+            self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.durable.lock().expect("durable lock") = session.clone();
+            Ok(())
+        }
+
+        async fn load_runtime_session(
+            &self,
+            _session_id: &str,
+        ) -> std::io::Result<Option<Session>> {
+            Ok(Some(self.durable.lock().expect("durable lock").clone()))
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "session-ledger-concurrent-append";
+    let original = Message::user("original request");
+    let concurrent = Message::user("concurrent child completion");
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(original.clone());
+    let mut durable = session.clone();
+    durable.add_message(concurrent.clone());
+
+    let persistence = Arc::new(ConcurrentAppendPersistence {
+        durable: Mutex::new(durable),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut config = test_config("system");
+    config.persistence = Some(persistence.clone());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), original],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id,
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("checkpoint merge must trigger a fresh bounded request");
+
+    let requested_messages = llm.requested_messages.lock().expect("messages lock");
+    assert!(
+        requested_messages
+            .iter()
+            .any(|message| message.id == concurrent.id),
+        "the dispatched request must include the suffix merged by the append-safe checkpoint"
+    );
+    assert_eq!(
+        persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the merged suffix needs one replacement ledger checkpoint before the rebuilt envelope stabilizes"
+    );
+}
+
+#[tokio::test]
+async fn mock_responses_provider_captures_four_exact_prefix_final_bodies() {
+    use bamboo_agent_core::tools::{FunctionCall, FunctionSchema, ToolCall, ToolSchema};
+    use bamboo_config::keyword_masking::{KeywordEntry, MatchType};
+    use bamboo_config::{
+        BodyPatch, BodyPatchOp, KeywordMaskingConfig, PatchValue, RequestOverridesConfig,
+        RequestScopeOverride,
+    };
+    use bamboo_llm::providers::common::{openai_responses, request_overrides};
+    use serde_json::{json, Value};
+
+    struct CapturingResponsesProvider {
+        bodies: Mutex<Vec<Value>>,
+        overrides: RequestOverridesConfig,
+        masking: KeywordMaskingConfig,
+    }
+
+    #[async_trait]
+    impl LLMProvider for CapturingResponsesProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            panic!("engine must dispatch the canonical PromptIR path")
+        }
+
+        async fn chat_stream_ir(
+            &self,
+            ir: &bamboo_llm::PromptIR,
+            tools: &[ToolSchema],
+            max_output_tokens: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            let generic_messages = ir.flatten();
+            let responses = ir
+                .responses_request_options(options.and_then(|options| options.responses.as_ref()));
+            // `None` is intentional: this is the compatible-proxy
+            // explicit_prompt_cache=false lowering used by #781.
+            let mut body = openai_responses::build_responses_body(
+                model,
+                &generic_messages,
+                tools,
+                max_output_tokens,
+                options.and_then(|options| options.reasoning_effort),
+                Some(&responses),
+                options.and_then(|options| options.parallel_tool_calls),
+                None,
+            );
+            request_overrides::apply_overrides_to_body_with_env(
+                &mut body,
+                Some(&self.overrides),
+                request_overrides::ENDPOINT_RESPONSES,
+                Some(model),
+                &std::collections::HashMap::new(),
+            );
+            if let Some(name) = options.and_then(|options| options.required_tool.as_deref()) {
+                body["tool_choice"] = json!({"type": "function", "name": name});
+            }
+            bamboo_llm::masking::mask_outbound_body(&mut body, &self.masking);
+            self.bodies.lock().expect("bodies lock").push(body);
+            Ok(Box::pin(stream::iter(vec![Ok(LLMChunk::Done)])))
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let provider = Arc::new(CapturingResponsesProvider {
+        bodies: Mutex::new(Vec::new()),
+        overrides: RequestOverridesConfig {
+            common: RequestScopeOverride {
+                headers: Default::default(),
+                body_patch: vec![BodyPatch {
+                    path: "prompt_cache_key".to_string(),
+                    op: BodyPatchOp::Set,
+                    value: Some(PatchValue::Json(json!("operator-cache-key"))),
+                }],
+            },
+            endpoints: Default::default(),
+            rules: Vec::new(),
+        },
+        masking: KeywordMaskingConfig {
+            entries: vec![KeywordEntry {
+                pattern: "wire-secret".to_string(),
+                match_type: MatchType::Exact,
+                enabled: true,
+            }],
+        },
+    });
+    let llm: Arc<dyn LLMProvider> = provider.clone();
+    let mut session = Session::new("serialized-prefix-session", "test-model");
+    session.add_message(Message::system("BASE_IDENTITY"));
+    session.add_message(Message::user("wire-secret"));
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Prefix work".to_string(),
+        items: vec![TaskItem {
+            id: "task-1".to_string(),
+            description: "context-v1".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let config = test_config("BASE_IDENTITY");
+    let tools = vec![ToolSchema {
+        schema_type: "function".to_string(),
+        function: FunctionSchema {
+            name: "lookup".to_string(),
+            description: "look up a value".to_string(),
+            parameters: json!({"type": "object"}),
+        },
+    }];
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(32);
+
+    macro_rules! capture_round {
+        () => {{
+            let prepared_context = PreparedContext {
+                messages: session.messages.clone(),
+                token_usage: usage(0, 22),
+                truncation_occurred: false,
+                segments_removed: 0,
+                compressed_message_ids: Vec::new(),
+                prompt_cached_tool_outputs: 0,
+                prompt_cached_tool_tokens_saved: 0,
+            };
+            execute_llm_stream(
+                &mut session,
+                &config,
+                &llm,
+                &prepared_context,
+                &tools,
+                &LlmStreamFrame {
+                    event_tx: &event_tx,
+                    cancel_token: &CancellationToken::new(),
+                    session_id: "serialized-prefix-session",
+                    model: "test-model",
+                    provider_name: Some("compatible-proxy"),
+                    provider_type: Some("openai"),
+                    reasoning_effort: None,
+                    max_context_tokens: 400_000,
+                    max_output_tokens: 128,
+                    prompt_memory_exposure: None,
+                },
+            )
+            .await
+            .expect("captured Responses round");
+        }};
+    }
+
+    capture_round!();
+    session.add_message(Message::assistant(
+        "checking",
+        Some(vec![ToolCall {
+            id: "call-prefix".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "lookup".to_string(),
+                arguments: r#"{"query":"wire-secret"}"#.to_string(),
+            },
+        }]),
+    ));
+    session.add_message(Message::tool_result("call-prefix", "tool output"));
+    capture_round!();
+    session.task_list.as_mut().unwrap().items[0].description = "context-v2".to_string();
+    session.task_list.as_mut().unwrap().updated_at = Utc::now();
+    capture_round!();
+    session.add_message(Message::user("continue"));
+    capture_round!();
+
+    let bodies = provider.bodies.lock().expect("bodies lock").clone();
+    assert_eq!(bodies.len(), 4);
+    for pair in bodies.windows(2) {
+        let previous = pair[0]["input"].as_array().expect("previous input");
+        let current = pair[1]["input"].as_array().expect("current input");
+        assert_eq!(
+            previous,
+            &current[..previous.len()],
+            "the complete final serialized input must be the next input's leading slice"
+        );
+    }
+    let tool_round = bodies[1]["input"].as_array().unwrap();
+    assert!(tool_round
+        .iter()
+        .any(|item| item["type"] == "function_call"));
+    assert!(tool_round
+        .iter()
+        .any(|item| item["type"] == "function_call_output"));
+    assert!(bodies.iter().all(|body| {
+        body["prompt_cache_key"] == "operator-cache-key"
+            && body.get("prompt_cache_options").is_none()
+    }));
+    let final_wire = serde_json::to_string(&bodies).unwrap();
+    assert!(!final_wire.contains("wire-secret"));
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| !message.content.contains("BAMBOO_MODEL_CONTEXT_EVENT_START")));
+}
+
+#[tokio::test]
+async fn explicit_activation_pending_suppresses_answer_tokens() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-explicit-guard", "test-model");
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+        "explicit".to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        "[\"review\"]".to_string(),
+    );
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system")],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let llm = mock_llm(vec![
+        LLMChunk::Token("answer must remain hidden".to_string()),
+        LLMChunk::Done,
+    ]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let tool_schemas = ["load_skill", "Read"]
+        .into_iter()
+        .map(|name| bamboo_agent_core::tools::ToolSchema {
+            schema_type: "function".to_string(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let (stream_output, _, _) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &tool_schemas,
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-explicit-guard",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute guarded stream");
+
+    assert_eq!(stream_output.content, "answer must remain hidden");
+    assert_eq!(
+        llm.requested_required_tool
+            .lock()
+            .expect("required_tool lock")
+            .as_deref(),
+        Some("load_skill")
+    );
+    assert_eq!(
+        *llm.requested_parallel_tool_calls
+            .lock()
+            .expect("parallel_tool_calls lock"),
+        Some(false)
+    );
+    assert_eq!(
+        *llm.requested_tool_names.lock().expect("tool names lock"),
+        vec!["load_skill".to_string()]
+    );
+    drop(event_tx);
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .all(|event| matches!(event, AgentEvent::TokenBudgetUpdated { .. })));
+}
+
+#[tokio::test]
+async fn projected_explicit_activation_uses_the_live_restricted_tool_schema_slice() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-explicit-projection", "test-model");
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+        "explicit".to_string(),
+    );
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+        "[\"review\"]".to_string(),
+    );
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("load it")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let tool_schemas = ["load_skill", "Read"]
+        .into_iter()
+        .map(|name| bamboo_agent_core::tools::ToolSchema {
+            schema_type: "function".to_string(),
+            function: bamboo_agent_core::tools::FunctionSchema {
+                name: name.to_string(),
+                description: format!("{name} schema ").repeat(32),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    let effective = super::effective_tool_schemas(&session, &tool_schemas);
+    assert_eq!(effective.len(), 1);
+    assert_eq!(effective[0].function.name, "load_skill");
+    let llm: Arc<dyn LLMProvider> = mock_llm(Vec::new());
+
+    let projected_from_full = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &tool_schemas,
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("full projection");
+    let projected_from_live_slice = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &tool_schemas[..1],
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("live-slice projection");
+    assert_eq!(
+        projected_from_full.input_tokens,
+        projected_from_live_slice.input_tokens
+    );
+    assert_eq!(
+        projected_from_full.ledger_rendered_bytes,
+        projected_from_live_slice.ledger_rendered_bytes
+    );
+    assert!(projected_from_full.tool_schema_input_tokens > 0);
+    assert_eq!(
+        projected_from_full.tool_schema_input_tokens,
+        projected_from_live_slice.tool_schema_input_tokens
+    );
+    assert_eq!(projected_from_full.tool_schema_segment_count, 1);
+}
+
+#[tokio::test]
+async fn projected_usage_adds_the_provider_visible_schema_lane_once() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-provider-visible-budget", "test-model");
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let llm: Arc<dyn LLMProvider> = mock_llm(Vec::new());
+
+    let empty = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &[],
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("empty provider-visible projection");
+    assert_eq!(empty.tool_schema_input_tokens, 0);
+    assert_eq!(empty.tool_schema_serialized_bytes, 0);
+    assert_eq!(empty.tool_schema_serialized_chars, 0);
+    assert_eq!(empty.tool_schema_segment_count, 0);
+    assert_eq!(empty.input_tokens, empty.message_input_tokens);
+
+    let tools = vec![provider_visible_schema(
+        "large_lookup",
+        "provider-visible lookup",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "large provider-visible parameter ".repeat(256)
+                }
+            }
+        }),
+    )];
+    let projected = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &tools,
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("schema provider-visible projection");
+    let repeated = super::project_request_usage(
+        &session,
+        &prepared_context,
+        &config,
+        &tools,
+        "test-model",
+        &llm,
+    )
+    .await
+    .expect("deterministic provider-visible projection");
+
+    assert!(projected.tool_schema_input_tokens > 0);
+    assert!(projected.tool_schema_serialized_bytes > 0);
+    assert!(projected.tool_schema_serialized_chars > 0);
+    assert_eq!(projected.tool_schema_segment_count, 1);
+    assert_eq!(projected.input_tokens, repeated.input_tokens);
+    assert_eq!(
+        projected.input_tokens,
+        projected
+            .message_input_tokens
+            .saturating_add(projected.tool_schema_input_tokens)
+    );
+}
+
+#[test]
+fn openai_loaded_tool_items_increase_only_the_message_lane() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-openai-loaded-budget", "test-model");
+    let assistant = Message::assistant("normalized search result", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    let mut config = test_config("system");
+    config.provider_name = Some("openai-footprint".to_string());
+    config.provider_type = Some("openai".to_string());
+    let prepared_context = PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let footprint = ProviderVisibleToolFootprint {
+        segments: vec![ProviderVisibleToolSegment {
+            kind: ProviderVisibleToolSegmentKind::InitialFullDefinition,
+            serialized: r#"[{"type":"function","name":"Read"}]"#.to_string(),
+        }],
+    };
+    let baseline_envelope =
+        super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let baseline = super::measure_request_usage(&session, &baseline_envelope, &footprint);
+
+    let boundary = bamboo_domain::provider_transcript_boundary_sha256(
+        config.provider_name.as_deref(),
+        config.provider_type.as_deref(),
+    )
+    .unwrap();
+    session
+        .activate_provider_transcript_route(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            &boundary,
+        )
+        .unwrap();
+    let search_output = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::HostToolSearch,
+        bamboo_domain::ProviderTranscriptAuthor::ToolResult,
+        serde_json::json!({
+            "type":"tool_search_output",
+            "execution":"client",
+            "call_id":"search_loaded_budget",
+            "status":"completed",
+            "tools":[{
+                "type":"function",
+                "name":"loaded_tool",
+                "description":"loaded message payload ".repeat(128),
+                "parameters":{"type":"object"},
+                "strict":false,
+                "defer_loading":true
+            }]
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![search_output])
+        .unwrap();
+    let additional_tools = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::DeveloperContext,
+        bamboo_domain::ProviderTranscriptAuthor::Host,
+        serde_json::json!({
+            "type":"additional_tools",
+            "role":"developer",
+            "tools":[{
+                "type":"function",
+                "name":"additional_tool",
+                "description":"additional message payload ".repeat(128),
+                "parameters":{"type":"object"},
+                "strict":false
+            }]
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![additional_tools])
+        .unwrap();
+
+    let loaded_envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let loaded = super::measure_request_usage(&session, &loaded_envelope, &footprint);
+
+    assert!(loaded.message_input_tokens > baseline.message_input_tokens);
+    assert_eq!(
+        loaded.tool_schema_input_tokens,
+        baseline.tool_schema_input_tokens
+    );
+    assert_eq!(
+        loaded.tool_schema_serialized_bytes,
+        baseline.tool_schema_serialized_bytes
+    );
+    assert_eq!(
+        loaded.input_tokens - baseline.input_tokens,
+        loaded.message_input_tokens - baseline.message_input_tokens
+    );
+}
+
+#[test]
+fn late_bound_marker_is_explicit_but_not_claimed_as_known_input() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-late-bound-budget", "test-model");
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let known = ProviderVisibleToolSegment {
+        kind: ProviderVisibleToolSegmentKind::InitialFullDefinition,
+        serialized: r#"[{"type":"tool_search"}]"#.to_string(),
+    };
+    let known_only = super::measure_request_usage(
+        &session,
+        &envelope,
+        &ProviderVisibleToolFootprint {
+            segments: vec![known.clone()],
+        },
+    );
+    let with_late_bound = super::measure_request_usage(
+        &session,
+        &envelope,
+        &ProviderVisibleToolFootprint {
+            segments: vec![
+                known,
+                ProviderVisibleToolSegment {
+                    kind: ProviderVisibleToolSegmentKind::ProviderLateBound,
+                    serialized: String::new(),
+                },
+            ],
+        },
+    );
+
+    assert_eq!(with_late_bound.input_tokens, known_only.input_tokens);
+    assert_eq!(with_late_bound.tool_schema_segment_count, 1);
+    assert_eq!(with_late_bound.tool_schema_late_bound_segment_count, 1);
+}
+
+#[tokio::test]
+async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-final-budget", "test-model");
+    session.token_usage = Some(TokenBudgetUsage {
+        system_tokens: 10,
+        summary_tokens: 0,
+        window_tokens: 90,
+        total_tokens: 100,
+        max_context_tokens: 400_000,
+        budget_limit: 399_872,
+        truncation_occurred: false,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 80,
+        provider_prompt_usage: Some(ProviderPromptUsage {
+            input_tokens: 20,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 80,
+            retained_from_previous_call: false,
+        }),
+    });
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system")],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![
+        LLMChunk::ProviderUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(80),
+            total_tokens: Some(180),
+            reasoning_tokens: Some(24),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(34),
+            cache_write_input_tokens: None,
+        },
+        // Later legacy summaries/cache frames must not overwrite authoritative
+        // provider fields or double the cache badge.
+        LLMChunk::UsageSummary {
+            output_tokens: 56,
+            thinking_tokens: 78,
+        },
+        LLMChunk::CacheUsage {
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 34,
+            input_tokens: 66,
+        },
+        LLMChunk::Done,
+    ]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-final-budget",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    match event_rx
+        .recv()
+        .await
+        .expect("initial budget event expected")
+    {
+        AgentEvent::TokenBudgetUpdated { usage } => {
+            assert_eq!(usage.thinking_tokens, 0);
+            assert_eq!(usage.cache_read_input_tokens, 80);
+            assert_eq!(
+                usage.provider_prompt_usage,
+                Some(ProviderPromptUsage {
+                    input_tokens: 20,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 80,
+                    retained_from_previous_call: true,
+                })
+            );
+        }
+        other => panic!("unexpected first event: {other:?}"),
+    }
+
+    match event_rx.recv().await.expect("final budget event expected") {
+        AgentEvent::TokenBudgetUpdated { usage } => {
+            assert_eq!(usage.thinking_tokens, 24);
+            assert_eq!(usage.cache_read_input_tokens, 34);
+            let provider_prompt = usage
+                .provider_prompt_usage
+                .expect("completed provider prompt usage");
+            assert_eq!(provider_prompt.input_tokens, 66);
+            assert_eq!(provider_prompt.cache_creation_input_tokens, 0);
+            assert_eq!(provider_prompt.cache_read_input_tokens, 34);
+            assert_eq!(provider_prompt.total_input_tokens(), 100);
+            assert_eq!(provider_prompt.cache_hit_rate(), Some(0.34));
+        }
+        other => panic!("unexpected second event: {other:?}"),
+    }
+
+    assert_eq!(stream_output.input_tokens, 66);
+    assert_eq!(stream_output.output_tokens, 80);
+    assert_eq!(stream_output.thinking_tokens, 24);
+    assert_eq!(stream_output.cache_read_input_tokens, 34);
+    assert_eq!(
+        stream_output
+            .provider_usage
+            .and_then(|usage| usage.input_tokens),
+        Some(100)
+    );
+    assert_eq!(
+        session.token_usage.as_ref().map(|usage| (
+            usage.thinking_tokens,
+            usage.cache_read_input_tokens,
+            usage.provider_prompt_usage,
+        )),
+        Some((
+            24,
+            34,
+            Some(bamboo_agent_core::ProviderPromptUsage {
+                input_tokens: 66,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 34,
+                retained_from_previous_call: false,
+            }),
+        ))
+    );
+}
+
+#[tokio::test]
+async fn execute_llm_stream_includes_task_block_in_full_request() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-task", "test-model");
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Agent Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "task-1".to_string(),
+            description: "Implement task block wiring".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![LLMChunk::Token("ok".to_string()), LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-task",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    let requested_messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
+    assert_eq!(requested_messages.len(), 4);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-task");
+    // On the first ledger epoch the full task snapshot is seeded before the
+    // real transcript. It is provider-visible but never added to Session.messages.
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
+        .content
+        .contains("context_type: task_snapshot"));
+    assert!(requested_messages[2]
+        .content
+        .contains("Implement task block wiring"));
+    assert!(matches!(requested_messages[3].role, Role::User));
+    assert_eq!(requested_messages[3].content, "continue");
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| !message.content.contains("BAMBOO_MODEL_CONTEXT_EVENT_START")));
+    assert_eq!(
+        llm.requested_instructions
+            .lock()
+            .expect("instructions lock")
+            .as_deref(),
+        Some(expected_system_field("system").as_str())
+    );
+}
+
+#[tokio::test]
+async fn final_ir_guard_rejects_unbudgeted_large_ledger_before_provider_dispatch() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "session-ledger-final-budget";
+    let round_id = "session-ledger-final-budget-run-test-round-1";
+    let mut session = Session::new(session_id, "test-model");
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Agent Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "task-1".to_string(),
+            description: "retain the ledger budget guard".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let mut config = test_config("system");
+    let (_metrics_dir, collector, storage) = prompt_exposure_metrics(session_id, round_id).await;
+    config.metrics_collector = Some(collector.clone());
+    let provenance = crate::runtime::runner::prompt_context::PromptMemoryExposureProvenance::supported_empty_for_test(None);
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    // Seed a valid ledger/cache scope first, then simulate a legacy persisted
+    // epoch whose rendered bytes were not included in context preparation.
+    let _ = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared_context,
+        &config,
+        &[],
+        "test-model",
+    );
+    let prior_state = session.model_context_state.clone().unwrap();
+    assert!(!prior_state.events.is_empty());
+    session.model_context_state.as_mut().unwrap().events[0].rendered_text =
+        "oversized historical ledger ".repeat(10_000);
+    let inflated_state = session.model_context_state.clone();
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let result = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id,
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 2_000,
+            max_output_tokens: 200,
+            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                round_id,
+                provenance: &provenance,
+            }),
+        },
+    )
+    .await;
+
+    assert!(matches!(result, Err(AgentError::Budget(_))));
+    assert!(llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .is_empty());
+    assert_eq!(session.model_context_state, inflated_state);
+    assert_no_prompt_exposure_after_collector_barrier(
+        &collector,
+        storage.as_ref(),
+        session_id,
+        round_id,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn final_guard_rejects_an_oversized_provider_visible_schema_before_dispatch() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "session-schema-final-budget";
+    let round_id = "session-schema-final-budget-run-test-round-1";
+    let mut session = Session::new(session_id, "test-model");
+    let mut config = test_config("system");
+    let (_metrics_dir, collector, storage) = prompt_exposure_metrics(session_id, round_id).await;
+    config.metrics_collector = Some(collector.clone());
+    let provenance = crate::runtime::runner::prompt_context::PromptMemoryExposureProvenance::supported_empty_for_test(None);
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), Message::user("continue")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let secret_sentinel = "SCHEMA_SENTINEL_MUST_NOT_APPEAR_IN_DIAGNOSTICS";
+    let tools = vec![provider_visible_schema(
+        "oversized_lookup",
+        "oversized provider-visible schema",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": format!("{} {}", secret_sentinel, "large parameter ".repeat(2_000))
+                }
+            }
+        }),
+    )];
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let result = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &tools,
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id,
+            model: "test-model",
+            provider_name: Some("test"),
+            provider_type: Some("test"),
+            reasoning_effort: None,
+            max_context_tokens: 1_000,
+            max_output_tokens: 200,
+            prompt_memory_exposure: Some(PromptMemoryExposureFrame {
+                round_id,
+                provenance: &provenance,
+            }),
+        },
+    )
+    .await;
+
+    let message = match result {
+        Err(AgentError::Budget(message)) => message,
+        Err(error) => panic!("oversized schema must fail with a budget error, got {error}"),
+        Ok(_) => panic!("oversized schema must be rejected"),
+    };
+    assert!(message.contains("message_input_tokens="));
+    assert!(message.contains("tool_schema_input_tokens="));
+    assert!(message.contains("input_limit=800"));
+    assert!(!message.contains(secret_sentinel));
+    assert_eq!(
+        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the final schema budget guard must run before chat_stream_ir"
+    );
+    assert!(llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .is_empty());
+    assert_no_prompt_exposure_after_collector_barrier(
+        &collector,
+        storage.as_ref(),
+        session_id,
+        round_id,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn projected_epoch_reseed_refits_and_dispatches_an_idempotent_request() {
+    struct CountingCheckpointPersistence(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl bamboo_domain::RuntimeSessionPersistence for CountingCheckpointPersistence {
+        async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ledger-reseed-refit", "test-model");
+    session
+        .messages
+        .push(Message::system(expected_system_field("system")));
+    for index in 0..20 {
+        session.messages.push(Message::user(format!(
+            "conversation-{index} {}",
+            "bounded transcript payload ".repeat(40)
+        )));
+        session.messages.push(Message::assistant(
+            format!(
+                "answer-{index} {}",
+                "implementation evidence and verification ".repeat(40)
+            ),
+            None,
+        ));
+    }
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Active ledger context".to_string(),
+        items: vec![TaskItem {
+            id: "task-reseed".to_string(),
+            description: "current task state must survive the epoch reseed ".repeat(120),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    session.model_context_state = Some(bamboo_domain::ModelContextState {
+        state_revision: 5,
+        prefix_epoch: 3,
+        last_reset_reason: Some(bamboo_domain::ModelContextResetReason::RetentionLimit),
+        ..bamboo_domain::ModelContextState::default()
+    });
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        4_000,
+        256,
+        BudgetStrategy::default(),
+        0,
+    ));
+
+    let persistence = Arc::new(CountingCheckpointPersistence(
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    let mut config = test_config("system");
+    config.persistence = Some(persistence.clone());
+    let budget = session.token_budget.as_ref().unwrap();
+    let naive = bamboo_compression::prepare_hybrid_context_with_fixed_tokens(
+        &session,
+        budget,
+        &bamboo_compression::TiktokenTokenCounter::default(),
+        0,
+    )
+    .expect("the legacy zero-reservation fit should succeed");
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let naive_projection =
+        super::project_request_usage(&session, &naive, &config, &[], "test-model", &llm_dyn)
+            .await
+            .expect("naive provider-visible projection");
+    assert!(
+        naive_projection.input_tokens > budget.max_request_input_tokens(),
+        "without projected snapshots the prepared transcript must reproduce the old overflow"
+    );
+    let naive_message_count = naive.messages.len();
+
+    let prepared = super::super::context_preparation::prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-ledger-reseed-refit",
+        &[],
+        &llm_dyn,
+        None,
+    )
+    .await
+    .expect("projected reseed should be absorbed by bounded transcript fitting");
+    assert!(prepared.prepared_context.truncation_occurred);
+    assert!(prepared.prepared_context.messages.len() < naive_message_count);
+    let projected = super::project_request_usage(
+        &session,
+        &prepared.prepared_context,
+        &config,
+        &[],
+        "test-model",
+        &llm_dyn,
+    )
+    .await
+    .expect("provider-visible projection");
+    assert!(projected.input_tokens <= prepared.budget.max_request_input_tokens());
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let frame = LlmStreamFrame {
+        event_tx: &event_tx,
+        cancel_token: &CancellationToken::new(),
+        session_id: "session-ledger-reseed-refit",
+        model: "test-model",
+        provider_name: Some("openai"),
+        provider_type: Some("openai"),
+        reasoning_effort: None,
+        max_context_tokens: prepared.budget.max_context_tokens,
+        max_output_tokens: prepared.budget.max_output_tokens,
+        prompt_memory_exposure: None,
+    };
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared.prepared_context,
+        &[],
+        &frame,
+    )
+    .await
+    .expect("refitted request should dispatch");
+    let request_shape = |messages: &[Message]| {
+        messages
+            .iter()
+            .map(|message| {
+                serde_json::json!({
+                    "role": message.role,
+                    "content": message.content,
+                    "tool_calls": message.tool_calls,
+                    "tool_call_id": message.tool_call_id,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let first_messages = request_shape(&llm.requested_messages.lock().unwrap());
+    let first_state = session.model_context_state.clone();
+    assert_eq!(
+        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        persistence.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the seeded ledger must checkpoint exactly once before dispatch"
+    );
+
+    let retry_prepared = super::super::context_preparation::prepare_round_context(
+        &mut session,
+        &config,
+        "test-model",
+        "session-ledger-reseed-refit",
+        &[],
+        &llm_dyn,
+        None,
+    )
+    .await
+    .expect("retry preparation should reuse the durable ledger without duplicate events");
+    let retry_projection = super::project_request_usage(
+        &session,
+        &retry_prepared.prepared_context,
+        &config,
+        &[],
+        "test-model",
+        &llm_dyn,
+    )
+    .await
+    .expect("retry provider-visible projection");
+    assert!(retry_projection.input_tokens <= retry_prepared.budget.max_request_input_tokens());
+
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &retry_prepared.prepared_context,
+        &[],
+        &frame,
+    )
+    .await
+    .expect("fully re-prepared retry should dispatch without a duplicate ledger event");
+    assert_eq!(
+        llm.ir_call_count.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    assert_eq!(
+        persistence.0.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "fully re-prepared retry must not checkpoint an unchanged ledger"
+    );
+    assert_eq!(
+        request_shape(&llm.requested_messages.lock().unwrap()),
+        first_messages
+    );
+    assert_eq!(session.model_context_state, first_state);
+}
+
+#[test]
+fn build_request_envelope_seeds_ledger_without_rewriting_old_breakpoints() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-cache-plan", "test-model");
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Agent Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "task-1".to_string(),
+            description: "Cacheable task".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let config = test_config("system");
+    let last_user = Message::user("continue");
+    let last_user_id = last_user.id.clone();
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("system"), last_user],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // The first epoch seeds typed context ahead of the real transcript. Future
+    // updates append after the prior transcript boundary instead of moving it.
+    assert_eq!(
+        envelope
+            .ir
+            .run(bamboo_llm::SegmentRole::ModelTranscript)
+            .len(),
+        3
+    );
+    let transcript = envelope.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
+    assert_session_identity_message(&transcript[0], "session-cache-plan");
+    assert!(transcript[1]
+        .content
+        .contains("context_type: task_snapshot"));
+    assert_eq!(transcript[2].content, "continue");
+
+    // A rolling breakpoint would remove an annotation from the former last item
+    // on the next round and violate byte-prefix identity. Only stable fixed
+    // boundaries (for example a relocated tool guide) may be generated.
+    assert!(envelope.ir.cache.cache_system);
+    assert!(envelope.ir.cache.cache_tools);
+    assert!(!envelope.ir.cache.is_breakpoint(&last_user_id));
+    assert!(envelope.ir.cache.breakpoint_message_ids.is_empty());
+    // The stable prefix uses the 1-hour extended TTL so the cache survives
+    // pauses longer than the 5-minute default and big tool results keep hitting.
+    assert_eq!(envelope.ir.cache.ttl, bamboo_llm::CacheTtl::Extended);
+}
+
+#[test]
+fn request_envelope_replays_only_the_selected_provider_family() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("native-family", "test-model");
+    session.add_message(Message::user("search"));
+    let assistant = Message::assistant("normalized", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    let openai_route = bamboo_domain::provider_transcript_boundary_sha256(None, Some("openai"))
+        .expect("provider type establishes a route boundary");
+    session
+        .activate_provider_transcript_route(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            &openai_route,
+        )
+        .unwrap();
+    let item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::Provider,
+        bamboo_domain::ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type":"tool_search_call","id":"tsc_search_weather","execution":"client","call_id":"search_weather",
+            "status":"completed","arguments":{"query":"weather"}
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![item])
+        .unwrap();
+    let prepared = PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let mut openai = test_config("system");
+    openai.provider_type = Some("openai".to_string());
+    let openai_envelope = super::build_request_envelope(&session, &prepared, &openai, &[]);
+    assert_eq!(openai_envelope.ir.provider_transcript_groups.len(), 1);
+
+    let mut anthropic = test_config("system");
+    anthropic.provider_type = Some("anthropic".to_string());
+    let anthropic_envelope = super::build_request_envelope(&session, &prepared, &anthropic, &[]);
+    assert!(anthropic_envelope.ir.provider_transcript_groups.is_empty());
+    assert_eq!(
+        anthropic_envelope.prefix_reset_reason,
+        Some(bamboo_domain::ModelContextResetReason::ProviderSwitch)
+    );
+}
+
+#[test]
+fn same_family_provider_instance_switch_invalidates_native_replay() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let route_a = bamboo_domain::provider_transcript_boundary_sha256(
+        Some("openai-instance-a"),
+        Some("openai"),
+    )
+    .unwrap();
+    let route_b = bamboo_domain::provider_transcript_boundary_sha256(
+        Some("openai-instance-b"),
+        Some("openai"),
+    )
+    .unwrap();
+    let mut session = Session::new("native-provider-route", "test-model");
+    session.add_message(Message::user("search"));
+    let assistant = Message::assistant("normalized", None);
+    let anchor = assistant.id.clone();
+    session.add_message(assistant);
+    session
+        .activate_provider_transcript_route(
+            bamboo_domain::ProviderFamily::OpenAi,
+            bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+            &route_a,
+        )
+        .unwrap();
+    let item = bamboo_domain::ProviderTranscriptItem::try_from_payload(
+        bamboo_domain::ProviderFamily::OpenAi,
+        bamboo_domain::ProviderProtocol::OpenAiResponsesV1,
+        bamboo_domain::ProviderTranscriptOrigin::Provider,
+        bamboo_domain::ProviderTranscriptAuthor::Model,
+        serde_json::json!({
+            "type":"tool_search_call","id":"tsc_route","execution":"client",
+            "call_id":"search_route","status":"completed","arguments":{"query":"weather"}
+        }),
+    )
+    .unwrap();
+    session
+        .append_provider_transcript_group(&anchor, None, vec![item])
+        .unwrap();
+    let prepared = PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let mut config = test_config("system");
+    config.provider_name = Some("openai-instance-a".to_string());
+    config.provider_type = Some("openai".to_string());
+    let model = session.model.clone();
+
+    let first =
+        super::build_request_envelope_reconciled(&mut session, &prepared, &config, &[], &model);
+    assert_eq!(first.ir.provider_transcript_groups.len(), 1);
+    let route_a_epoch = session.provider_transcript.epoch();
+
+    let unchanged =
+        super::build_request_envelope_reconciled(&mut session, &prepared, &config, &[], &model);
+    assert_eq!(unchanged.ir.provider_transcript_groups.len(), 1);
+    assert_eq!(session.provider_transcript.epoch(), route_a_epoch);
+
+    config.provider_name = Some("openai-instance-b".to_string());
+    let switched =
+        super::build_request_envelope_reconciled(&mut session, &prepared, &config, &[], &model);
+    assert!(switched.ir.provider_transcript_groups.is_empty());
+    assert_eq!(session.provider_transcript.epoch(), route_a_epoch + 1);
+    assert_eq!(
+        session
+            .provider_transcript
+            .active_provider_boundary_sha256(),
+        Some(route_b.as_str())
+    );
+    assert_eq!(
+        session.provider_transcript.last_reset_reason(),
+        Some(bamboo_domain::ProviderTranscriptResetReason::ProviderSwitch)
+    );
+    assert_eq!(
+        switched.prefix_reset_reason,
+        Some(bamboo_domain::ModelContextResetReason::ProviderSwitch)
+    );
+}
+
+#[test]
+fn stable_prefix_is_byte_stable_across_rounds() {
+    // The whole point of relocating the tool guide out of the system prompt is a
+    // PREFIX that actually caches: across rounds where only the conversation
+    // grows, the cacheable prefix (static system + the relocated guide message
+    // content) must be byte-identical and its drift hash unchanged, so the
+    // provider cache hits instead of re-reading the prefix each turn.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-prefix-stable", "test-model");
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER stable guidance".to_string());
+
+    let ctx = |msgs: Vec<Message>| PreparedContext {
+        messages: msgs,
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    // Round 1: a short conversation.
+    let round1 = ctx(vec![
+        Message::system("BASE_IDENTITY"),
+        Message::user("first"),
+    ]);
+    // Round 2: the same session, conversation has grown.
+    let round2 = ctx(vec![
+        Message::system("BASE_IDENTITY"),
+        Message::user("first"),
+        Message::assistant("answer", None),
+        Message::user("second"),
+    ]);
+
+    let e1 = super::build_request_envelope(&session, &round1, &config, &[]);
+    let e2 = super::build_request_envelope(&session, &round2, &config, &[]);
+
+    // The static system identity is unchanged across rounds.
+    assert_eq!(
+        e1.ir.system_text, e2.ir.system_text,
+        "system prompt must stay byte-stable across rounds"
+    );
+
+    // The relocated guide message content is unchanged (its id may differ — only
+    // content is what the provider caches).
+    let guide = |e: &super::PreparedRequestEnvelope| -> String {
+        e.ir.run(bamboo_llm::SegmentRole::StablePrefix)
+            .iter()
+            .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+            .map(|m| m.content.clone())
+            .expect("relocated guide present")
+    };
+    assert_eq!(guide(&e1), guide(&e2), "guide prefix must stay byte-stable");
+
+    // The cacheable-prefix sections are byte-identical across rounds, so the cache
+    // hits. Compare the (name, content) of every section directly — the strongest
+    // form of the old drift-hash check.
+    let sections = |e: &super::PreparedRequestEnvelope| -> Vec<(String, String)> {
+        e.stable_prefix_sections
+            .iter()
+            .map(|s| (s.name.to_string(), s.content.clone()))
+            .collect()
+    };
+    assert!(!e1.stable_prefix_sections.is_empty());
+    assert_eq!(
+        sections(&e1),
+        sections(&e2),
+        "stable prefix sections must not drift between rounds"
+    );
+}
+
+#[test]
+fn execution_model_change_starts_one_cache_scope_epoch() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-model-scope", "recorded-model");
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let first = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared_context,
+        &config,
+        &[],
+        "model-a",
+    );
+    assert_eq!(first.prefix_epoch, 0);
+    assert!(first.prefix_reset_reason.is_none());
+
+    let changed = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared_context,
+        &config,
+        &[],
+        "model-b",
+    );
+    assert_eq!(changed.prefix_epoch, 1);
+    assert_eq!(
+        changed.prefix_reset_reason,
+        Some(bamboo_domain::ModelContextResetReason::CacheScopeChanged)
+    );
+
+    let next = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared_context,
+        &config,
+        &[],
+        "model-b",
+    );
+    assert_eq!(next.prefix_epoch, changed.prefix_epoch);
+    assert!(next.prefix_reset_reason.is_none());
+}
+
+#[tokio::test]
+async fn execute_llm_stream_routes_normal_request_through_lanes_with_relocated_guide() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-lanes", "test-model");
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![LLMChunk::Token("ok".to_string()), LLMChunk::Done]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-lanes",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    // Requests go through the single canonical IR entry point.
+    assert!(
+        *llm.ir_invoked.lock().expect("ir_invoked lock"),
+        "request must route through chat_stream_ir"
+    );
+
+    // What the provider actually received: the leading system message keeps the
+    // static identity but NOT the tool/server guide, which arrives as its own
+    // message instead.
+    let messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
+    assert!(matches!(messages[0].role, Role::System));
+    assert!(messages[0].content.contains("BASE_IDENTITY"));
+    assert!(
+        !messages[0].content.contains("NOVA_GUIDANCE_MARKER"),
+        "guide must not be in the system message"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m.role, Role::User) && m.content.contains("NOVA_GUIDANCE_MARKER")),
+        "guide arrives as a dedicated message"
+    );
+}
+
+#[test]
+fn build_request_envelope_relocates_tool_guide_into_stable_prefix_lane() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-toolguide", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    // A connected MCP server's `initialize` guidance (e.g. nova's targeting
+    // workflow) flows into the tool guide; mark it so we can locate it.
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // The lane's system prompt keeps the static identity but NO LONGER carries the
+    // tool/connected-server guide — that is the "system stays static" property.
+    assert!(
+        envelope.ir.system_text.contains("BASE_SYSTEM_IDENTITY"),
+        "lane system keeps the static base identity"
+    );
+    assert!(
+        !envelope.ir.system_text.contains("NOVA_GUIDANCE_MARKER"),
+        "tool/server guide must be removed from the lane system prompt"
+    );
+
+    // It rides as a fixed stable-prefix MESSAGE (a typed, never-compressed context
+    // block at a known position) instead.
+    let guide = envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::StablePrefix)
+        .iter()
+        .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+        .expect("tool guide relocated into a stable-prefix message");
+    assert_eq!(guide.role, bamboo_agent_core::Role::User);
+    assert!(guide.never_compress);
+
+    // And that relocated, session-stable message earns its own cache breakpoint.
+    assert!(envelope.ir.cache.is_breakpoint(&guide.id));
+
+    // The Responses-API view (derived by the adapter from the IR) mirrors the
+    // relocation: the guide leaves `instructions` (the system field) and rides at
+    // the FRONT of the input messages — so every provider family gets the same
+    // static-system structure.
+    let responses = envelope.ir.responses_request_options(None);
+    assert!(
+        !responses
+            .instructions
+            .as_deref()
+            .unwrap_or_default()
+            .contains("NOVA_GUIDANCE_MARKER"),
+        "tool/server guide must be removed from Responses instructions"
+    );
+    assert!(
+        responses
+            .input_messages
+            .as_deref()
+            .and_then(|m| m.first())
+            .is_some_and(|m| m.content.contains("NOVA_GUIDANCE_MARKER")),
+        "tool/server guide leads the Responses input messages"
+    );
+}
+
+#[test]
+fn build_request_envelope_relocates_session_context_after_tool_guide() {
+    // Session-variable context (here: loaded-skill context) must leave the static
+    // system field and ride as a typed context-block message positioned AFTER the
+    // large invariant tool guide — so it never shifts the cached head.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut env_config = Config::default();
+    env_config.env_vars = vec![bamboo_config::EnvVarEntry {
+        name: "ENV_AUTHORITY_MARKER".to_string(),
+        value: "dynamic environment".to_string(),
+        secret: false,
+        value_encrypted: None,
+        credential_ref: None,
+        configured: true,
+        description: Some("authority-owned environment context".to_string()),
+    }];
+    env_config.publish_env_vars();
+    let mut session = Session::new("session-sessionctx", "test-model");
+    session.metadata.insert(
+        "skill.context".to_string(),
+        "SKILL_CONTEXT_MARKER loaded skill body".to_string(),
+    );
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.system_prompt = Some(format!(
+        "BASE_SYSTEM_IDENTITY\n\n{}\nSTALE_SYSTEM_ENV_MARKER\n{}",
+        crate::runtime::context::ENV_CONTEXT_START_MARKER,
+        crate::runtime::context::ENV_CONTEXT_END_MARKER,
+    ));
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // Not in the cacheable, invariant system field.
+    assert!(
+        !envelope.ir.system_text.contains("SKILL_CONTEXT_MARKER"),
+        "session-variable skill context must leave the system prompt"
+    );
+    assert!(!envelope.ir.system_text.contains("STALE_SYSTEM_ENV_MARKER"));
+
+    // The immutable guide remains the stable prefix; mutable skill state is a
+    // typed event in the chronological ledger.
+    let stable = envelope.ir.run(bamboo_llm::SegmentRole::StablePrefix);
+    let transcript = envelope.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
+    let skill_pos = transcript
+        .iter()
+        .position(|m| m.content.contains("SKILL_CONTEXT_MARKER"))
+        .expect("skill context reconciled into the model transcript");
+    assert!(transcript[skill_pos]
+        .content
+        .contains("context_type: skill_context"));
+    assert!(transcript[skill_pos]
+        .content
+        .contains("scope: round_dynamic"));
+    assert!(!transcript[skill_pos].never_compress);
+    let env = transcript
+        .iter()
+        .find(|message| message.content.contains("ENV_AUTHORITY_MARKER"))
+        .expect("environment context reconciled into the model transcript");
+    assert!(env.content.contains("context_type: env_snapshot"));
+    assert!(env.content.contains("scope: session_stable"));
+    assert!(!transcript
+        .iter()
+        .any(|message| message.content.contains("STALE_SYSTEM_ENV_MARKER")));
+
+    // Provider lowering places the stable guide before the ledger event.
+    let guide_pos = stable
+        .iter()
+        .position(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+        .expect("tool guide present");
+    let responses = envelope.ir.responses_input();
+    let response_guide = responses
+        .iter()
+        .position(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+        .unwrap();
+    let response_skill = responses
+        .iter()
+        .position(|m| m.content.contains("SKILL_CONTEXT_MARKER"))
+        .unwrap();
+    assert_eq!(guide_pos, 0);
+    assert!(response_guide < response_skill);
+    assert!(session
+        .messages
+        .iter()
+        .all(|message| !message.content.contains("BAMBOO_MODEL_CONTEXT_EVENT_START")));
+}
+
+fn workspace_session(id: &str, workspace: &std::path::Path) -> Session {
+    let mut session = Session::new(id, "test-model");
+    session.set_workspace_path_meta(bamboo_config::paths::path_to_display_string(workspace));
+    session.metadata.insert(
+        crate::project_context::WORKSPACE_SOURCE_METADATA_KEY.to_string(),
+        crate::project_context::WorkspaceSource::Explicit
+            .as_str()
+            .to_string(),
+    );
+    session.metadata.insert(
+        crate::project_context::WORKSPACE_BINDING_STATUS_METADATA_KEY.to_string(),
+        crate::project_context::WorkspaceBindingStatus::Registered
+            .as_str()
+            .to_string(),
+    );
+    session
+}
+
+fn workspace_prepared_context() -> PreparedContext {
+    PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    }
+}
+
+#[test]
+fn selected_root_orchestration_prompt_is_provider_visible_on_start_and_resume_only() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+    let prepared = workspace_prepared_context();
+
+    let mut ordinary = Session::new("ordinary-root", "test-model");
+    let ordinary_envelope = super::build_request_envelope_reconciled(
+        &mut ordinary,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(ordinary_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+
+    let mut root = Session::new("selected-root", "test-model");
+    root.set_root_orchestration_prompt_enabled(true);
+    let initial =
+        super::build_request_envelope_reconciled(&mut root, &prepared, &config, &[], "test-model");
+    assert_eq!(initial.ir.system_text, ordinary_envelope.ir.system_text);
+    assert_eq!(
+        message_shape(initial.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        message_shape(
+            ordinary_envelope
+                .ir
+                .run(bamboo_llm::SegmentRole::StablePrefix)
+        ),
+        "the selected enhancement must not duplicate or move the tool schema"
+    );
+    let first_blocks = initial
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .filter(|message| message.content.contains("context_type: root_orchestration"))
+        .collect::<Vec<_>>();
+    assert_eq!(first_blocks.len(), 1);
+    assert!(first_blocks[0]
+        .content
+        .contains("delegate a read-only Plan"));
+    assert!(first_blocks[0]
+        .content
+        .contains("Inspect authoritative child progress"));
+
+    let stored = serde_json::to_string(&root).expect("persist selected root");
+    let mut resumed: Session = serde_json::from_str(&stored).expect("reload selected root");
+    let mut resumed_prepared = workspace_prepared_context();
+    resumed_prepared.messages.push(Message::user("continue"));
+    let resumed_envelope = super::build_request_envelope_reconciled(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(resumed_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content == "continue"));
+    assert!(resumed_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content == first_blocks[0].content));
+    assert_eq!(
+        resumed
+            .model_context_state
+            .as_ref()
+            .expect("durable context ledger")
+            .events
+            .iter()
+            .filter(|event| event.block_type == bamboo_domain::ContextBlockType::RootOrchestration)
+            .count(),
+        1,
+        "resuming must replay the one durable instruction, not append a duplicate"
+    );
+
+    resumed.set_root_orchestration_prompt_enabled(false);
+    let disabled = super::build_request_envelope_reconciled(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert!(disabled.prefix_epoch > initial.prefix_epoch);
+    assert!(disabled
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+
+    let mut child = Session::new_child_of("child", &resumed, "test-model", "child");
+    child.set_root_orchestration_prompt_enabled(true);
+    let child_envelope =
+        super::build_request_envelope_reconciled(&mut child, &prepared, &config, &[], "test-model");
+    assert!(child_envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: root_orchestration")));
+}
+
+#[test]
+fn session_identity_is_model_visible_after_invariant_prefix_without_cross_session_drift() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+    let mut session_a = Session::new("session-identity-a", "test-model");
+    let mut session_b = Session::new("session-identity-b", "test-model");
+    let prepared = workspace_prepared_context();
+
+    let envelope_a = super::build_request_envelope_reconciled(
+        &mut session_a,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    let envelope_b = super::build_request_envelope_reconciled(
+        &mut session_b,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+
+    assert_eq!(envelope_a.ir.system_text, envelope_b.ir.system_text);
+    assert_eq!(
+        message_shape(envelope_a.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        message_shape(envelope_b.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        "per-Session identity must not invalidate the cross-session invariant prefix"
+    );
+    assert!(envelope_a
+        .ir
+        .run(bamboo_llm::SegmentRole::StablePrefix)
+        .iter()
+        .any(|message| message.content.contains("STABLE_GUIDE_MARKER")));
+
+    let transcript = envelope_a.ir.run(bamboo_llm::SegmentRole::ModelTranscript);
+    let identities = transcript
+        .iter()
+        .filter(|message| message.content.contains("context_type: session_identity"))
+        .collect::<Vec<_>>();
+    assert_eq!(identities.len(), 1);
+    assert!(identities[0].content.contains("session-identity-a"));
+    assert!(identities[0].content.contains("scope: session_stable"));
+    assert!(!envelope_a.ir.system_text.contains("session-identity-a"));
+    assert!(envelope_a
+        .ir
+        .run(bamboo_llm::SegmentRole::StablePrefix)
+        .iter()
+        .all(|message| !message.content.contains("session-identity-a")));
+    assert!(envelope_b
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .any(|message| message.content.contains("session-identity-b")));
+
+    let retry_a = super::build_request_envelope_reconciled(
+        &mut session_a,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    assert_eq!(
+        retry_a
+            .ir
+            .run(bamboo_llm::SegmentRole::ModelTranscript)
+            .iter()
+            .filter(|message| message.content.contains("context_type: session_identity"))
+            .count(),
+        1,
+        "unchanged reconciliation must not duplicate Session identity"
+    );
+}
+
+#[test]
+fn openai_responses_places_one_workspace_block_after_stable_prefix() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join(".git")).expect("git marker");
+    std::fs::write(
+        workspace.path().join("AGENTS.md"),
+        "WORKSPACE_POLICY_MARKER",
+    )
+    .expect("workspace policy");
+    let workspace_path = bamboo_config::paths::path_to_display_string(workspace.path());
+    let session = workspace_session("workspace-openai", workspace.path());
+    let mut config = test_config("BASE_IDENTITY");
+    config.provider_type = Some("openai".to_string());
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+
+    let envelope =
+        super::build_request_envelope(&session, &workspace_prepared_context(), &config, &[]);
+    assert!(envelope.stable_prefix_sections.iter().all(|section| {
+        matches!(section.name, "base" | "core_directives" | "tool_guide")
+            && !section.content.contains(&workspace_path)
+    }));
+    let responses = envelope.ir.responses_request_options(None);
+    let instructions = responses.instructions.expect("Responses instructions");
+    assert!(!instructions.contains(&workspace_path));
+    assert!(!instructions.contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+    let input = responses.input_messages.expect("Responses input");
+    assert_eq!(
+        input
+            .iter()
+            .filter(|message| message.content.contains("context_type: workspace"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        input
+            .iter()
+            .map(|message| message.content.matches(&workspace_path).count())
+            .sum::<usize>(),
+        1,
+        "the absolute active path appears only in the Workspace block"
+    );
+    let guide = input
+        .iter()
+        .position(|message| message.content.contains("STABLE_GUIDE_MARKER"))
+        .expect("stable guide");
+    let workspace_position = input
+        .iter()
+        .position(|message| message.content.contains("context_type: workspace"))
+        .expect("workspace block");
+    let conversation = input
+        .iter()
+        .position(|message| message.content == "go")
+        .expect("conversation");
+    assert!(guide < workspace_position && workspace_position < conversation);
+    let instruction = input
+        .iter()
+        .find(|message| message.content.contains("WORKSPACE_POLICY_MARKER"))
+        .expect("instruction overlay");
+    assert!(instruction.content.contains("Source: AGENTS.md"));
+    assert!(!instruction.content.contains(&workspace_path));
+}
+
+#[test]
+fn anthropic_body_places_workspace_after_stable_prefix_not_system() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = bamboo_config::paths::path_to_display_string(workspace.path());
+    let session = workspace_session("workspace-anthropic", workspace.path());
+    let mut config = test_config("BASE_IDENTITY");
+    config.provider_type = Some("anthropic".to_string());
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+
+    let envelope =
+        super::build_request_envelope(&session, &workspace_prepared_context(), &config, &[]);
+    assert!(!envelope.ir.system_text.contains(&workspace_path));
+    assert!(!envelope
+        .ir
+        .system_text
+        .contains(crate::runtime::context::WORKSPACE_CONTEXT_START_MARKER));
+    let body = envelope.ir.body_chat();
+    assert_eq!(
+        body.iter()
+            .filter(|message| message.content.contains("context_type: workspace"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        body.iter()
+            .map(|message| message.content.matches(&workspace_path).count())
+            .sum::<usize>(),
+        1
+    );
+    let guide = body
+        .iter()
+        .position(|message| message.content.contains("STABLE_GUIDE_MARKER"))
+        .expect("stable guide");
+    let workspace_position = body
+        .iter()
+        .position(|message| message.content.contains("context_type: workspace"))
+        .expect("workspace block");
+    assert!(guide < workspace_position);
+}
+
+#[test]
+fn no_workspace_emits_no_workspace_context_block() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("workspace-none", "test-model");
+    let envelope = super::build_request_envelope(
+        &session,
+        &workspace_prepared_context(),
+        &test_config("BASE_IDENTITY"),
+        &[],
+    );
+    assert!(envelope
+        .ir
+        .body_chat()
+        .iter()
+        .all(|message| !message.content.contains("context_type: workspace")));
+}
+
+#[test]
+fn workspace_switch_supersedes_dynamic_context_without_resetting_cache_prefix() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let first_workspace = tempfile::tempdir().expect("first workspace");
+    let second_workspace = tempfile::tempdir().expect("second workspace");
+    let first_path = bamboo_config::paths::path_to_display_string(first_workspace.path());
+    let second_path = bamboo_config::paths::path_to_display_string(second_workspace.path());
+    let mut session = workspace_session("workspace-switch", first_workspace.path());
+    let mut config = test_config("BASE_IDENTITY");
+    config.provider_type = Some("openai".to_string());
+    config.mcp_tool_guidance = Some("STABLE_GUIDE_MARKER".to_string());
+    let prepared = workspace_prepared_context();
+
+    let first = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    let first_cache_scope = session
+        .model_context_state
+        .as_ref()
+        .and_then(|state| state.cache_scope_sha256.clone())
+        .expect("first cache scope");
+    let first_state_revision = session
+        .model_context_state
+        .as_ref()
+        .map(|state| state.state_revision)
+        .expect("first state revision");
+    let first_next_sequence = session
+        .model_context_state
+        .as_ref()
+        .map(|state| state.next_sequence)
+        .expect("first context sequence");
+
+    session.set_workspace_path_meta(&second_path);
+    let switched = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &[],
+        "test-model",
+    );
+    let state = session.model_context_state.as_ref().expect("context state");
+    let workspace_events = state
+        .events
+        .iter()
+        .filter(|event| event.block_type == bamboo_domain::ContextBlockType::Workspace)
+        .collect::<Vec<_>>();
+
+    assert_eq!(switched.ir.system_text, first.ir.system_text);
+    assert_eq!(
+        message_shape(switched.ir.run(bamboo_llm::SegmentRole::StablePrefix)),
+        message_shape(first.ir.run(bamboo_llm::SegmentRole::StablePrefix))
+    );
+    assert_eq!(switched.prefix_epoch, first.prefix_epoch);
+    assert!(switched.prefix_reset_reason.is_none());
+    assert_eq!(
+        state.cache_scope_sha256.as_deref(),
+        Some(first_cache_scope.as_str())
+    );
+    assert!(state.state_revision > first_state_revision);
+    assert!(state.next_sequence > first_next_sequence);
+    assert!(switched.ledger_changed);
+    assert_eq!(workspace_events.len(), 2);
+    assert_eq!(workspace_events[0].revision, 1);
+    assert_eq!(workspace_events[1].revision, 2);
+    assert_eq!(workspace_events[1].supersedes_revision, Some(1));
+    assert!(workspace_events[1].anchor_message_id.is_some());
+    assert!(workspace_events
+        .iter()
+        .all(|event| event.rendered_text.contains("scope: round_dynamic")));
+    assert_eq!(
+        switched
+            .ir
+            .body_chat()
+            .iter()
+            .map(|message| message.content.matches(&second_path).count())
+            .sum::<usize>(),
+        1
+    );
+    assert!(first
+        .ir
+        .body_chat()
+        .iter()
+        .any(|message| message.content.contains(&first_path)));
+}
+
+#[test]
+fn lane_system_is_invariant_to_session_variable_context() {
+    // The cache win: two sessions that differ ONLY in session-variable context
+    // (here loaded skills) must produce a byte-identical system field, so the big
+    // invariant prefix (system + tool guide) can share an automatic prefix cache
+    // across sessions instead of diverging at the first variable byte. (Fails on
+    // the old layout, which merged the skill block into the system prompt.)
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let ctx = || PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let mut with_skill = Session::new("sess-a", "test-model");
+    with_skill
+        .metadata
+        .insert("skill.context".to_string(), "SKILL_A body".to_string());
+    let without_skill = Session::new("sess-b", "test-model");
+
+    let e_with = super::build_request_envelope(&with_skill, &ctx(), &config, &[]);
+    let e_without = super::build_request_envelope(&without_skill, &ctx(), &config, &[]);
+
+    assert_eq!(
+        e_with.ir.system_text, e_without.ir.system_text,
+        "system field must be invariant to session-variable context"
+    );
+    // The relocated invariant guide block is identical too (same cached block).
+    let guide = |e: &super::PreparedRequestEnvelope| {
+        e.ir.run(bamboo_llm::SegmentRole::StablePrefix)
+            .iter()
+            .find(|m| m.content.contains("NOVA_GUIDANCE_MARKER"))
+            .map(|m| m.content.clone())
+            .expect("guide present")
+    };
+    assert_eq!(guide(&e_with), guide(&e_without));
+}
+
+#[test]
+fn system_field_is_assembled_as_discrete_base_core_env_blocks() {
+    // Step 4 invariant: the cross-session-invariant system field is carried as a
+    // STRUCTURED ARRAY of typed PromptBlocks (identity `base`, framework
+    // `core_directives`, globally-stable `env`) — not one glued string. A
+    // block-native provider can render one wire block per entry; the single
+    // system cache breakpoint anchors on the LAST block.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-sysblocks", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    // A non-empty tool/server guide triggers the static-system relocation under
+    // which the system field is emitted as discrete blocks.
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let blocks = &envelope.ir.system_blocks;
+
+    // Discrete, structured, and non-empty.
+    assert!(!blocks.is_empty(), "system field must be structured blocks");
+    // Identity `base` leads and carries the configured base identity.
+    assert_eq!(blocks[0].id, "base");
+    assert_eq!(blocks[0].kind, bamboo_domain::ContextBlockType::Base);
+    assert!(blocks[0].text.contains("BASE_SYSTEM_IDENTITY"));
+    // Framework `core_directives` is its own block (always present, non-empty).
+    let core = blocks
+        .iter()
+        .find(|b| b.id == "core_directives")
+        .expect("core_directives is a discrete block");
+    assert_eq!(core.kind, bamboo_domain::ContextBlockType::CoreDirectives);
+    assert!(!core.text.trim().is_empty());
+    // Every system block is marked Stable (it forms the cacheable head).
+    assert!(blocks
+        .iter()
+        .all(|b| b.stability == bamboo_domain::ContextBlockStability::Stable));
+    // Exactly the LAST block is the cache anchor (one system breakpoint).
+    assert!(blocks.last().expect("non-empty").cache_anchor);
+    assert_eq!(
+        blocks.iter().filter(|b| b.cache_anchor).count(),
+        1,
+        "exactly one system cache breakpoint, on the last block"
+    );
+    // The tool guide is NOT a system block — it rides as a relocated message.
+    assert!(blocks
+        .iter()
+        .all(|b| !b.text.contains("NOVA_GUIDANCE_MARKER")));
+}
+
+#[test]
+fn system_blocks_join_is_byte_identical_to_lane_system_string() {
+    // The structured `system_blocks` and the legacy joined `stable_instructions`
+    // string are two views of the SAME bytes: their `"\n\n"` join must reproduce
+    // the string wire exactly, so flipping a provider to the structured form
+    // changes nothing on the wire.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-sysblocks-join", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let joined = envelope
+        .ir
+        .system_blocks
+        .iter()
+        .map(|b| b.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    assert_eq!(
+        envelope.ir.system_text, joined,
+        "joined system blocks must reproduce the string system field byte-for-byte"
+    );
+    // `system_text()` is the provider-facing accessor; it returns the same bytes.
+    assert_eq!(envelope.ir.system_field(), joined);
+}
+
+#[test]
+fn goal_rides_model_context_ledger_and_never_leaks_into_system_blocks() {
+    // Goal-leak fix (step 6a): a per-session goal is built as a dedicated volatile
+    // GoalState block in the tail — NOT injected into the cached system prefix —
+    // so changing the goal never invalidates the cached system head.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-goal-block", "test-model");
+    let mut config = test_config("BASE_SYSTEM_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER targeting workflow".to_string());
+    config.gold_config = Some(crate::runtime::config::GoldConfig {
+        enabled: true,
+        goal: Some("SHIP_THE_RELEASE_GOAL".to_string()),
+        ..Default::default()
+    });
+    assert_eq!(config.active_goal(), Some("SHIP_THE_RELEASE_GOAL"));
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    // Goal does NOT leak into any system block, nor the joined system string.
+    assert!(envelope
+        .ir
+        .system_blocks
+        .iter()
+        .all(|b| !b.text.contains("SHIP_THE_RELEASE_GOAL")));
+    assert!(!envelope.ir.system_text.contains("SHIP_THE_RELEASE_GOAL"));
+
+    // It rides the append-only model transcript as a typed GoalState snapshot.
+    let goal_msg = envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .find(|m| m.content.contains("context_type: goal_state"))
+        .expect("goal rides the model-context ledger as a goal_state block");
+    assert!(goal_msg.content.contains("SHIP_THE_RELEASE_GOAL"));
+}
+
+#[test]
+fn zero_tools_fallback_keeps_merged_system_string_and_no_blocks() {
+    // When there is no tool/server guide (no tools, no MCP guidance), the
+    // invariant system field stays a byte-authoritative string and
+    // `system_blocks` is empty. Mutable context is carried by the ledger.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-zero-tools", "test-model");
+    let config = test_config("BASE_SYSTEM_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_SYSTEM_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    assert!(
+        envelope.ir.system_blocks.is_empty(),
+        "no relocation → no structured system blocks"
+    );
+    assert!(envelope.ir.system_text.contains("BASE_SYSTEM_IDENTITY"));
+}
+
+#[test]
+fn agent_loop_prompt_cache_key_is_stable_isolated_and_private() {
+    let raw_session_id = "session-secret-alpha";
+    let first = super::agent_loop_prompt_cache_key(Some(raw_session_id), Some("agent_loop"))
+        .expect("agent-loop session gets an affinity key");
+    let resumed = super::agent_loop_prompt_cache_key(Some(raw_session_id), Some("agent_loop"))
+        .expect("resumed session gets the same affinity key");
+    let other_session =
+        super::agent_loop_prompt_cache_key(Some("session-secret-beta"), Some("agent_loop"))
+            .expect("different session gets an affinity key");
+
+    assert_eq!(first, resumed);
+    assert_eq!(
+        first,
+        "29665ec5c5f0fc1c3f89fb420c578cf217757f6a3d4f52b57ca711c94f15e599"
+    );
+    assert_eq!(first.len(), 64);
+    assert!(first
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    assert_ne!(first, other_session);
+    assert!(!first.contains(raw_session_id));
+    assert!(super::agent_loop_prompt_cache_key(None, Some("agent_loop")).is_none());
+    assert!(super::agent_loop_prompt_cache_key(Some(""), Some("agent_loop")).is_none());
+    assert!(super::agent_loop_prompt_cache_key(Some("   "), Some("agent_loop")).is_none());
+    assert!(super::agent_loop_prompt_cache_key(Some(raw_session_id), None).is_none());
+    assert!(
+        super::agent_loop_prompt_cache_key(Some(raw_session_id), Some("title_generation"))
+            .is_none()
+    );
+}
+
+#[test]
+fn plan_llm_request_model_transcript_path_records_observability() {
+    // The single request-planning seam: a normal request takes the canonical
+    // lanes path and the render descriptor captures the system shape + cache plan.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-plan", "test-model");
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    let usage = super::ProjectedRequestUsage {
+        message_input_tokens: 120,
+        tool_schema_input_tokens: 30,
+        input_tokens: 150,
+        tool_schema_serialized_bytes: 512,
+        tool_schema_serialized_chars: 500,
+        tool_schema_segment_count: 2,
+        tool_schema_late_bound_segment_count: 1,
+        ledger_rendered_bytes: 64,
+        history_boundary_input_tokens: 0,
+        prepared_message_input_tokens: 0,
+    };
+    let planned = super::plan_llm_request(&envelope, "session-plan", None, 3, None, usage);
+
+    // No continuation set on the IR → the canonical model-transcript wire.
+    assert!(envelope.ir.continuation.is_none());
+    assert_eq!(planned.render.wire, "model_transcript");
+    assert!(planned.render.model_transcript_messages >= 1);
+    // System rendered as structured blocks (tool guide present → relocation on).
+    assert!(planned.render.system_block_count >= 1);
+    assert_eq!(planned.render.tool_count, 3);
+    assert_eq!(planned.render.message_input_tokens, 120);
+    assert_eq!(planned.render.tool_schema_input_tokens, 30);
+    assert_eq!(planned.render.total_input_tokens, 150);
+    assert_eq!(planned.render.tool_schema_segment_count, 2);
+    assert_eq!(planned.render.tool_schema_late_bound_segment_count, 1);
+    assert_eq!(planned.render.tool_schema_serialized_bytes, 512);
+    assert_eq!(planned.render.tool_schema_serialized_chars, 500);
+    // Cache plan surfaced into the observability + carried in the request options.
+    assert!(planned.render.cache_system);
+    assert_eq!(planned.render.cache_ttl, "1h");
+    assert!(planned.request_options.cache.is_some());
+    let responses = planned
+        .request_options
+        .responses
+        .as_ref()
+        .expect("agent loop carries Responses policy");
+    let cache_key = responses
+        .prompt_cache_key
+        .as_deref()
+        .expect("agent loop carries a session-scoped cache-affinity key");
+    assert_eq!(cache_key.len(), 64);
+    assert!(!cache_key.contains("session-plan"));
+}
+
+#[test]
+fn plan_llm_request_continuation_path_builds_delta() {
+    // A Responses-API continuation takes the flat delta path: only the messages
+    // after the last assistant turn are sent, and the render reflects that.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-plan-cont", "test-model");
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let envelope = with_ir_continuation(
+        super::build_request_envelope(&session, &prepared_context, &config, &[]),
+        "resp_prev",
+    );
+
+    let planned = super::plan_llm_request(
+        &envelope,
+        "session-plan-cont",
+        None,
+        0,
+        None,
+        super::ProjectedRequestUsage::default(),
+    );
+
+    assert_eq!(planned.render.wire, "responses_continuation");
+    // Delta is the tool result after the last assistant turn — NOT the full convo.
+    let delta = envelope.ir.continuation_delta();
+    assert!(!delta.is_empty());
+    assert_eq!(planned.render.request_message_count, delta.len());
+    // The provider derives previous_response_id from the IR continuation (the engine
+    // no longer pre-bakes it into the request options).
+    let responses = envelope
+        .ir
+        .responses_request_options(planned.request_options.responses.as_ref());
+    assert_eq!(responses.previous_response_id.as_deref(), Some("resp_prev"));
+}
+
+fn message_shape(messages: &[bamboo_agent_core::Message]) -> Vec<(Role, String)> {
+    messages
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect()
+}
+
+/// Mirror the engine dispatch: set the stateful Responses continuation on the IR
+/// (boundary = the last assistant turn in the ModelTranscript run), as
+/// `execute_llm_stream` does before planning/dispatch.
+fn with_ir_continuation(
+    mut envelope: super::PreparedRequestEnvelope,
+    previous_response_id: &str,
+) -> super::PreparedRequestEnvelope {
+    let last_committed_assistant_id = envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::Assistant))
+        .map(|m| m.id.clone());
+    envelope.ir.continuation = Some(bamboo_llm::Continuation {
+        previous_response_id: previous_response_id.to_string(),
+        last_committed_assistant_id,
+    });
+    envelope
+}
+
+#[test]
+fn envelope_ir_flatten_orders_stable_prefix_and_model_transcript() {
+    // The normal engine path lowers one chronological ModelTranscript after the
+    // immutable guide. Initial typed snapshots precede real history.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ir-golden", "test-model");
+    // A persisted System message that diverges from the assembled system field
+    // becomes a SystemRemainder run — the case that must stay byte-stable.
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "t1".to_string(),
+            // A distinctive marker: a plain phrase like "do it" collides with the
+            // system directives (which contain the substring "do it"), so
+            // `pos("do it")` would match the leading System run, not this tail.
+            description: "VOLATILE_TAIL_TASK".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("u1"),
+            Message::assistant("a1", None),
+            Message::user("u2"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+
+    assert!(envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::SystemRemainder)
+        .is_empty());
+    assert!(envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::VolatileTail)
+        .is_empty());
+    assert!(!envelope
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .is_empty());
+    // Flat order: system, stable guide, initial typed snapshot, then real history.
+    let flat = message_shape(&envelope.ir.flatten());
+    assert!(matches!(flat[0].0, Role::System));
+    assert!(flat[0].1.contains("BASE_IDENTITY"), "system field leads");
+    let pos = |needle: &str| flat.iter().position(|(_, c)| c.contains(needle));
+    let guide = pos("NOVA_GUIDANCE_MARKER").expect("relocated tool guide present");
+    let task = pos("VOLATILE_TAIL_TASK").expect("task snapshot present");
+    let remainder = pos("PERSISTED OPERATOR NOTE").expect("system remainder present");
+    let conversation = pos("u1").expect("conversation present");
+    assert!(
+        0 < guide && guide < task,
+        "stable prefix (guide) precedes the ledger"
+    );
+    assert!(
+        task < remainder && remainder < conversation,
+        "initial snapshot precedes the unmodified real transcript"
+    );
+    // system_field() returns the byte-authoritative system string.
+    assert_eq!(envelope.ir.system_field(), envelope.ir.system_text);
+}
+
+#[test]
+fn engine_model_transcript_continuation_delta_starts_after_assistant_boundary() {
+    // The engine's normal request no longer reconstructs four mutable lanes.
+    // Continuation slicing operates over the single chronological transcript,
+    // retaining only provider-visible items after the committed assistant.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ir-delta-golden", "test-model");
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    // DynamicContext run: a conversation summary (rides the front/dynamic context).
+    session.conversation_summary = Some(ConversationSummary::new("DELTA_SUMMARY_MARKER", 2, 50));
+    // VolatileTail run: a task list.
+    session.task_list = Some(TaskList {
+        session_id: session.id.clone(),
+        title: "Tasks".to_string(),
+        items: vec![TaskItem {
+            id: "t1".to_string(),
+            description: "DELTA_TASK_MARKER".to_string(),
+            status: TaskItemStatus::InProgress,
+            ..TaskItem::default()
+        }],
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    });
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(2, 40),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = with_ir_continuation(
+        super::build_request_envelope(&session, &prepared_context, &config, &[]),
+        "resp_prev",
+    );
+
+    let delta = envelope.ir.continuation_delta();
+    assert_eq!(delta.len(), 1);
+    assert!(matches!(delta[0].role, Role::Tool));
+    assert_eq!(delta[0].content, "{\"ok\":true}");
+    assert!(delta.iter().all(|message| {
+        !message.content.contains("DELTA_SUMMARY_MARKER")
+            && !message.content.contains("DELTA_TASK_MARKER")
+            && !message.content.contains("PERSISTED OPERATOR NOTE")
+    }));
+}
+
+#[test]
+fn responses_continuation_uses_full_input_not_the_delta() {
+    // Locks review finding #1: on a Responses continuation the request sends the
+    // FULL input view (== ir.responses_input()) via input_messages +
+    // previous_response_id. select_responses_input_messages prefers the Explicit
+    // input_messages over the delta `messages` arg, so the continuation_delta is
+    // NOT what rides the Responses wire. Byte-faithful to legacy — this test makes
+    // that intentional rather than accidental, so a future "real delta" change
+    // fails loudly.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-resp-cont", "test-model");
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = with_ir_continuation(
+        super::build_request_envelope(&session, &prepared_context, &config, &[]),
+        "resp_prev",
+    );
+    let planned = super::plan_llm_request(
+        &envelope,
+        "session-resp-cont",
+        None,
+        0,
+        None,
+        super::ProjectedRequestUsage::default(),
+    );
+
+    // The adapter derives the Responses wire view from the IR + the engine's request
+    // POLICY (planned.request_options.responses).
+    let responses = envelope
+        .ir
+        .responses_request_options(planned.request_options.responses.as_ref());
+
+    let input = responses
+        .input_messages
+        .as_ref()
+        .expect("input_messages present");
+    assert_eq!(
+        message_shape(input),
+        message_shape(&envelope.ir.responses_input()),
+        "Responses continuation sends the FULL input view, not the delta"
+    );
+    assert_eq!(responses.previous_response_id.as_deref(), Some("resp_prev"));
+    assert!(
+        input.len() > envelope.ir.continuation_delta().len(),
+        "FULL Responses input must exceed the smaller continuation delta"
+    );
+}
+
+#[test]
+fn ir_cache_matches_request_options_cache() {
+    // Locks review finding #4: the cache plan lives in both ir.cache and
+    // options.cache (the provider reads options.cache; the IR carries its own copy
+    // for observability). They must stay identical so the two can never diverge.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-cache-dup", "test-model");
+    let config = test_config("BASE_IDENTITY");
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let planned = super::plan_llm_request(
+        &envelope,
+        "session-cache-dup",
+        None,
+        0,
+        None,
+        super::ProjectedRequestUsage::default(),
+    );
+    let options_cache = planned
+        .request_options
+        .cache
+        .as_ref()
+        .expect("cache plan present");
+
+    assert_eq!(envelope.ir.cache.cache_system, options_cache.cache_system);
+    assert_eq!(envelope.ir.cache.cache_tools, options_cache.cache_tools);
+    assert_eq!(envelope.ir.cache.ttl, options_cache.ttl);
+    assert_eq!(
+        envelope.ir.cache.breakpoint_message_ids,
+        options_cache.breakpoint_message_ids
+    );
+}
+
+#[test]
+fn cache_anchor_marks_only_the_last_system_block() {
+    // Review finding #3: the engine marks `cache_anchor` on the LAST system block,
+    // and the Anthropic builder hardcodes `cache_control` onto the last system
+    // block (without reading `cache_anchor`). They agree only because the anchor is
+    // last — lock that so moving the anchor (or adding a second) is caught here
+    // instead of silently diverging from the Anthropic breakpoint.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session = Session::new("session-anchor", "test-model");
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![Message::system("BASE_IDENTITY"), Message::user("go")],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    let blocks = &envelope.ir.system_blocks;
+    assert!(
+        !blocks.is_empty(),
+        "tool guide present → structured system blocks"
+    );
+    let anchor_indices: Vec<usize> = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.cache_anchor)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        anchor_indices,
+        vec![blocks.len() - 1],
+        "exactly one cache_anchor, on the LAST system block (where Anthropic places cache_control)"
+    );
+}
+
+#[test]
+fn ir_responses_view_orders_guide_skill_conversation_and_lifts_system_to_instructions() {
+    // GOLDEN: the adapter-derived Responses view (`PromptIR::responses_request_options`)
+    // is the canonical Responses wire — the tool guide leads the input array, the
+    // relocated skill context follows, the conversation comes after, and the stable
+    // system field is lifted to top-level `instructions` (NOT a leading system
+    // message in the array).
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-ir-resp", "test-model");
+    session.add_message(Message::system("PERSISTED OPERATOR NOTE"));
+    session.metadata.insert(
+        "skill.context".to_string(),
+        "SKILL_CONTEXT_MARKER body".to_string(),
+    );
+    let mut config = test_config("BASE_IDENTITY");
+    config.mcp_tool_guidance = Some("NOVA_GUIDANCE_MARKER guide".to_string());
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("PERSISTED OPERATOR NOTE"),
+            Message::user("u1"),
+            Message::assistant("a1", None),
+            Message::user("u2"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let envelope = super::build_request_envelope(&session, &prepared_context, &config, &[]);
+    // responses_input() == body_chat() (system rides instructions, not the array).
+    let input = message_shape(&envelope.ir.responses_input());
+    let pos = |needle: &str| input.iter().position(|(_, c)| c.contains(needle));
+    let guide = pos("NOVA_GUIDANCE_MARKER").expect("tool guide present");
+    let skill = pos("SKILL_CONTEXT_MARKER").expect("relocated skill context present");
+    let conversation = pos("u1").expect("conversation present");
+    assert!(
+        guide < skill && skill < conversation,
+        "guide leads, then relocated skill context, then the conversation"
+    );
+    assert!(
+        !matches!(input.first(), Some((Role::System, _))),
+        "the stable system rides instructions, so the input array does not LEAD with a system message"
+    );
+
+    // The adapter lifts the stable system to top-level instructions. Asserted by
+    // CONTENT (not by re-deriving from system_field, which would be tautological):
+    // instructions carries the base identity but NOT the relocated guide/skill —
+    // proving the guide/skill left the system and ride the input array instead.
+    let responses = envelope.ir.responses_request_options(None);
+    let instructions = responses.instructions.expect("instructions lifted");
+    assert!(
+        instructions.contains("BASE_IDENTITY"),
+        "instructions carries the stable base identity"
+    );
+    assert!(
+        !instructions.contains("NOVA_GUIDANCE_MARKER")
+            && !instructions.contains("SKILL_CONTEXT_MARKER"),
+        "the relocated guide + skill are NOT in instructions (they ride the input array)"
+    );
+    assert!(
+        instructions == instructions.trim(),
+        "instructions are trimmed (byte-faithful to build_responses_body)"
+    );
+    // The adapter wires the responses_input view as the Responses input array.
+    let wired = responses
+        .input_messages
+        .expect("input_messages derived")
+        .iter()
+        .any(|m| m.content.contains("NOVA_GUIDANCE_MARKER"));
+    assert!(
+        wired,
+        "input_messages carries the relocated guide (the responses_input view)"
+    );
+}
+
+#[tokio::test]
+async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_policy() {
+    // The engine's Responses policy is stateless (`store=false`): the upstream
+    // never persists a turn, so a chained `previous_response_id` is guaranteed to
+    // fail with `previous_response_not_found`. A session that still carries a
+    // stale id (persisted by a pre-fix build) must be sent as a FULL request with
+    // NO continuation, the stale id must be scrubbed from metadata, and the new
+    // response id must NOT be persisted for the next round.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-2", "test-model");
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp_prev".to_string(),
+    );
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![
+        LLMChunk::ResponseId("resp_next".to_string()),
+        LLMChunk::Token("done".to_string()),
+        LLMChunk::Done,
+    ]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-2",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    let requested_messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
+    // FULL request (no continuation delta): system field + whole conversation.
+    assert_eq!(requested_messages.len(), 5);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-2");
+    assert!(matches!(requested_messages[4].role, Role::Tool));
+    // The stale id is NOT sent to the provider.
+    assert_eq!(
+        llm.requested_previous_response_id
+            .lock()
+            .expect("previous_response_id lock")
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        llm.requested_instructions
+            .lock()
+            .expect("instructions lock")
+            .as_deref(),
+        Some(expected_system_field("system").as_str())
+    );
+    assert_eq!(
+        *llm.requested_store.lock().expect("store lock"),
+        Some(false)
+    );
+    assert_eq!(
+        llm.requested_text_verbosity
+            .lock()
+            .expect("text_verbosity lock")
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        llm.requested_include.lock().expect("include lock").clone(),
+        Some(vec!["reasoning.encrypted_content".to_string()])
+    );
+    assert_eq!(
+        llm.requested_reasoning_summary
+            .lock()
+            .expect("reasoning_summary lock")
+            .as_deref(),
+        Some("auto")
+    );
+    assert_eq!(
+        llm.requested_session_id
+            .lock()
+            .expect("session_id lock")
+            .as_deref(),
+        Some("session-stream-2")
+    );
+    // The stream still surfaces the upstream response id, but under a stateless
+    // store policy the engine neither keeps the stale id nor persists the new
+    // one — the metadata key is scrubbed entirely.
+    assert_eq!(stream_output.response_id.as_deref(), Some("resp_next"));
+    assert!(!session
+        .metadata
+        .contains_key("responses.previous_response_id"));
+}
+
+#[test]
+fn responses_continuation_enabled_requires_store_true_and_supported_provider() {
+    use bamboo_llm::provider::ResponsesRequestOptions;
+
+    // The engine's shipped policy is stateless — this is the invariant that
+    // guarantees no `previous_response_id` ever rides a `store=false` turn
+    // (OpenAI rejects that with 400 `previous_response_not_found`).
+    let shipped = super::engine_responses_policy();
+    assert_eq!(shipped.store, Some(false));
+    assert!(!super::responses_continuation_enabled(
+        &shipped,
+        Some("openai")
+    ));
+
+    // A stateful (store=true) policy re-enables chaining for providers that
+    // support the parameter…
+    let stateful = ResponsesRequestOptions {
+        store: Some(true),
+        ..Default::default()
+    };
+    assert!(super::responses_continuation_enabled(
+        &stateful,
+        Some("openai")
+    ));
+    assert!(super::responses_continuation_enabled(&stateful, None));
+    // …but never for Copilot, whose HTTP /responses endpoint rejects it.
+    assert!(!super::responses_continuation_enabled(
+        &stateful,
+        Some("copilot")
+    ));
+
+    // store unset defaults to the stateless wire value (false) → disabled.
+    let unset = ResponsesRequestOptions::default();
+    assert!(!super::responses_continuation_enabled(
+        &unset,
+        Some("openai")
+    ));
+}
+
+#[tokio::test]
+async fn execute_llm_stream_includes_external_memory_volatile_block() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-2a", "test-model");
+    // A stale continuation id may still be present (pre-fix persistence); under
+    // the stateless store policy it is ignored and the request is sent in full.
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp_prev".to_string(),
+    );
+    // External memory rides a session field now (the async refresh populates it),
+    // not a system-message marker.
+    session.metadata.insert(
+        crate::runtime::runner::prompt_context::EXTERNAL_MEMORY_RENDERED_KEY.to_string(),
+        "## External Memory (Persistent)\n\nSession note body".to_string(),
+    );
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![
+        LLMChunk::ResponseId("resp_next".to_string()),
+        LLMChunk::Token("done".to_string()),
+        LLMChunk::Done,
+    ]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-2a",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    let requested_messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
+    // First epoch: external memory is seeded before the real transcript. Later
+    // revisions append after the then-current transcript boundary.
+    assert_eq!(requested_messages.len(), 6);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-2a");
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
+        .content
+        .contains("context_type: external_memory"));
+    assert!(requested_messages[2].content.contains("Session note body"));
+    assert!(matches!(requested_messages[5].role, Role::Tool));
+    // The stale continuation id was ignored, not forwarded.
+    assert_eq!(
+        llm.requested_previous_response_id
+            .lock()
+            .expect("previous_response_id lock")
+            .as_deref(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-2plan", "test-model");
+    // Stale continuation id: ignored under the stateless store policy.
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp_prev".to_string(),
+    );
+    // Plan mode active in session STATE — the plan_runtime/plan_mode volatile
+    // blocks are now built directly from this, not reparsed from system markers.
+    {
+        use bamboo_domain::session::runtime_state::{
+            AgentRuntimeState, PlanModeState, PlanModeStatus,
+        };
+        session.agent_runtime_state = Some(AgentRuntimeState::new("run-1"));
+        session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".to_string(),
+            plan_file_path: None,
+            status: PlanModeStatus::Exploring,
+        });
+    }
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let system_prompt = "system";
+    let config = test_config(system_prompt);
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system(system_prompt),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![
+        LLMChunk::ResponseId("resp_next".to_string()),
+        LLMChunk::Token("done".to_string()),
+        LLMChunk::Done,
+    ]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-2plan",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    let requested_messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
+    // Initial snapshots are ordered deterministically by typed context kind,
+    // followed by the unchanged real transcript.
+    assert_eq!(requested_messages.len(), 7);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-2plan");
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
+        .content
+        .contains("context_type: plan_mode_state"));
+    assert!(requested_messages[2].content.contains("PLAN MODE ACTIVE"));
+    assert!(matches!(requested_messages[3].role, Role::User));
+    assert!(requested_messages[3]
+        .content
+        .contains("context_type: plan_runtime_state"));
+    assert!(requested_messages[3]
+        .content
+        .contains("DURABLE PLAN EXECUTION CONTEXT"));
+    assert!(matches!(requested_messages[6].role, Role::Tool));
+}
+
+#[tokio::test]
+async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_active() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-2b", "test-model");
+    // Stale continuation id: ignored under the stateless store policy — the
+    // request rides the full lanes wire with the summary as dynamic context.
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp_prev".to_string(),
+    );
+    session.conversation_summary = Some(ConversationSummary::new(
+        "Older work has been summarized locally.",
+        6,
+        42,
+    ));
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("previous work was compressed"),
+            Message::assistant("here is the local summary context", None),
+            Message::user("continue from the compressed state"),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(18, 40),
+        truncation_occurred: false,
+        segments_removed: 1,
+        compressed_message_ids: vec!["msg_old_1".to_string(), "msg_old_2".to_string()],
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![
+        LLMChunk::ResponseId("resp_next".to_string()),
+        LLMChunk::Token("done".to_string()),
+        LLMChunk::Done,
+    ]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-2b",
+            model: "test-model",
+            provider_name: Some("openai"),
+            provider_type: Some("openai"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    let requested_messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
+    // Full request: system field, the summary as dynamic context, then the whole
+    // (compressed) conversation window.
+    assert_eq!(requested_messages.len(), 7);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-2b");
+    assert!(matches!(requested_messages[2].role, Role::User));
+    assert!(requested_messages[2]
+        .content
+        .contains("context_type: conversation_summary"));
+    assert!(requested_messages[2]
+        .content
+        .contains("Older work has been summarized locally."));
+    assert!(matches!(requested_messages[3].role, Role::User));
+    assert_eq!(
+        requested_messages[3].content,
+        "previous work was compressed"
+    );
+    assert!(matches!(requested_messages[6].role, Role::Tool));
+    // The stale continuation id was ignored, not forwarded.
+    assert_eq!(
+        llm.requested_previous_response_id
+            .lock()
+            .expect("previous_response_id lock")
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        llm.requested_instructions
+            .lock()
+            .expect("instructions lock")
+            .as_deref(),
+        Some(expected_system_field("system").as_str())
+    );
+    assert_eq!(
+        llm.requested_session_id
+            .lock()
+            .expect("session_id lock")
+            .as_deref(),
+        Some("session-stream-2b")
+    );
+}
+
+#[tokio::test]
+async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-3", "test-model");
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp_prev".to_string(),
+    );
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![
+        LLMChunk::ResponseId("resp_next".to_string()),
+        LLMChunk::Token("done".to_string()),
+        LLMChunk::Done,
+    ]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-3",
+            model: "test-model",
+            provider_name: Some("copilot"),
+            provider_type: Some("copilot"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    let requested_messages = llm
+        .requested_messages
+        .lock()
+        .expect("messages lock")
+        .clone();
+    assert_eq!(requested_messages.len(), 5);
+    assert!(matches!(requested_messages[0].role, Role::System));
+    assert_session_identity_message(&requested_messages[1], "session-stream-3");
+    assert_eq!(
+        llm.requested_previous_response_id
+            .lock()
+            .expect("previous_response_id lock")
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        llm.requested_instructions
+            .lock()
+            .expect("instructions lock")
+            .as_deref(),
+        Some(expected_system_field("system").as_str())
+    );
+    assert_eq!(
+        *llm.requested_store.lock().expect("store lock"),
+        Some(false)
+    );
+    assert_eq!(
+        llm.requested_text_verbosity
+            .lock()
+            .expect("text_verbosity lock")
+            .as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        llm.requested_include.lock().expect("include lock").clone(),
+        Some(vec!["reasoning.encrypted_content".to_string()])
+    );
+    assert_eq!(
+        llm.requested_reasoning_summary
+            .lock()
+            .expect("reasoning_summary lock")
+            .as_deref(),
+        Some("auto")
+    );
+    assert_eq!(
+        llm.requested_session_id
+            .lock()
+            .expect("session_id lock")
+            .as_deref(),
+        Some("session-stream-3")
+    );
+    assert!(!session
+        .metadata
+        .contains_key("responses.previous_response_id"));
+}
+
+#[tokio::test]
+async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_provider_type() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("session-stream-4", "test-model");
+    session.metadata.insert(
+        "responses.previous_response_id".to_string(),
+        "resp_prev".to_string(),
+    );
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let config = test_config("system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("system"),
+            Message::user("run a tool"),
+            Message::assistant("calling tool", None),
+            Message::tool_result("call_1", "{\"ok\":true}"),
+        ],
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+
+    let llm = mock_llm(vec![
+        LLMChunk::ResponseId("resp_next".to_string()),
+        LLMChunk::Token("done".to_string()),
+        LLMChunk::Done,
+    ]);
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+
+    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "session-stream-4",
+            model: "test-model",
+            provider_name: Some("copilot-instance"),
+            provider_type: Some("copilot"),
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .expect("execute llm stream");
+
+    assert_eq!(
+        llm.requested_previous_response_id
+            .lock()
+            .expect("previous_response_id lock")
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        llm.requested_instructions
+            .lock()
+            .expect("instructions lock")
+            .as_deref(),
+        Some(expected_system_field("system").as_str())
+    );
+    assert!(!session
+        .metadata
+        .contains_key("responses.previous_response_id"));
+}
+
+#[test]
+fn overflow_error_detection_matches_common_provider_messages() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    assert!(super::is_llm_overflow_error("prompt too long"));
+    assert!(super::is_llm_overflow_error(
+        "API error: maximum context length exceeded"
+    ));
+    assert!(super::is_llm_overflow_error(
+        "Request too large for model context window"
+    ));
+    assert!(!super::is_llm_overflow_error("timeout while connecting"));
+    assert!(!super::is_llm_overflow_error(
+        "authentication error: invalid api key"
+    ));
+}
+
+#[test]
+fn activated_guidance_appends_to_transcript_without_rewriting_cached_head() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("guide-cache", "test-model");
+    session.messages.push(Message::user("start"));
+    let config = test_config("system");
+    let tools = bamboo_tools::BuiltinToolExecutor::new();
+    let schemas =
+        crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+            &config,
+            &tools,
+            &mut session,
+        );
+    let prepare = |session: &Session| PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let prepared = prepare(&session);
+    let before = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &schemas,
+        "test-model",
+    );
+    bamboo_tools::exposure::activate_discoverable_tools(&mut session, ["Sleep"]);
+    session.messages.push(Message::user("wait briefly"));
+    let schemas_after =
+        crate::runtime::runner::session_setup::tool_schemas::resolve_tool_schemas_for_round(
+            &config,
+            &tools,
+            &mut session,
+        );
+    let prepared = prepare(&session);
+    let after = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &schemas_after,
+        "test-model",
+    );
+    assert_eq!(
+        serde_json::to_string(&schemas).unwrap(),
+        serde_json::to_string(&schemas_after).unwrap()
+    );
+    let prefix = |envelope: &super::PreparedRequestEnvelope| {
+        envelope
+            .ir
+            .run(bamboo_llm::SegmentRole::StablePrefix)
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(before.ir.system_text, after.ir.system_text);
+    assert_eq!(prefix(&before), prefix(&after));
+    assert!(after
+        .ir
+        .run(bamboo_llm::SegmentRole::ModelTranscript)
+        .iter()
+        .any(|m| m.content.contains("Activated Tool Guidance") && m.content.contains("Sleep")));
+    assert!(!session
+        .messages
+        .iter()
+        .any(|m| m.content.contains("Activated Tool Guidance")));
+    let third = super::build_request_envelope_reconciled(
+        &mut session,
+        &prepared,
+        &config,
+        &schemas_after,
+        "test-model",
+    );
+    assert_eq!(
+        after.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len(),
+        third.ir.run(bamboo_llm::SegmentRole::ModelTranscript).len()
+    );
+}
+
+fn browser_history_fixture() -> (Session, ToolSchema, String) {
+    let browser = provider_visible_schema(
+        "browser",
+        "BROWSER_SCHEMA_ONLY_MARKER: operate the shared page",
+        serde_json::json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["navigate","snapshot","click"]},
+                "selector":{"type":"string","description":"Select an element in the active page"},
+                "expected_epoch":{"type":"integer"}
+            },
+            "required":["action"]
+        }),
+    );
+    let mut session = Session::new("browser-history", "test-model");
+    session.add_message(Message::system("system"));
+    session.add_message(Message::user("Find the browser"));
+    let call = ToolCall {
+        id: "browser-discovery".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.to_string(),
+            arguments: r#"{"query":"browser"}"#.to_string(),
+        },
+    };
+    let mut assistant = Message::assistant("", Some(vec![call]));
+    assistant.never_compress = true;
+    assistant.metadata = Some(serde_json::json!({
+        "runtime_kind":"sticky_capability_discovery","version":1
+    }));
+    session.add_message(assistant);
+    let full_result = format!(
+        "<loaded_tools>{}</loaded_tools>",
+        serde_json::json!({"tools":[serde_json::to_value(&browser).unwrap()]})
+    );
+    let mut result =
+        Message::tool_result_with_status("browser-discovery", full_result.clone(), true);
+    result.never_compress = true;
+    result.metadata = Some(serde_json::json!({
+        "runtime_kind":"sticky_capability_discovery",
+        "version":1,
+        "canonical_new_names":["browser"]
+    }));
+    session.add_message(result);
+    (session, browser, full_result)
+}
+
+fn browser_history_prepared(session: &Session) -> PreparedContext {
+    PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    }
+}
+
+#[test]
+fn legacy_browser_request_has_one_complete_schema_after_load_and_resume() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (mut session, browser, full_result) = browser_history_fixture();
+    let config = test_config("system");
+    let mut before_session = session.clone();
+    before_session.messages.truncate(2);
+    let before_tools = super::super::request_tool_schemas_for_loading_mode(
+        &before_session,
+        std::slice::from_ref(&browser),
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
+    );
+    let before_prepared = browser_history_prepared(&before_session);
+    let before = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut before_session,
+        &before_prepared,
+        &config,
+        before_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    let before_wire = serde_json::to_string(&serde_json::json!({
+        "messages":before.ir.flatten(),"tools":before_tools.as_ref()
+    }))
+    .unwrap();
+    assert!(before_wire.contains("discover_capabilities"));
+    assert!(!before_wire.contains("BROWSER_SCHEMA_ONLY_MARKER"));
+
+    let loaded_tools = super::super::request_tool_schemas_for_loading_mode(
+        &session,
+        std::slice::from_ref(&browser),
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        None,
+    );
+    assert_eq!(loaded_tools[0].function.name, "browser");
+    assert_eq!(
+        crate::runtime::runner::loop_execution::legacy_browser_loaded_result_content(&session)
+            .len(),
+        1
+    );
+    let prepared = browser_history_prepared(&session);
+    let persisted_messages = session.messages.clone();
+    let mut duplicate_session = session.clone();
+    let duplicate = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut duplicate_session,
+        &prepared,
+        &config,
+        loaded_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::Progressive,
+    );
+    let duplicate_wire = serde_json::to_vec(&serde_json::json!({
+        "messages":duplicate.ir.flatten(),"tools":loaded_tools.as_ref()
+    }))
+    .unwrap();
+    let after = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut session,
+        &prepared,
+        &config,
+        loaded_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    let after_messages = after.ir.flatten();
+    assert_eq!(
+        after_messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("browser-discovery"))
+            .unwrap()
+            .content,
+        super::LOADED_BROWSER_ACKNOWLEDGEMENT
+    );
+    let after_wire = serde_json::to_string(&serde_json::json!({
+        "messages":after_messages,"tools":loaded_tools.as_ref()
+    }))
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(loaded_tools.as_ref()).unwrap(),
+        serde_json::json!([browser])
+    );
+    assert!(!after_wire.contains("<loaded_tools>"));
+    assert!(after_wire.contains(super::LOADED_BROWSER_ACKNOWLEDGEMENT));
+    assert!(!after_wire.contains(&full_result));
+    assert!(after_wire.len() < duplicate_wire.len());
+    assert_eq!(
+        serde_json::to_value(&session.messages).unwrap(),
+        serde_json::to_value(&persisted_messages).unwrap()
+    );
+    assert_eq!(session.messages.last().unwrap().content, full_result);
+
+    let mut resumed: Session =
+        serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+    let resumed_prepared = browser_history_prepared(&resumed);
+    let resumed_request = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        loaded_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    assert_eq!(
+        resumed_request
+            .ir
+            .flatten()
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("browser-discovery"))
+            .unwrap()
+            .content,
+        super::LOADED_BROWSER_ACKNOWLEDGEMENT
+    );
+
+    let disabled = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        &[],
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    assert!(disabled
+        .ir
+        .flatten()
+        .iter()
+        .any(|message| message.content == full_result));
+    assert!(duplicate
+        .ir
+        .flatten()
+        .iter()
+        .any(|message| message.content == full_result));
+    let sticky = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut resumed,
+        &resumed_prepared,
+        &config,
+        loaded_tools.as_ref(),
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::StickyFallback,
+    );
+    assert!(sticky
+        .ir
+        .flatten()
+        .iter()
+        .any(|message| message.content == full_result));
+}
+
+#[test]
+fn legacy_browser_history_projection_requires_a_canonical_result() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (mut session, browser, full_result) = browser_history_fixture();
+    session.messages.last_mut().unwrap().metadata = None;
+    let prepared = browser_history_prepared(&session);
+    let envelope = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut session,
+        &prepared,
+        &test_config("system"),
+        &[browser],
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    assert!(envelope
+        .ir
+        .flatten()
+        .iter()
+        .any(|message| message.content == full_result));
+}
+
+#[test]
+fn legacy_browser_history_projection_preserves_other_discovery_results() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (mut session, browser, _) = browser_history_fixture();
+    let other = provider_visible_schema(
+        "ReadArchive",
+        "Read archived repository files",
+        serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+    );
+    session.add_message(Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: "other-discovery".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME.to_string(),
+                arguments: r#"{"query":"ReadArchive"}"#.to_string(),
+            },
+        }]),
+    ));
+    let other_result = format!(
+        "<loaded_tools>{}</loaded_tools>",
+        serde_json::json!({"tools":[other]})
+    );
+    let mut result =
+        Message::tool_result_with_status("other-discovery", other_result.clone(), true);
+    result.never_compress = true;
+    result.metadata = Some(serde_json::json!({
+        "runtime_kind":"sticky_capability_discovery",
+        "version":1,
+        "canonical_new_names":["ReadArchive"]
+    }));
+    session.add_message(result);
+    let prepared = browser_history_prepared(&session);
+    let envelope = super::build_request_envelope_reconciled_for_loading_mode(
+        &mut session,
+        &prepared,
+        &test_config("system"),
+        &[browser],
+        "test-model",
+        bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+    );
+    let transcript = envelope.ir.flatten();
+    assert!(transcript.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("browser-discovery")
+            && message.content == super::LOADED_BROWSER_ACKNOWLEDGEMENT
+    }));
+    assert!(transcript.iter().any(|message| {
+        message.tool_call_id.as_deref() == Some("other-discovery")
+            && message.content == other_result
+    }));
+}
+
+#[tokio::test]
+async fn legacy_browser_usage_projection_counts_compact_provider_history() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (session, browser, _) = browser_history_fixture();
+    let prepared = browser_history_prepared(&session);
+    let provider: Arc<dyn LLMProvider> = mock_llm(vec![LLMChunk::Done]);
+    let config = test_config("system");
+    let projected = super::project_request_usage(
+        &session,
+        &prepared,
+        &config,
+        std::slice::from_ref(&browser),
+        "test-model",
+        &provider,
+    )
+    .await
+    .unwrap();
+    let unprojected =
+        bamboo_compression::TiktokenTokenCounter::default().count_messages(&prepared.messages);
+    assert!(projected.prepared_message_input_tokens < unprojected);
+    let disabled =
+        super::project_request_usage(&session, &prepared, &config, &[], "test-model", &provider)
+            .await
+            .unwrap();
+    assert_eq!(disabled.prepared_message_input_tokens, unprojected);
+    let non_browser = provider_visible_schema(
+        "ReadArchive",
+        "Read archived repository files",
+        serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+    );
+    let non_browser_projected = super::project_request_usage(
+        &session,
+        &prepared,
+        &config,
+        &[non_browser],
+        "test-model",
+        &provider,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        non_browser_projected.prepared_message_input_tokens,
+        unprojected
+    );
+}
+
+#[tokio::test]
+async fn legacy_browser_dispatch_sends_acknowledgement_and_retains_durable_definition() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let (mut session, browser, full_result) = browser_history_fixture();
+    let prepared = browser_history_prepared(&session);
+    let llm = mock_llm(vec![LLMChunk::Done]);
+    let provider: Arc<dyn LLMProvider> = llm.clone();
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+
+    execute_llm_stream(
+        &mut session,
+        &test_config("system"),
+        &provider,
+        &prepared,
+        &[browser],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id: "browser-history",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let requested = llm.requested_messages.lock().unwrap();
+    assert_eq!(
+        requested
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("browser-discovery"))
+            .unwrap()
+            .content,
+        super::LOADED_BROWSER_ACKNOWLEDGEMENT
+    );
+    assert_eq!(*llm.requested_tool_names.lock().unwrap(), vec!["browser"]);
+    assert_eq!(session.messages.last().unwrap().content, full_result);
+}

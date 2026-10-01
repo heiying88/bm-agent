@@ -1,0 +1,50 @@
+//! Framework-agnostic server-side tool implementations.
+//!
+//! These tools (memory, session inspector, skill runtime, compact, overlay) and
+//! the [`ToolSurfaceFactory`] depend only on lower crates (`bamboo-agent-core`,
+//! `bamboo-engine`, `bamboo-infrastructure`, `bamboo-memory`, `bamboo-tools`) —
+//! never on `bamboo-server`'s `AppState`. Server-bound tools (sub-agent,
+//! schedule) live in `bamboo-server::tools` and reach this crate through ports.
+
+pub mod archive;
+pub mod ask_agent;
+pub mod cluster_tool;
+pub mod compact;
+pub mod deploy_agent;
+pub mod fabric_deploy;
+pub mod ledger;
+pub mod memory;
+pub mod notify;
+pub mod overlay_executor;
+pub mod parent_request_reply;
+pub mod plan;
+pub mod project_tools;
+pub mod registry_keys;
+pub mod session_control;
+pub mod session_inspector;
+pub mod skill_runtime;
+pub mod sub_agent;
+mod sub_agent_facade;
+pub mod surface;
+
+pub use archive::ArchiveContextTool;
+pub use ask_agent::AskAgentTool;
+pub use cluster_tool::ClusterTool;
+pub use compact::CompactContextTool;
+pub use deploy_agent::{DeployAgentTool, Deployed, DeployedRegistry};
+pub use fabric_deploy::{FabricActionResult, FabricCommitSnapshot, FabricDeployer, FabricError};
+pub use ledger::{LedgerScheduleBridge, LedgerTool};
+pub use memory::MemoryTool;
+pub use notify::{NotificationDispatcher, NotifyTool};
+pub use overlay_executor::OverlayToolExecutor;
+pub use parent_request_reply::{
+    validate_parent_answer_input, ParentQuestionReplyReceipt, ParentRequestMessageReceipt,
+    ParentRequestReplyPort, ParentRequestReplyReceipt, ParentRequestReplyState,
+};
+pub use plan::PlanTool;
+pub use project_tools::{ProjectTool, ProjectWorkspaceTool};
+pub use session_control::SessionControlTool;
+pub use session_inspector::SessionInspectorTool;
+pub use skill_runtime::{LoadSkillTool, ReadSkillResourceTool};
+pub use sub_agent::{SubAgentTool, DEFAULT_MAX_SPAWN_DEPTH};
+pub use surface::{ToolSurface, ToolSurfaceFactory};

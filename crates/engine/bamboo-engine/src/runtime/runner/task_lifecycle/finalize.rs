@@ -1,0 +1,60 @@
+use chrono::Utc;
+use tokio::sync::mpsc;
+
+use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::task_context::TaskLoopContext;
+use bamboo_agent_core::{AgentEvent, Session};
+
+pub(super) async fn finalize_task_context(
+    task_context: Option<TaskLoopContext>,
+    session: &mut Session,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    config: &AgentLoopConfig,
+) {
+    let Some(ctx) = task_context else {
+        return;
+    };
+
+    if ctx.is_all_completed() {
+        tracing::info!("[{}] All task items completed", session_id);
+
+        let _ = event_tx
+            .send(AgentEvent::TaskListCompleted {
+                session_id: session_id.to_string(),
+                completed_at: Utc::now(),
+                total_rounds: ctx.current_round + 1, // Convert 0-indexed to 1-indexed for display.
+                total_tool_calls: ctx.items.iter().map(|item| item.tool_calls.len()).sum(),
+                version: Some(ctx.version),
+            })
+            .await;
+    }
+
+    let version = ctx.version;
+    let task_list_title = session
+        .task_list
+        .as_ref()
+        .map(|task_list| task_list.title.clone())
+        .unwrap_or_else(|| "Agent Tasks".to_string());
+    session.set_task_list_version_meta(version.to_string());
+    session.task_list = Some(ctx.into_task_list_with_title(task_list_title));
+    session.updated_at = Utc::now();
+
+    tracing::debug!(
+        "[{}] Synced TaskLoopContext to session, version={}",
+        session_id,
+        version
+    );
+
+    if let Some(ref persistence) = config.persistence {
+        if let Err(error) = persistence.save_runtime_session(session).await {
+            tracing::warn!(
+                "[{}] Failed to save session after agent loop: {}",
+                session_id,
+                error
+            );
+        } else {
+            tracing::debug!("[{}] Session saved with updated task list", session_id);
+        }
+    }
+}

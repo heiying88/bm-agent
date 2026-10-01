@@ -1,0 +1,169 @@
+# Project identity and shared resources
+
+A Bamboo Project is a stable user-local identity shared by sessions. It is not
+derived from a workspace, repository name, remote URL, or path hash. A session's
+`project_id` remains unchanged when its current workspace moves between a main
+checkout, linked worktree, subdirectory, or an unregistered temporary directory.
+
+Projects live below the configured Bamboo data directory:
+
+```text
+${BAMBOO_DATA_DIR}/projects/<opaque-project-id>/
+├── project.json
+├── settings.json
+├── skills/
+├── skills-<mode>/
+├── commands/
+├── memory/v1/
+├── artifacts/
+└── state/
+```
+
+`project.json` is authoritative. `projects/index.json` is rebuildable. Project
+updates use revision/ETag compare-and-swap. The opaque ID, not the display name,
+is the directory component, so renaming a Project does not move its resources.
+Archived Projects keep their sessions and resources.
+
+## Project and Workspace
+
+Every new active Project has one canonical `project_path`: the user's source
+folder and the Project's default execution directory. It is distinct from
+`project_home`, Bamboo's private resource directory shown above. A Project can
+also register additional workspace/worktree roots. All roots own their
+descendant paths. Bamboo rejects a Project path CAS update, session assignment,
+or Workspace tool change when the confinement-resolved destination belongs to
+another Project. An unregistered directory remains an ephemeral workspace and
+is not added to the registry. For an assigned session, user-facing explicit
+switches through session PATCH or chat reject an unregistered directory with
+`project_workspace_unbound`; bind it through the Project workspace API first.
+Unassigned sessions may continue to select unregistered directories.
+
+Assigned sessions resolve their effective workspace with one precedence:
+
+```text
+explicit request/tool workspace
+  > persisted session workspace
+  > Project.project_path
+```
+
+Resolution stops there. Global `default_work_area` and session-scoped temporary
+directories are compatibility fallbacks only for Unassigned/legacy sessions.
+Missing, moved, non-directory, or confinement-relocated Project paths fail
+closed with `project_path_missing` or `project_path_unavailable`; they never
+drift to a global, foreign-Project, or temporary directory.
+
+Resource precedence is:
+
+```text
+builtin < global/user < Project home < current Workspace < session activation
+```
+
+Workspace-local overlays remain in `<git-root>/.bamboo/`. Project skills and
+commands are shared by all Project sessions; Workspace skills and commands can
+override them. Deterministic workflows remain `workflow.yaml` files inside skill
+bundles—there is no standalone Project `workflows/` directory.
+
+For repository compatibility only, a Workspace may contain legacy read-only
+`.bamboo/workflows/*.md` sources. An assigned Project session explicitly
+migrates such a source into the Project home's canonical `skills/` layer; an
+unassigned legacy session retains the bounded Workspace `.bamboo/skills/`
+fallback. Migration never creates a Project-home `workflows/` directory,
+never modifies the source, and records the relative `original_source` plus the
+`lotus-119-complete` compatibility removal boundary in the migrated bundle.
+
+Project memory and Dream data are stored in
+`projects/<id>/memory/v1`. Assigned sessions never derive a write scope from a
+workspace path.
+
+## API and propagation
+
+The `/api/v1/projects` API creates, lists, updates, binds, unbinds, inspects,
+archives, and unarchives Projects. Create requires `project_path`; list/detail
+return it; PATCH can change it without changing `project_id`. Mutations require
+the current revision through `If-Match`. `POST /api/v1/projects/{id}/unarchive`
+restores only an archived Project, returns its canonical manifest and new ETag,
+and publishes `ProjectUpdated`. Missing or stale `If-Match` values return `428`
+or `412`; restoring an already-active Project returns structured
+`project_not_archived` (`409`). Restore preserves Project identity, paths,
+bindings, shared resources, and session ownership. The current primary path
+cannot be unbound—select a replacement with Project CAS first.
+Session create/list/detail and chat contracts expose `project_id`; explicit
+session reassignment also requires `If-Match` and is rejected while the session
+is running.
+
+`PATCH /api/v1/sessions/{id}` accepts `workspace_path` as an immediate durable
+Workspace switch. It requires `If-Match` (`428` when absent, `412` when stale),
+never changes `project_id`, updates the session metadata/index before returning,
+and publishes `session_project_updated` with `project_id`, `workspace_path`, and
+`metadata_version` on the account feed. Assigned sessions may select only an
+existing path already bound to their active Project; the endpoint never binds
+paths as a side effect. Errors are structured as `workspace_invalid` (`400`),
+`project_workspace_conflict`, `project_workspace_unbound`, `project_archived`,
+or `session_project_running_conflict` (`409`). Sending `project_id` and
+`workspace_path` together validates and commits both as one explicit
+reassignment transaction.
+
+`POST /chat` retains its compatibility behavior where an explicitly supplied
+`workspace_path` becomes the persisted Workspace for that chat turn. It uses
+the same active-Project, path, ownership, and pre-existing-binding validation
+as the PATCH switch, while chat requests that omit the field keep the current
+durable Workspace/fallback behavior.
+
+Child, resident, guardian, remote actor, schedule, connect, headless, TUI, and
+SDK creation paths propagate the typed Project ID. Normal chat and Workspace
+changes never reassign it.
+
+The system prompt uses separate Project and Workspace marker blocks. The
+Project block distinguishes `Project path` from `Project home (Bamboo data)`;
+the Workspace block reports the effective path plus `explicit`, `session`, or
+`project_default` source. Project identity/path remain stable while ordinary
+Workspace changes replace only the Workspace block. Resource counts and
+revisions are dynamic per-round context, not part of the cacheable identity
+prefix. Prompt and resource APIs expose only redacted names, status, counts,
+and revisions—never MCP headers, environment values, or credential secrets.
+
+## Legacy Project assignment
+
+Root persistence protects Project membership with the existing
+`metadata_version` and `created_at`. Full and runtime writes revalidate the
+small canonical `runtime.json` under the cross-process session lock. An older
+revision, a changed creation time, or a different Project without exactly the
+next revision returns a typed storage conflict before files or caches publish.
+Project changes use checked revision increments, including removal and
+reassignment; overflow returns `409 session_metadata_revision_exhausted` from
+Project/Workspace PATCH. A concurrent context change caught at its final writer
+returns `409 session_authority_conflict` and requires reloading before retry.
+
+Merge-save adopts durable Project membership together with its revision and
+workspace context into the caller snapshot. The SDK's first assignment of an
+already persisted Unassigned Root validates the candidate without publishing a
+runtime workspace, advances the revision, commits its sidecar, and only then
+enters normal execution preparation. New unsaved sessions retain revision zero.
+These are stale-snapshot guarantees for trusted storage writers, not an ACL for
+arbitrary Rust callers that deliberately fabricate newer revisions.
+
+A Root with missing or corrupt runtime state remains readable through the
+legacy history fallback, but cannot be saved, cleared, or rebuilt by automatic
+sidecar migration or Task writes. A main-only legacy Root is indistinguishable
+from one that lost newer Project context. Restoring its correct canonical
+runtime state is required before mutation; reconstructing authority from old
+history is deliberately unavailable. Strict Root authority reads also require
+main/runtime creation times to match. Legacy Child sidecar migration remains
+available. No new identity registry, Project epoch or recovery journal is added.
+An interrupted first create with only empty layout directories can be retried.
+A full save can also complete a missing main file when the valid runtime still
+proves exactly the same creation identity, Project and revision; it cannot
+advance context during that repair. Runtime and Task writes require the pair.
+
+Migration dry-runs match only exact canonical bindings or a safely resolved
+common Git directory. Ambiguous names, missing paths, remote URLs, and path
+hashes remain Unassigned. When a dry-run session supplies only `workspace_path`,
+the server reads that existing Workspace to derive its canonical path, Git
+common directory. Caller-supplied evidence remains authoritative and is never
+rewritten. Missing, unreadable, or nonexistent Workspaces produce diagnostics
+and no derived evidence instead of failing the request. This enrichment is
+read-only and never updates a session, Project manifest, or index.
+
+Manifest v1 migration promotes an old binding only when exactly one exists.
+Zero bindings remain `needs_configuration`; multiple bindings remain
+`needs_selection` and are never resolved by vector order or a `main` label.

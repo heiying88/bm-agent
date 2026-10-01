@@ -1,0 +1,413 @@
+use crate::runtime::config::AgentLoopConfig;
+use bamboo_agent_core::tools::{ToolExecutor, ToolSchema};
+use bamboo_agent_core::Session;
+use bamboo_domain::{
+    resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
+    ClassifiedToolIdentity, ClassifiedToolSchema, EffectiveCallableSet, SessionKind,
+};
+use bamboo_skills::runtime_metadata::{
+    LOADED_SKILL_IDS_METADATA_KEY, SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY,
+    SKILL_RUNTIME_SELECTION_SOURCE_KEY,
+};
+use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
+
+const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
+const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
+const PHYSICAL_SUBAGENT_TOOLS: [&str; 3] = ["ask_agent", "deploy_agent", "cluster"];
+
+pub(crate) fn effective_guide_activation(
+    config: &AgentLoopConfig,
+    session: &Session,
+) -> std::collections::BTreeSet<String> {
+    if config.freeze_tool_exposure_for_cache {
+        if let Some(frozen) = session
+            .metadata
+            .get(EXPOSURE_ACTIVATED)
+            .and_then(|raw| serde_json::from_str(raw).ok())
+        {
+            return frozen;
+        }
+    }
+    activated_discoverable_tools(session)
+}
+
+/// Capture presentation only; the catalog and execution authority are rebuilt live.
+pub(crate) fn resolve_tool_schemas_for_round(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &mut Session,
+) -> Vec<ToolSchema> {
+    if config.freeze_tool_exposure_for_cache {
+        use sha2::{Digest, Sha256};
+        let catalog = resolve_catalog_with_activation(
+            config,
+            tools,
+            session,
+            &std::collections::BTreeSet::new(),
+        );
+        let schemas = catalog
+            .iter()
+            .map(|entry| entry.schema())
+            .collect::<Vec<_>>();
+        let value = serde_json::to_value(schemas).expect("tool schemas serialize");
+        let bytes =
+            bamboo_llm::providers::common::tool_schema::canonicalize_json_value(&value).to_string();
+        let signature = Sha256::digest(bytes.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if session.metadata.get(EXPOSURE_SIGNATURE) != Some(&signature) {
+            session
+                .metadata
+                .insert(EXPOSURE_SIGNATURE.into(), signature);
+            session.metadata.insert(
+                EXPOSURE_ACTIVATED.into(),
+                serde_json::to_string(&activated_discoverable_tools(session))
+                    .expect("activation names serialize"),
+            );
+        }
+    } else {
+        session.metadata.remove(EXPOSURE_SIGNATURE);
+        session.metadata.remove(EXPOSURE_ACTIVATED);
+    }
+    resolve_available_tool_schemas_for_session(config, tools, session)
+}
+
+/// A persisted session already inside the legacy PlanMode state machine keeps
+/// `ExitPlanMode` as its recovery path. New sessions use delegated `Plan` only.
+fn prefer_delegated_plan_tool(
+    session: &Session,
+    catalog: &mut std::collections::BTreeMap<String, ClassifiedToolSchema>,
+) {
+    if !catalog.contains_key("Plan") {
+        return;
+    }
+
+    let legacy_plan_active = session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.plan_mode.is_some());
+    if legacy_plan_active {
+        catalog.remove("Plan");
+    } else {
+        catalog.remove("ExitPlanMode");
+    }
+}
+
+pub(crate) fn resolve_available_tool_schemas_for_session(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &Session,
+) -> Vec<ToolSchema> {
+    let catalog = resolve_classified_tool_catalog_for_session(config, tools, session);
+    let effective = EffectiveCallableSet::from_catalog(
+        &catalog,
+        CapabilityLoadingMode::LegacyFullCatalog,
+        std::iter::empty::<&str>(),
+    );
+    catalog
+        .into_iter()
+        .filter(|entry| effective.contains_execution_name(entry.execution_name()))
+        .map(ClassifiedToolSchema::into_schema)
+        .collect()
+}
+
+/// Resolve the provider-neutral logical catalog for one round.
+///
+/// Legacy providers project every model-visible Deferred entry from this
+/// catalog. Native/fallback progressive-loading adapters later consume the same
+/// classification and may project only initially visible entries. HostOnly
+/// entries remain represented for host compatibility but never cross the model
+/// catalog projection above.
+pub(crate) fn resolve_classified_tool_catalog_for_session(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &Session,
+) -> Vec<ClassifiedToolSchema> {
+    resolve_catalog_with_activation(
+        config,
+        tools,
+        session,
+        &effective_guide_activation(config, session),
+    )
+}
+
+fn resolve_catalog_with_activation(
+    config: &AgentLoopConfig,
+    tools: &dyn ToolExecutor,
+    session: &Session,
+    activated: &std::collections::BTreeSet<String>,
+) -> Vec<ClassifiedToolSchema> {
+    let mut tool_schemas = config.tool_registry.list_tools();
+    if tool_schemas.is_empty() {
+        tool_schemas = tools.list_tools();
+    }
+
+    tool_schemas.extend(config.additional_tool_schemas.clone());
+    tool_schemas.sort_by(|left, right| left.function.name.cmp(&right.function.name));
+    tool_schemas.dedup_by(|left, right| left.function.name == right.function.name);
+    // Resolve the disabled set LIVE each round (#136): when a resolver is wired
+    // (server path) a tool disabled/re-enabled mid-run takes effect on the next
+    // round, because this list is rebuilt unfiltered every round; with no resolver
+    // (SDK/tests) this is the frozen per-run snapshot (#44), unchanged.
+    let (disabled_tools, _disabled_skill_ids) = config.resolve_disabled_filters();
+    // The `update_goal` self-report tool is only meaningful while the autonomous
+    // goal loop is active; hide it from every ordinary session so it never
+    // tempts the model when no goal is set.
+    if !config.goal_loop_active() {
+        tool_schemas.retain(|schema| {
+            schema.function.name != bamboo_tools::tools::goal::UPDATE_GOAL_TOOL_NAME
+        });
+    }
+
+    // Once a single explicitly selected workflow reaches a terminal activation
+    // result, stop advertising load_skill so the model-issued attempt occurs
+    // exactly once. A typed degraded result is terminal too: the main session
+    // continues without workflow instructions instead of retrying forever.
+    // Automatic catalogs keep the tool available until the model chooses a
+    // candidate.
+    let loaded_skill_ids = session
+        .metadata
+        .get(LOADED_SKILL_IDS_METADATA_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default();
+    let selected_skill_ids = session
+        .metadata
+        .get(SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default();
+    let explicit_selection = session
+        .metadata
+        .get(SKILL_RUNTIME_SELECTION_SOURCE_KEY)
+        .is_some_and(|source| source == "explicit");
+    let explicit_activation_is_current = explicit_selection
+        && !loaded_skill_ids.is_empty()
+        && loaded_skill_ids == selected_skill_ids;
+    let explicit_activation_degraded = explicit_selection
+        && session
+            .metadata
+            .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
+    if explicit_activation_is_current || explicit_activation_degraded {
+        tool_schemas.retain(|schema| schema.function.name != "load_skill");
+    }
+
+    // Legacy providers keep Deferred schemas visible during migration;
+    // activation only controls the depth of the existing tool-guide summaries.
+    for schema in &mut tool_schemas {
+        let Some(identity) = ClassifiedToolIdentity::from_schema_name(&schema.function.name) else {
+            continue;
+        };
+        let guide_name = identity.alias_fallback_name();
+        if identity.loading_class() == CapabilityLoadingClass::Deferred
+            && !activated.contains(guide_name)
+        {
+            if let Some(short) = expandable_tool_short_description(guide_name) {
+                schema.function.description =
+                    format!("[Discoverable — not fully activated] {}", short);
+            }
+        }
+    }
+
+    let mut by_execution_name = std::collections::BTreeMap::<String, ClassifiedToolSchema>::new();
+    for entry in tool_schemas
+        .into_iter()
+        .filter_map(ClassifiedToolSchema::new)
+    {
+        let key = entry.execution_name().to_string();
+        match by_execution_name.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    let disabled_execution_names = disabled_tools
+        .iter()
+        .filter_map(|reference| {
+            resolve_tool_reference_name(reference, |name| by_execution_name.contains_key(name))
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
+    prefer_delegated_plan_tool(session, &mut by_execution_name);
+    // Root and Child models delegate through the logical SubAgent facade. Keep the
+    // physical broker/deployment tools registered for existing direct callers,
+    // but omit their schemas (including namespaced aliases) from every Root/Child
+    // model catalog and capability-discovery projection.
+    if matches!(session.kind, SessionKind::Root | SessionKind::Child) {
+        by_execution_name
+            .retain(|_, entry| !PHYSICAL_SUBAGENT_TOOLS.contains(&entry.alias_fallback_name()));
+    }
+    // Apply the durable Root authority to exact registered execution names.
+    // This catalog feeds both provider schemas and capability discovery, so
+    // aliases and custom registrations cannot reintroduce a denied tool.
+    by_execution_name.retain(|name, _| session.allows_model_tool_execution(name));
+
+    let mut catalog = by_execution_name.into_values().collect::<Vec<_>>();
+    catalog.sort_by(|left, right| {
+        left.schema()
+            .function
+            .name
+            .cmp(&right.schema().function.name)
+    });
+
+    catalog
+}
+
+#[cfg(test)]
+mod live_disabled_tests {
+    use super::*;
+    use bamboo_agent_core::tools::{
+        FunctionSchema, ToolCall, ToolError, ToolExecutionContext, ToolResult,
+    };
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            schema_type: "function".into(),
+            function: FunctionSchema {
+                name: name.into(),
+                description: String::new(),
+                parameters: serde_json::json!({ "type": "object" }),
+            },
+        }
+    }
+
+    fn plan_catalog() -> std::collections::BTreeMap<String, ClassifiedToolSchema> {
+        ["Plan", "ExitPlanMode", "Read"]
+            .into_iter()
+            .map(schema)
+            .filter_map(ClassifiedToolSchema::new)
+            .map(|entry| (entry.execution_name().to_string(), entry))
+            .collect()
+    }
+
+    #[test]
+    fn delegated_plan_hides_legacy_exit_for_inactive_sessions() {
+        let session = Session::new("s", "m");
+        let mut catalog = plan_catalog();
+
+        prefer_delegated_plan_tool(&session, &mut catalog);
+
+        assert_eq!(
+            catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["Plan", "Read"]
+        );
+    }
+
+    #[test]
+    fn delegated_plan_preserves_exit_for_an_active_legacy_session() {
+        let mut session = Session::new("s", "m");
+        let runtime = session
+            .agent_runtime_state
+            .get_or_insert_with(bamboo_domain::AgentRuntimeState::default);
+        runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".to_string(),
+            plan_file_path: None,
+            status: bamboo_domain::PlanModeStatus::Exploring,
+        });
+        let mut catalog = plan_catalog();
+
+        prefer_delegated_plan_tool(&session, &mut catalog);
+
+        assert_eq!(
+            catalog.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["ExitPlanMode", "Read"]
+        );
+    }
+
+    #[test]
+    fn legacy_exit_remains_when_plan_is_not_available() {
+        let session = Session::new("s", "m");
+        let mut catalog = plan_catalog();
+        catalog.remove("Plan");
+
+        prefer_delegated_plan_tool(&session, &mut catalog);
+
+        assert!(catalog.contains_key("ExitPlanMode"));
+    }
+
+    struct TwoTools;
+    #[async_trait::async_trait]
+    impl ToolExecutor for TwoTools {
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolResult, ToolError> {
+            unreachable!("not invoked in this test")
+        }
+        async fn execute_with_context(
+            &self,
+            call: &ToolCall,
+            _ctx: ToolExecutionContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            self.execute(call).await
+        }
+        fn list_tools(&self) -> Vec<ToolSchema> {
+            ["alpha_tool", "beta_tool", "load_skill"]
+                .into_iter()
+                .map(schema)
+                .collect()
+        }
+    }
+
+    fn offered(config: &AgentLoopConfig, tools: &TwoTools, session: &Session, name: &str) -> bool {
+        resolve_available_tool_schemas_for_session(config, tools, session)
+            .iter()
+            .any(|s| s.function.name == name)
+    }
+
+    #[test]
+    fn live_disabled_resolver_filters_tools_on_the_next_round() {
+        // A resolver whose disabled set flips mid-run: round 1 nothing disabled,
+        // round 2 "beta_tool" disabled — mirrors a user disabling a tool mid-run.
+        let disabled = Arc::new(AtomicBool::new(false));
+        let d = disabled.clone();
+        let mut config = AgentLoopConfig::default();
+        config.disabled_filter_resolver = Some(Arc::new(move || {
+            let tools = if d.load(Ordering::SeqCst) {
+                BTreeSet::from(["beta_tool".to_string()])
+            } else {
+                BTreeSet::new()
+            };
+            (tools, BTreeSet::new())
+        }));
+        let session = Session::new("s", "m");
+        let tools = TwoTools;
+
+        // Round 1: nothing disabled -> beta_tool is offered.
+        assert!(offered(&config, &tools, &session, "beta_tool"));
+
+        // Disable beta_tool mid-run (NO new execution).
+        disabled.store(true, Ordering::SeqCst);
+
+        // Round 2 (same run): the live disable took effect -> beta_tool gone,
+        // alpha_tool still offered. Re-enable would restore it (list rebuilt fresh).
+        assert!(!offered(&config, &tools, &session, "beta_tool"));
+        assert!(offered(&config, &tools, &session, "alpha_tool"));
+    }
+
+    #[test]
+    fn explicit_degraded_activation_hides_load_skill_after_one_attempt() {
+        let config = AgentLoopConfig::default();
+        let tools = TwoTools;
+        let mut session = Session::new("degraded", "m");
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTION_SOURCE_KEY.to_string(),
+            "explicit".to_string(),
+        );
+        session.metadata.insert(
+            SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY.to_string(),
+            r#"["review"]"#.to_string(),
+        );
+
+        assert!(offered(&config, &tools, &session, "load_skill"));
+        session.metadata.insert(
+            bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY.to_string(),
+            r#"{"code":"provider_failed"}"#.to_string(),
+        );
+        assert!(!offered(&config, &tools, &session, "load_skill"));
+        assert!(!super::super::skill_context::explicit_activation_pending(
+            &session
+        ));
+    }
+}

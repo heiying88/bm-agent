@@ -1,0 +1,50 @@
+[package]
+name = "bamboo-config"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+description = "Configuration, settings, paths, encryption and keyword-masking for the Bamboo agent framework"
+license = "MIT"
+
+[dependencies]
+bamboo-domain = { path = "../../core/bamboo-domain" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = "1"
+tracing = "0.1"
+async-trait = "0.1"
+regex = "1"
+dirs = "6"
+aes-gcm = "0.11"
+rand = "0.10"
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+url = "2"
+uuid = { workspace = true }
+fs2 = "0.4"
+notify = "8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+futures = "0.3"
+
+[features]
+test-utils = []

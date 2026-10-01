@@ -1,0 +1,658 @@
+//! The `ChildExecutor` seam: how an actor actually runs a task.
+//!
+//! This crate never depends on the agent runtime. The worker process implements
+//! [`ChildExecutor`] backed by the real `agent.execute()`; the transport layer drives it.
+//! [`EchoExecutor`] is a dependency-free stand-in used by the demo worker and tests.
+
+use async_trait::async_trait;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio_util::sync::CancellationToken;
+
+use crate::proto::{
+    RunSpec, SessionMessageAdmissionConfirmation, SessionMessageDelivery, TerminalStatus,
+};
+
+/// Non-AgentEvent signals an executor sends to its transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutorControl {
+    SessionMessageAdmitted(SessionMessageAdmissionConfirmation),
+    InitialInputReleaseRequest(crate::proto::InitialInputReleaseRequest),
+}
+
+/// Which kind of host callback a [`HostRequest`] is — selects the wire frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRequestKind {
+    /// Proxy a gated-tool approval to the host (→ `ChildFrame::ApprovalRequest`).
+    Approval,
+    /// Read the active logical Child's owned tree from its canonical Host.
+    OwnedTree,
+    /// Invoke the canonical Host's logical SubAgent tool for this active Run.
+    SubAgent,
+}
+
+/// A single host-callback request: an executor proxies a gated-tool approval
+/// back to the host over the run's WS and awaits the reply.
+pub struct HostRequest {
+    pub kind: HostRequestKind,
+    pub body: serde_json::Value,
+    pub reply: oneshot::Sender<serde_json::Value>,
+}
+
+/// Host-callback bridge handed to an executor (via [`EventSink`]) so a nested
+/// sub-agent can proxy a gated-tool approval to the host — over the same
+/// per-child WebSocket, no broker needed. Absent for tests/[`EchoExecutor`].
+#[derive(Clone)]
+pub struct HostBridge {
+    req_tx: mpsc::UnboundedSender<HostRequest>,
+    tree_permits: Arc<Semaphore>,
+    tree_calls: Arc<AtomicUsize>,
+    subagent_permits: Arc<Semaphore>,
+    subagent_calls: Arc<AtomicUsize>,
+}
+
+impl HostBridge {
+    /// Create a bridge + the receiver the transport pumps to the wire.
+    pub fn channel() -> (Self, mpsc::UnboundedReceiver<HostRequest>) {
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        (
+            HostBridge {
+                req_tx,
+                tree_permits: Arc::new(Semaphore::new(1)),
+                tree_calls: Arc::new(AtomicUsize::new(0)),
+                subagent_permits: Arc::new(Semaphore::new(1)),
+                subagent_calls: Arc::new(AtomicUsize::new(0)),
+            },
+            req_rx,
+        )
+    }
+
+    /// Proxy one gated-tool approval to the host and await the decision JSON
+    /// (`{"approved": bool}`). The worker's permission flow blocks on this so the
+    /// human decides on the parent (Phase 2).
+    pub async fn approval_call(
+        &self,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.call(HostRequestKind::Approval, body).await
+    }
+
+    /// Request one bounded read from the canonical Host for the active logical
+    /// Child. Caller identity is never accepted from the Worker payload.
+    pub async fn owned_tree_call(&self, cursor: Option<&str>) -> Result<serde_json::Value, String> {
+        const MAX_CURSOR_BYTES: usize = 128;
+        const MAX_RESULT_BYTES: usize = 8192;
+        const MAX_CALLS_PER_RUN: usize = 16;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        if cursor.is_some_and(|cursor| cursor.is_empty() || cursor.len() > MAX_CURSOR_BYTES) {
+            return Err("invalid owned tree cursor".into());
+        }
+        let _permit = tokio::time::timeout(TIMEOUT, self.tree_permits.acquire())
+            .await
+            .map_err(|_| "owned tree request timed out")?
+            .map_err(|_| "owned tree inspection unavailable")?;
+        if self.tree_calls.fetch_add(1, Ordering::AcqRel) >= MAX_CALLS_PER_RUN {
+            return Err("owned tree request limit reached".into());
+        }
+        let reply = tokio::time::timeout(
+            TIMEOUT,
+            self.call(
+                HostRequestKind::OwnedTree,
+                serde_json::json!({"cursor":cursor}),
+            ),
+        )
+        .await
+        .map_err(|_| "owned tree request timed out")??;
+        let page = reply
+            .get("page")
+            .filter(|page| !page.is_null())
+            .ok_or_else(|| "owned tree inspection rejected".to_string())?;
+        if serde_json::to_vec(page).map_or(true, |bytes| bytes.len() > MAX_RESULT_BYTES) {
+            return Err("owned tree observation exceeds its limit".into());
+        }
+        Ok(page.clone())
+    }
+
+    /// Route a nested Child's logical operation to its canonical Host. The
+    /// Worker sends arguments and a transcript call id, never caller authority.
+    pub async fn subagent_call(
+        &self,
+        args: serde_json::Value,
+        tool_call_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        const MAX_ARGS_BYTES: usize = 64 * 1024;
+        const MAX_REPLY_BYTES: usize = 16 * 1024;
+        const MAX_CALLS_PER_RUN: usize = 64;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        if tool_call_id.is_empty()
+            || tool_call_id.len() > 128
+            || serde_json::to_vec(&args).map_or(true, |bytes| bytes.len() > MAX_ARGS_BYTES)
+        {
+            return Err("invalid canonical SubAgent request".into());
+        }
+        let _permit = tokio::time::timeout(TIMEOUT, self.subagent_permits.acquire())
+            .await
+            .map_err(|_| "canonical SubAgent request timed out")?
+            .map_err(|_| "canonical SubAgent unavailable")?;
+        if self.subagent_calls.fetch_add(1, Ordering::AcqRel) >= MAX_CALLS_PER_RUN {
+            return Err("canonical SubAgent request limit reached".into());
+        }
+        let reply = tokio::time::timeout(
+            TIMEOUT,
+            self.call(
+                HostRequestKind::SubAgent,
+                serde_json::json!({"args":args,"tool_call_id":tool_call_id}),
+            ),
+        )
+        .await
+        .map_err(|_| "canonical SubAgent request timed out")??;
+        if serde_json::to_vec(&reply).map_or(true, |bytes| bytes.len() > MAX_REPLY_BYTES) {
+            return Err("canonical SubAgent result exceeds its limit".into());
+        }
+        if let Some(error) = reply.get("error").and_then(serde_json::Value::as_str) {
+            return Err(error.to_owned());
+        }
+        reply
+            .get("result")
+            .cloned()
+            .ok_or_else(|| "canonical SubAgent operation rejected".into())
+    }
+
+    async fn call(
+        &self,
+        kind: HostRequestKind,
+        body: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let (reply, rx) = oneshot::channel();
+        self.req_tx
+            .send(HostRequest { kind, body, reply })
+            .map_err(|_| "host bridge closed".to_string())?;
+        rx.await
+            .map_err(|_| "host bridge dropped reply".to_string())
+    }
+}
+
+/// Sink an executor emits events into; the transport forwards each as a `ChildFrame::Event`.
+#[derive(Clone)]
+pub struct EventSink {
+    tx: mpsc::Sender<serde_json::Value>,
+    control_tx: Option<mpsc::Sender<ExecutorControl>>,
+    host: Option<HostBridge>,
+}
+
+impl EventSink {
+    pub const EVENT_CAPACITY: usize = 256;
+    pub const CONTROL_CAPACITY: usize = 32;
+
+    /// Create a sink + the receiver the transport pumps to the wire.
+    pub fn channel() -> (Self, mpsc::Receiver<serde_json::Value>) {
+        let (tx, rx) = mpsc::channel(Self::EVENT_CAPACITY);
+        (
+            EventSink {
+                tx,
+                control_tx: None,
+                host: None,
+            },
+            rx,
+        )
+    }
+    /// Create a sink with a control channel for protocol-level confirmations.
+    pub fn channel_with_control() -> (
+        Self,
+        mpsc::Receiver<serde_json::Value>,
+        mpsc::Receiver<ExecutorControl>,
+    ) {
+        let (tx, rx) = mpsc::channel(Self::EVENT_CAPACITY);
+        let (control_tx, control_rx) = mpsc::channel(Self::CONTROL_CAPACITY);
+        (
+            EventSink {
+                tx,
+                control_tx: Some(control_tx),
+                host: None,
+            },
+            rx,
+            control_rx,
+        )
+    }
+    /// Attach a host-callback bridge (the transport wires this for real runs).
+    pub fn with_host_bridge(mut self, bridge: HostBridge) -> Self {
+        self.host = Some(bridge);
+        self
+    }
+    /// The host-callback bridge, if this run was wired with one.
+    pub fn host(&self) -> Option<&HostBridge> {
+        self.host.as_ref()
+    }
+    /// Emit one event with bounded producer backpressure. Transport QoS still
+    /// decides whether a sequenced live batch can be dropped; durable events
+    /// cannot accumulate without bound ahead of that transport or be lost here.
+    pub async fn emit(&self, event: serde_json::Value) {
+        let _ = self.tx.send(event).await;
+    }
+    pub async fn request_initial_release(
+        &self,
+        request: crate::proto::InitialInputReleaseRequest,
+    ) -> Result<(), String> {
+        self.control_tx
+            .as_ref()
+            .ok_or("initial release channel missing")?
+            .send(ExecutorControl::InitialInputReleaseRequest(request))
+            .await
+            .map_err(|_| "initial release channel closed".into())
+    }
+    /// Confirm a forwarded SessionInbox message only after the executor has
+    /// observed its durable local admitted receipt.
+    pub async fn confirm_session_message(&self, confirmation: SessionMessageAdmissionConfirmation) {
+        if let Some(tx) = &self.control_tx {
+            let _ = tx
+                .send(ExecutorControl::SessionMessageAdmitted(confirmation))
+                .await;
+        }
+    }
+}
+
+/// Result of running a task to completion (or suspension).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ChildOutcome {
+    pub status: TerminalStatus,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    /// Rolling-wire compatibility field. The current actor host never consumes
+    /// it: canonical session checkpoints are the transcript authority and
+    /// suspend/resume dispatch is not implemented. Keep serializing the empty
+    /// field until the protocol is versioned; do not build new state transfer on
+    /// this payload.
+    #[serde(default)]
+    pub transcript: Vec<serde_json::Value>,
+}
+
+impl ChildOutcome {
+    pub fn completed(result: impl Into<String>) -> Self {
+        Self {
+            status: TerminalStatus::Completed,
+            result: Some(result.into()),
+            error: None,
+            transcript: Vec::new(),
+        }
+    }
+    pub fn error(msg: impl Into<String>) -> Self {
+        Self {
+            status: TerminalStatus::Error,
+            result: None,
+            error: Some(msg.into()),
+            transcript: Vec::new(),
+        }
+    }
+    pub fn cancelled() -> Self {
+        Self {
+            status: TerminalStatus::Cancelled,
+            result: None,
+            error: None,
+            transcript: Vec::new(),
+        }
+    }
+    /// Compatibility constructor for the unimplemented suspend wire path.
+    /// Current hosts reject `Suspended` and do not persist this transcript.
+    pub fn suspended(transcript: Vec<serde_json::Value>) -> Self {
+        Self {
+            status: TerminalStatus::Suspended,
+            result: None,
+            error: None,
+            transcript,
+        }
+    }
+}
+
+/// Mid-run steering inbox: `ParentFrame::Message` texts arriving while a run is
+/// active. Executors that support in-band steering admit them at a safe point
+/// (the engine's round boundary); others may simply ignore the inbox.
+pub struct SteerInbox {
+    rx: mpsc::UnboundedReceiver<SteerMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SteerMessage {
+    /// Direct legacy WS text has no durable ingress identity and remains
+    /// explicitly best-effort.
+    Text(String),
+    /// Broker Maildir ingress retains its durable message id so at-least-once
+    /// replay converges on one typed SessionInbox envelope.
+    DurableText {
+        message_id: String,
+        text: String,
+    },
+    SessionMessage(Box<SessionMessageDelivery>),
+    InitialInputRelease(crate::proto::InitialInputRelease),
+}
+
+impl From<String> for SteerMessage {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for SteerMessage {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_string())
+    }
+}
+
+impl SteerInbox {
+    /// Create a sender + inbox pair (the transport holds the sender).
+    pub fn channel() -> (mpsc::UnboundedSender<SteerMessage>, Self) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (tx, SteerInbox { rx })
+    }
+    /// An already-closed inbox (for tests / executors that don't steer).
+    pub fn disconnected() -> Self {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        SteerInbox { rx }
+    }
+    /// Next steering message, or `None` once the run's sender is gone.
+    pub async fn recv(&mut self) -> Option<String> {
+        match self.rx.recv().await? {
+            SteerMessage::Text(text) => Some(text),
+            SteerMessage::DurableText { text, .. } => Some(text),
+            SteerMessage::SessionMessage(delivery) => serde_json::to_string(&delivery).ok(),
+            SteerMessage::InitialInputRelease(_) => None, // Never flatten authority into text.
+        }
+    }
+    /// Wait before SDK admission. Any unrelated/late control is a failed barrier.
+    pub async fn wait_initial_release(
+        &mut self,
+        request: &crate::proto::InitialInputReleaseRequest,
+        cancel: &CancellationToken,
+        events: &EventSink,
+    ) -> Result<chrono::DateTime<chrono::Utc>, String> {
+        self.wait_initial_release_bounded(
+            request,
+            cancel,
+            events,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+    }
+    async fn wait_initial_release_bounded(
+        &mut self,
+        request: &crate::proto::InitialInputReleaseRequest,
+        cancel: &CancellationToken,
+        events: &EventSink,
+        wait: std::time::Duration,
+    ) -> Result<chrono::DateTime<chrono::Utc>, String> {
+        let timeout = tokio::time::sleep(wait);
+        tokio::pin!(timeout);
+        let mut retry = tokio::time::interval(std::time::Duration::from_secs(5));
+        retry.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err("initial release cancelled".into()),
+                _ = &mut timeout => return Err("initial release timed out".into()),
+                message = self.recv_message() => return match message {
+                    Some(SteerMessage::InitialInputRelease(release)) if release.permits(request, chrono::Utc::now()) => Ok(release.expires_at),
+                    _ => Err("initial release missing, expired or mismatched".into()),
+                },
+                _ = retry.tick() => events.request_initial_release(request.clone()).await?,
+            }
+        }
+    }
+    /// Receive the typed steering value. Runtime-backed workers use this path
+    /// so SessionInbox envelopes never collapse into ad-hoc text.
+    pub async fn recv_message(&mut self) -> Option<SteerMessage> {
+        self.rx.recv().await
+    }
+}
+
+/// What runs inside an actor. Implemented by the worker with the real runtime.
+#[async_trait]
+pub trait ChildExecutor: Send + Sync + 'static {
+    /// Advertise only when `run` validates EnvironmentLease before executing
+    /// provider or tools. The broker binds this claim to the authenticated
+    /// subscriber connection; an older worker defaults to unsupported.
+    fn supports_environment_lease_v1(&self) -> bool {
+        false
+    }
+    /// Maximum number of independent Run/Ask/Task executions this instance may
+    /// execute at once. The safe default is one: production executors often
+    /// own mutable permission/provider/child-runner state that must not cross
+    /// session boundaries. An implementation may opt into more slots only when
+    /// all per-run state is isolated.
+    fn max_parallel_executions(&self) -> usize {
+        1
+    }
+
+    async fn run(
+        &self,
+        spec: RunSpec,
+        events: EventSink,
+        steer: SteerInbox,
+        cancel: CancellationToken,
+    ) -> ChildOutcome;
+}
+
+/// Dependency-free executor: streams one `token` event per word, then completes with an echo.
+/// Used by the demo worker and tests to exercise the full transport without a real LLM.
+///
+/// Test hook: an assignment starting with `__sleep_ms:<n>` sleeps (cancellably)
+/// for `n` milliseconds before echoing the rest — this is what lets cancel /
+/// concurrency e2e tests hold a run open deterministically without an LLM.
+pub struct EchoExecutor;
+
+/// Assignment prefix recognized by [`EchoExecutor`] for a cancellable delay.
+pub const ECHO_SLEEP_PREFIX: &str = "__sleep_ms:";
+
+#[async_trait]
+impl ChildExecutor for EchoExecutor {
+    fn max_parallel_executions(&self) -> usize {
+        // Echo has no mutable execution state; keep the high-concurrency fabric
+        // E2E honest without weakening the safe default for real runtimes.
+        256
+    }
+
+    async fn run(
+        &self,
+        spec: RunSpec,
+        events: EventSink,
+        _steer: SteerInbox,
+        cancel: CancellationToken,
+    ) -> ChildOutcome {
+        // Optional cancellable delay: any token `__sleep_ms:<n>` in the
+        // assignment (scanned, not just the prefix — child creation may wrap
+        // the prompt in a template). The marker token itself is not echoed.
+        let mut sleep_ms: Option<u64> = None;
+        let mut words: Vec<&str> = Vec::new();
+        for word in spec.assignment.split_whitespace() {
+            match word
+                .strip_prefix(ECHO_SLEEP_PREFIX)
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                Some(ms) if sleep_ms.is_none() => sleep_ms = Some(ms),
+                _ => words.push(word),
+            }
+        }
+        if let Some(ms) = sleep_ms {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => {}
+                _ = cancel.cancelled() => return ChildOutcome::cancelled(),
+            }
+        }
+
+        for word in &words {
+            if cancel.is_cancelled() {
+                return ChildOutcome::cancelled();
+            }
+            events
+                .emit(serde_json::json!({ "type": "token", "content": format!("{word} ") }))
+                .await;
+            // tiny yield so cancellation can interleave; not a real delay
+            tokio::task::yield_now().await;
+        }
+        events.emit(serde_json::json!({ "type": "complete" })).await;
+        ChildOutcome::completed(format!("echo: {}", words.join(" ")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn initial_release_wait_observes_timeout_disconnect_and_cancel() {
+        let request = crate::proto::InitialInputReleaseRequest {
+            version: 1,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            child_id: "wait-child".into(),
+            parent_id: "parent".into(),
+            root_id: "parent".into(),
+            created_at: chrono::Utc::now(),
+            spawn_depth: 1,
+            project_id: None,
+            envelope_id: "input".into(),
+            generation: 1,
+            activation_run_id: "run".into(),
+            execution_epoch: 1,
+        };
+        let (events, _rx, _controls) = EventSink::channel_with_control();
+        for case in ["timeout", "disconnect", "cancel"] {
+            let (sender, mut inbox) = SteerInbox::channel();
+            let cancel = CancellationToken::new();
+            if case == "disconnect" {
+                drop(sender);
+            } else if case == "cancel" {
+                cancel.cancel();
+            }
+            let error = inbox
+                .wait_initial_release_bounded(
+                    &request,
+                    &cancel,
+                    &events,
+                    std::time::Duration::from_millis(2),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.contains(match case {
+                "timeout" => "timed out",
+                "cancel" => "cancelled",
+                _ => "missing",
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn full_event_queue_backpressures_without_losing_durable_order_or_blocking_control() {
+        let (sink, mut events, mut controls) = EventSink::channel_with_control();
+        for index in 0..EventSink::EVENT_CAPACITY {
+            sink.emit(serde_json::json!({"type":"tool_start","index":index}))
+                .await;
+        }
+        assert_eq!(events.len(), EventSink::EVENT_CAPACITY);
+        let terminal = sink.emit(serde_json::json!({"type":"complete"}));
+        tokio::pin!(terminal);
+        assert!(futures_util::poll!(&mut terminal).is_pending());
+
+        // Admission control has its own bounded lane even while event
+        // production is parked at capacity.
+        let confirmation = SessionMessageAdmissionConfirmation {
+            target_session_id: "bounded-child".into(),
+            envelope_id: "message".into(),
+            canonical_claim_generation: 1,
+            activation_run_id: "activation".into(),
+        };
+        sink.confirm_session_message(confirmation.clone()).await;
+        assert_eq!(
+            controls.recv().await.unwrap(),
+            ExecutorControl::SessionMessageAdmitted(confirmation)
+        );
+        assert_eq!(events.recv().await.unwrap()["index"], 0);
+        terminal.await;
+        for index in 1..EventSink::EVENT_CAPACITY {
+            assert_eq!(events.recv().await.unwrap()["index"], index);
+        }
+        assert_eq!(events.recv().await.unwrap()["type"], "complete");
+    }
+
+    #[test]
+    fn echo_explicitly_opts_into_high_parallelism() {
+        assert!(EchoExecutor.max_parallel_executions() >= 200);
+    }
+
+    #[tokio::test]
+    async fn echo_streams_then_completes() {
+        let (sink, mut rx) = EventSink::channel();
+        let outcome = EchoExecutor
+            .run(
+                RunSpec {
+                    assignment: "alpha beta".into(),
+                    logical_session: None,
+                    project_id: None,
+                    reasoning_effort: None,
+                    permission_policy: None,
+                    messages: Vec::new(),
+                    activation_run_id: None,
+                    execution_epoch: 0,
+                    initial_session_messages: Vec::new(),
+                    secrets: Default::default(),
+                },
+                sink,
+                SteerInbox::disconnected(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Completed);
+        assert_eq!(outcome.result.as_deref(), Some("echo: alpha beta"));
+
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        // two tokens + one complete
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["content"], "alpha ");
+    }
+
+    #[tokio::test]
+    async fn echo_honors_cancel() {
+        let (sink, _rx) = EventSink::channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = EchoExecutor
+            .run(
+                RunSpec {
+                    assignment: "a b c".into(),
+                    logical_session: None,
+                    project_id: None,
+                    reasoning_effort: None,
+                    permission_policy: None,
+                    messages: Vec::new(),
+                    activation_run_id: None,
+                    execution_epoch: 0,
+                    initial_session_messages: Vec::new(),
+                    secrets: Default::default(),
+                },
+                sink,
+                SteerInbox::disconnected(),
+                cancel,
+            )
+            .await;
+        assert_eq!(outcome.status, TerminalStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn approval_call_sends_approval_kind_and_round_trips_reply() {
+        let (bridge, mut req_rx) = HostBridge::channel();
+        let caller = tokio::spawn(async move {
+            bridge
+                .approval_call(serde_json::json!({"resource": "/tmp/x"}))
+                .await
+        });
+        let req = req_rx.recv().await.expect("a host request");
+        assert_eq!(req.kind, HostRequestKind::Approval);
+        assert_eq!(req.body["resource"], "/tmp/x");
+        let _ = req.reply.send(serde_json::json!({"approved": true}));
+        let reply = caller.await.unwrap().expect("decision");
+        assert_eq!(reply["approved"], true);
+    }
+}

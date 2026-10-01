@@ -1,0 +1,1096 @@
+use async_trait::async_trait;
+use serde_json::json;
+
+use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
+use bamboo_agent_core::Session;
+use bamboo_memory::memory_store::{
+    normalize_retrieval_terms, normalize_tags, DurableMemoryDocument, DurableMemoryStatus,
+    MemoryQueryOptions, MemoryRetrievalInput, MemoryScope, MemoryStore, DEFAULT_QUERY_LIMIT,
+    MAX_EXPLICIT_MEMORY_ENTITIES, MAX_EXPLICIT_MEMORY_KEYWORDS, MAX_MAX_CHARS, MAX_MEMORY_ENTITIES,
+    MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS, MAX_MEMORY_TAGS,
+    MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TITLE_LEN, MAX_QUERY_LIMIT, MAX_RETRIEVAL_TERM_CHARS,
+};
+use bamboo_tools::tools::session_memory::{
+    execute_session_memory_action, SessionMemoryAction, MEMORY_SESSION_ACTION_NAMES,
+};
+
+mod args;
+mod parsing;
+
+#[cfg(test)]
+mod tests;
+
+use args::MemoryArgs;
+
+#[derive(Clone)]
+pub struct MemoryTool {
+    session_repo: bamboo_engine::SessionRepository,
+    memory_store: MemoryStore,
+}
+
+struct ResolvedMemoryAccess {
+    store: MemoryStore,
+    project_key: Option<String>,
+}
+
+fn bound_retrieval_metadata(doc: &mut DurableMemoryDocument) -> bool {
+    let original_tags = doc.frontmatter.tags.clone();
+    let original_keywords = doc.frontmatter.retrieval.keywords.clone();
+    let original_entities = doc.frontmatter.retrieval.entities.clone();
+
+    doc.frontmatter.tags = normalize_tags(original_tags.iter().map(String::as_str));
+    doc.frontmatter.retrieval.keywords = normalize_retrieval_terms(
+        original_keywords.iter().map(String::as_str),
+        MAX_MEMORY_KEYWORDS,
+    );
+    doc.frontmatter.retrieval.entities = normalize_retrieval_terms(
+        original_entities.iter().map(String::as_str),
+        MAX_MEMORY_ENTITIES,
+    );
+
+    original_tags != doc.frontmatter.tags
+        || original_keywords != doc.frontmatter.retrieval.keywords
+        || original_entities != doc.frontmatter.retrieval.entities
+}
+
+impl MemoryTool {
+    pub fn with_defaults(session_repo: bamboo_engine::SessionRepository) -> Self {
+        Self {
+            session_repo,
+            memory_store: MemoryStore::with_defaults(),
+        }
+    }
+
+    pub fn new(
+        session_repo: bamboo_engine::SessionRepository,
+        data_dir: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self::with_store(session_repo, MemoryStore::new(data_dir))
+    }
+
+    pub fn with_store(
+        session_repo: bamboo_engine::SessionRepository,
+        memory_store: MemoryStore,
+    ) -> Self {
+        Self {
+            session_repo,
+            memory_store,
+        }
+    }
+
+    async fn session_for_context(&self, session_id: Option<&str>) -> Option<Session> {
+        self.session_repo.load(session_id?).await
+    }
+
+    async fn resolve_memory_access(
+        &self,
+        explicit: Option<&str>,
+        session_id: Option<&str>,
+        requested_scope: Option<MemoryScope>,
+    ) -> Result<ResolvedMemoryAccess, ToolError> {
+        let explicit = explicit
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let session = self.session_for_context(session_id).await;
+        if let Some(session) = session.as_ref() {
+            if let bamboo_engine::project_context::SessionProjectIdentity::Invalid {
+                raw,
+                message,
+            } = bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
+                session,
+            ) {
+                return Err(ToolError::InvalidArguments(format!(
+                    "session carries an invalid Project identity '{raw}': {message}"
+                )));
+            }
+        }
+        if let Some(project_id) = session.as_ref().and_then(
+            bamboo_engine::project_context::ProjectContextResolver::project_id_from_session,
+        ) {
+            if explicit
+                .as_deref()
+                .is_some_and(|requested| requested != project_id.as_str())
+            {
+                return Err(ToolError::InvalidArguments(
+                    "project_key cannot override the session's assigned Project".to_string(),
+                ));
+            }
+            return Ok(ResolvedMemoryAccess {
+                store: self.memory_store.for_project(&project_id),
+                project_key: Some(project_id.to_string()),
+            });
+        }
+
+        if explicit.is_some() {
+            return Err(ToolError::InvalidArguments(
+                "project_key requires the session to be assigned to that Project".to_string(),
+            ));
+        }
+        if requested_scope == Some(MemoryScope::Project) {
+            return Err(ToolError::InvalidArguments(
+                "Project memory requires an assigned Project".to_string(),
+            ));
+        }
+        Ok(ResolvedMemoryAccess {
+            store: self.memory_store.clone(),
+            project_key: None,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for MemoryTool {
+    fn name(&self) -> &str {
+        "memory"
+    }
+
+    fn description(&self) -> &str {
+        "Bamboo's unified memory tool. Use session_* for continuity notes. For durable memory, start with a short lexical query: omitting limit returns a compact top-3 shortlist with actionable ids and no bodies; then get only selected ids. Query before write/merge, and persist one atomic confirmed fact with bounded tags, keywords, and entities. The Session's assigned Project is trusted scope authority: project_key cannot grant or switch access. Verify live state when a fact may have changed. Retrieval is embedding-free; no embeddings are used. A blank query remains a management listing."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "Recall with query, inspect a selected result with get, then use a mutation only when needed. Query before write or merge to avoid duplicates.",
+                    "enum": [
+                        "session_read",
+                        "session_append",
+                        "session_replace",
+                        "session_clear",
+                        "session_list_topics",
+                        "query",
+                        "get",
+                        "find_duplicates",
+                        "write",
+                        "merge",
+                        "split",
+                        "consolidate",
+                        "purge",
+                        "inspect",
+                        "rebuild",
+                        "scan_blobs",
+                        "scan_duplicates"
+                    ]
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["session", "project", "global"],
+                    "description": "Durable actions use project or global. Use session_* actions, not durable actions, for session continuity notes."
+                },
+                "granularity": {
+                    "type": "string",
+                    "enum": ["day", "week", "month", "quarter", "year"],
+                    "description": "Optional temporal granularity for `write`, orthogonal to scope: day (today's working context), week (sprint), month, quarter (direction), year (long-term goals). Omit if the memory has no time horizon. Coarser granularities are prefix-cache friendly and recalled ahead of finer ones at equal relevance."
+                },
+                "project_key": {
+                    "type": "string",
+                    "description": "Optional assertion only. The trusted Session Project selects and authorizes Project memory; this value cannot grant access or switch projects."
+                },
+                "topic": {"type": "string"},
+                "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_MEMORY_ID_LEN,
+                    "description": "Actionable memory id returned by query; use get only for selected ids."
+                },
+                "query": {
+                    "type": "string",
+                    "maxLength": MAX_MEMORY_QUERY_CHARS,
+                    "description": "Short, discriminative lexical keywords or entities. Omit/blank only for a bounded management listing; no embedding search is used."
+                },
+                "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+                "title": {
+                    "type": "string",
+                    "maxLength": MAX_MEMORY_TITLE_LEN,
+                    "description": "Concise title for one atomic confirmed fact."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "One atomic confirmed fact, not a transcript or speculative note. Verify live state instead of trusting stale memory."
+                },
+                "tags": {
+                    "type": "array",
+                    "maxItems": MAX_MEMORY_TAGS,
+                    "items": {"type": "string", "maxLength": MAX_MEMORY_TAG_CHARS},
+                    "description": "Bounded categorical labels."
+                },
+                "keywords": {
+                    "type": "array",
+                    "maxItems": MAX_EXPLICIT_MEMORY_KEYWORDS,
+                    "items": {"type": "string", "maxLength": MAX_RETRIEVAL_TERM_CHARS},
+                    "description": "Bounded multilingual lexical aliases supplied by the model; embeddings are neither accepted nor computed."
+                },
+                "entities": {
+                    "type": "array",
+                    "maxItems": MAX_EXPLICIT_MEMORY_ENTITIES,
+                    "items": {"type": "string", "maxLength": MAX_RETRIEVAL_TERM_CHARS},
+                    "description": "Bounded canonical names, products, projects, people, or other entities useful for lexical recall."
+                },
+                "pieces": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "maxLength": MAX_MEMORY_TITLE_LEN},
+                            "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+                            "content": {"type": "string"},
+                            "tags": {
+                                "type": "array",
+                                "maxItems": MAX_MEMORY_TAGS,
+                                "items": {"type": "string", "maxLength": MAX_MEMORY_TAG_CHARS}
+                            },
+                            "keywords": {
+                                "type": "array",
+                                "maxItems": MAX_EXPLICIT_MEMORY_KEYWORDS,
+                                "items": {"type": "string", "maxLength": MAX_RETRIEVAL_TERM_CHARS}
+                            },
+                            "entities": {
+                                "type": "array",
+                                "maxItems": MAX_EXPLICIT_MEMORY_ENTITIES,
+                                "items": {"type": "string", "maxLength": MAX_RETRIEVAL_TERM_CHARS}
+                            }
+                        },
+                        "required": ["title", "content"]
+                    },
+                    "description": "Atomic replacement facts for split; each piece carries its own retrieval metadata."
+                },
+                "ids": {
+                    "type": "array",
+                    "minItems": 2,
+                    "items": {"type": "string", "maxLength": MAX_MEMORY_ID_LEN}
+                },
+                "min_score": {"type": "number"},
+                "filters": {
+                    "type": "object",
+                    "description": "Optional narrowing for `query`/`purge`. Each sub-filter is independent and defaults to unfiltered when omitted or empty.",
+                    "properties": {
+                        "type": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["user", "feedback", "project", "reference"]},
+                            "description": "Restrict results to these memory types. Omit for no type filtering."
+                        },
+                        "status": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["active", "stale", "superseded", "contradicted", "archived"]},
+                            "description": "Restrict results to these statuses. Omit for no status filtering."
+                        },
+                        "granularity": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["day", "week", "month", "quarter", "year"]
+                            },
+                            "description": "Restrict results to these temporal granularities: day (today's working context), week (sprint), month, quarter (direction), year (long-term goals). This is a hard filter (unlike the passive recall-into-prompt ordering): a memory whose granularity doesn't appear in this list is excluded entirely, and a memory with no granularity never matches a non-empty filter here. Omit for no granularity filtering."
+                        }
+                    }
+                },
+                "options": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_QUERY_LIMIT,
+                            "default": DEFAULT_QUERY_LIMIT,
+                            "description": "Omit for the compact default top-3 query result."
+                        },
+                        "max_chars": {"type": "integer", "minimum": 1, "maximum": MAX_MAX_CHARS},
+                        "cursor": {"type": "string"},
+                        "include_related": {"type": "boolean"},
+                        "allow_merge_if_similar": {
+                            "type": "boolean",
+                            "description": "Write-only opt-in after query confirms an existing memory should absorb the fact."
+                        }
+                    }
+                },
+                "reason": {"type": "string"}
+            },
+            "required": ["action"]
+        })
+    }
+
+    fn classify(&self, args: &serde_json::Value) -> ToolClass {
+        let action = args
+            .get("action")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        match action.as_str() {
+            "session_read"
+            | "session_list_topics"
+            | "query"
+            | "get"
+            | "find_duplicates"
+            | "scan_blobs"
+            | "scan_duplicates"
+            | "inspect" => ToolClass::READONLY_PARALLEL,
+            _ => ToolClass::MUTATING_SERIAL,
+        }
+    }
+
+    async fn invoke(
+        &self,
+        args: serde_json::Value,
+        ctx: ToolCtx,
+    ) -> Result<ToolOutcome, ToolError> {
+        let session_id = ctx.session_id().ok_or_else(|| {
+            ToolError::Execution("memory requires a session_id in tool context".to_string())
+        })?;
+
+        let parsed: MemoryArgs = serde_json::from_value(args).map_err(|error| {
+            ToolError::InvalidArguments(format!("Invalid memory args: {error}"))
+        })?;
+
+        let result = match parsed {
+            MemoryArgs::SessionRead { topic, options } => {
+                let max_chars = options.and_then(|value| value.max_chars);
+                execute_session_memory_action(
+                    &self.memory_store,
+                    session_id,
+                    SessionMemoryAction::Read,
+                    topic.as_deref(),
+                    None,
+                    max_chars,
+                    MEMORY_SESSION_ACTION_NAMES,
+                )
+                .await
+            }
+            MemoryArgs::SessionAppend { topic, content } => {
+                execute_session_memory_action(
+                    &self.memory_store,
+                    session_id,
+                    SessionMemoryAction::Append,
+                    topic.as_deref(),
+                    Some(content.as_str()),
+                    None,
+                    MEMORY_SESSION_ACTION_NAMES,
+                )
+                .await
+            }
+            MemoryArgs::SessionReplace { topic, content } => {
+                execute_session_memory_action(
+                    &self.memory_store,
+                    session_id,
+                    SessionMemoryAction::Replace,
+                    topic.as_deref(),
+                    Some(content.as_str()),
+                    None,
+                    MEMORY_SESSION_ACTION_NAMES,
+                )
+                .await
+            }
+            MemoryArgs::SessionClear { topic } => {
+                execute_session_memory_action(
+                    &self.memory_store,
+                    session_id,
+                    SessionMemoryAction::Clear,
+                    topic.as_deref(),
+                    None,
+                    None,
+                    MEMORY_SESSION_ACTION_NAMES,
+                )
+                .await
+            }
+            MemoryArgs::SessionListTopics => {
+                execute_session_memory_action(
+                    &self.memory_store,
+                    session_id,
+                    SessionMemoryAction::ListTopics,
+                    None,
+                    None,
+                    None,
+                    MEMORY_SESSION_ACTION_NAMES,
+                )
+                .await
+            }
+            MemoryArgs::Query {
+                scope,
+                query,
+                filters,
+                project_key,
+                options,
+            } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "query supports durable scopes only; use session_read/session_list_topics for session scope"
+                            .to_string(),
+                    ));
+                }
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .await?;
+                let options = MemoryQueryOptions {
+                    limit: options
+                        .as_ref()
+                        .and_then(|value| value.limit)
+                        .map(|value| value.min(MAX_QUERY_LIMIT)),
+                    max_chars: options
+                        .as_ref()
+                        .and_then(|value| value.max_chars)
+                        .map(|value| value.min(MAX_MAX_CHARS)),
+                    cursor: options.as_ref().and_then(|value| value.cursor.clone()),
+                    include_related: options
+                        .as_ref()
+                        .and_then(|value| value.include_related)
+                        .unwrap_or(false),
+                };
+                let (filter_types, filter_statuses, filter_granularity) =
+                    Self::parse_query_filters(filters.as_ref())?;
+                let result = memory_access
+                    .store
+                    .query_scope(
+                        scope,
+                        memory_access.project_key.as_deref(),
+                        query.as_deref(),
+                        filter_types.as_ref(),
+                        filter_statuses.as_ref(),
+                        filter_granularity.as_ref(),
+                        &options,
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to query memory: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "query",
+                        "success": true,
+                        "data": result,
+                        "summary": bamboo_memory::memory_store::summary_json(result.returned_count, result.matched_count),
+                        "warnings": [],
+                    }).to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+            MemoryArgs::Get {
+                id,
+                project_key,
+                options,
+            } => {
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
+                    .await?;
+                let max_chars = options
+                    .and_then(|value| value.max_chars)
+                    .unwrap_or(MAX_MAX_CHARS)
+                    .min(MAX_MAX_CHARS);
+                let Some(mut doc) = memory_access
+                    .store
+                    .get_memory(id.trim(), memory_access.project_key.as_deref())
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to get memory: {error}"))
+                    })?
+                else {
+                    return Err(ToolError::Execution(format!(
+                        "memory not found: {}",
+                        id.trim()
+                    )));
+                };
+                let (body, truncated) =
+                    bamboo_memory::memory_store::truncate_chars(&doc.body, max_chars);
+                doc.body = body;
+                let retrieval_metadata_truncated = bound_retrieval_metadata(&mut doc);
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "get",
+                        "id": doc.frontmatter.id,
+                        "memory": {
+                            "frontmatter": doc.frontmatter,
+                            "body": doc.body,
+                            "path": doc.path,
+                            "body_truncated": truncated,
+                            "retrieval_metadata_truncated": retrieval_metadata_truncated,
+                        }
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+            MemoryArgs::Write {
+                scope,
+                r#type,
+                title,
+                content,
+                tags,
+                keywords,
+                entities,
+                project_key,
+                granularity,
+                options,
+            } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "write supports durable scopes only; use session_replace/session_append for session scope"
+                            .to_string(),
+                    ));
+                }
+                let granularity = Self::parse_granularity(granularity.as_deref())?;
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .await?;
+                let doc = memory_access
+                    .store
+                    .write_memory_with_retrieval(
+                        scope,
+                        memory_access.project_key.as_deref(),
+                        Self::parse_type(&r#type)?,
+                        &title,
+                        &content,
+                        &tags,
+                        &MemoryRetrievalInput { keywords, entities },
+                        Some(session_id),
+                        "main-model",
+                        options
+                            .and_then(|value| value.allow_merge_if_similar)
+                            .unwrap_or(false),
+                        granularity,
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to write memory: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "write",
+                        "memory": {
+                            "id": doc.frontmatter.id,
+                            "title": doc.frontmatter.title,
+                            "type": doc.frontmatter.r#type,
+                            "scope": doc.frontmatter.scope,
+                            "status": doc.frontmatter.status,
+                            "project_key": doc.frontmatter.project_key,
+                            "path": doc.path,
+                        }
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+            MemoryArgs::Merge {
+                id,
+                content,
+                tags,
+                keywords,
+                entities,
+                project_key,
+                source_memory_ids,
+                mode,
+                reason,
+            } => {
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
+                    .await?;
+                let mode = Self::parse_merge_mode(mode.as_deref())?;
+                if matches!(mode.as_deref(), Some("contradict")) {
+                    let Some(result) = memory_access
+                        .store
+                        .mark_memory_contradicted(
+                            id.trim(),
+                            memory_access.project_key.as_deref(),
+                            &source_memory_ids,
+                            reason.as_deref().or(Some(content.trim())),
+                            Some(session_id),
+                            "main-model",
+                        )
+                        .await
+                        .map_err(|error| {
+                            ToolError::Execution(format!("Failed to contradict memory: {error}"))
+                        })?
+                    else {
+                        return Err(ToolError::Execution(format!(
+                            "memory not found: {}",
+                            id.trim()
+                        )));
+                    };
+                    Ok(ToolResult {
+                        success: true,
+                        result: json!({
+                            "action": "merge",
+                            "mode": "contradict",
+                            "data": result,
+                        })
+                        .to_string(),
+                        display_preference: Some("json".to_string()),
+                        images: Vec::new(),
+                    })
+                } else {
+                    let Some(result) = memory_access
+                        .store
+                        .merge_memory_with_retrieval(
+                            id.trim(),
+                            memory_access.project_key.as_deref(),
+                            &content,
+                            &tags,
+                            &MemoryRetrievalInput { keywords, entities },
+                            Some(session_id),
+                            "main-model",
+                            &source_memory_ids,
+                        )
+                        .await
+                        .map_err(|error| {
+                            ToolError::Execution(format!("Failed to merge memory: {error}"))
+                        })?
+                    else {
+                        return Err(ToolError::Execution(format!(
+                            "memory not found: {}",
+                            id.trim()
+                        )));
+                    };
+                    Ok(ToolResult {
+                        success: true,
+                        result: json!({
+                            "action": "merge",
+                            "mode": mode.unwrap_or_else(|| "merge".to_string()),
+                            "data": result,
+                        })
+                        .to_string(),
+                        display_preference: Some("json".to_string()),
+                        images: Vec::new(),
+                    })
+                }
+            }
+            MemoryArgs::FindDuplicates {
+                scope,
+                title,
+                content,
+                r#type,
+                tags,
+                keywords,
+                entities,
+                project_key,
+                options,
+            } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "find_duplicates supports durable scopes only".to_string(),
+                    ));
+                }
+                let r#type = match r#type.as_deref() {
+                    Some(value) => Some(Self::parse_type(value)?),
+                    None => None,
+                };
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .await?;
+                let limit = options
+                    .and_then(|value| value.limit)
+                    .unwrap_or(5)
+                    .clamp(1, MAX_QUERY_LIMIT);
+                let candidates = memory_access
+                    .store
+                    .find_duplicate_candidates_with_retrieval(
+                        scope,
+                        memory_access.project_key.as_deref(),
+                        r#type,
+                        &title,
+                        content.as_deref().unwrap_or(""),
+                        &tags,
+                        &MemoryRetrievalInput { keywords, entities },
+                        limit,
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to find duplicates: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "find_duplicates",
+                        "candidates": candidates,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+            MemoryArgs::Split {
+                id,
+                project_key,
+                pieces,
+            } => {
+                if pieces.is_empty() {
+                    return Err(ToolError::InvalidArguments(
+                        "split requires at least one piece".to_string(),
+                    ));
+                }
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
+                    .await?;
+                let mut split_pieces = Vec::with_capacity(pieces.len());
+                let mut retrieval = Vec::with_capacity(pieces.len());
+                for piece in pieces {
+                    let r#type = match piece.r#type.as_deref() {
+                        Some(value) => Some(Self::parse_type(value)?),
+                        None => None,
+                    };
+                    split_pieces.push(bamboo_memory::memory_store::MemorySplitPiece {
+                        title: piece.title,
+                        r#type,
+                        content: piece.content,
+                        tags: piece.tags,
+                    });
+                    retrieval.push(MemoryRetrievalInput {
+                        keywords: piece.keywords,
+                        entities: piece.entities,
+                    });
+                }
+                let Some(result) = memory_access
+                    .store
+                    .split_memory_with_retrieval(
+                        id.trim(),
+                        memory_access.project_key.as_deref(),
+                        &split_pieces,
+                        &retrieval,
+                        Some(session_id),
+                        "main-model",
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to split memory: {error}"))
+                    })?
+                else {
+                    return Err(ToolError::Execution(format!(
+                        "memory not found: {}",
+                        id.trim()
+                    )));
+                };
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "split",
+                        "data": result,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+            MemoryArgs::ScanBlobs {
+                scope,
+                project_key,
+                min_sections,
+                options,
+            } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "scan_blobs supports durable scopes only".to_string(),
+                    ));
+                }
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .await?;
+                let min_sections = min_sections.unwrap_or(3);
+                let limit = options
+                    .and_then(|value| value.limit)
+                    .unwrap_or(20)
+                    .clamp(1, 200);
+                let report = memory_access
+                    .store
+                    .scan_blob_candidates(
+                        scope,
+                        memory_access.project_key.as_deref(),
+                        min_sections,
+                        limit,
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to scan blobs: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "scan_blobs",
+                        "report": report,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+            MemoryArgs::ScanDuplicates {
+                scope,
+                project_key,
+                min_score,
+                options,
+            } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "scan_duplicates supports durable scopes only".to_string(),
+                    ));
+                }
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .await?;
+                let min_score = min_score.unwrap_or(0.6);
+                let limit = options
+                    .and_then(|value| value.limit)
+                    .unwrap_or(20)
+                    .clamp(1, 200);
+                let report = memory_access
+                    .store
+                    .scan_duplicate_clusters(
+                        scope,
+                        memory_access.project_key.as_deref(),
+                        min_score,
+                        5,
+                        limit,
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to scan duplicates: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "scan_duplicates",
+                        "report": report,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+            MemoryArgs::Consolidate {
+                ids,
+                title,
+                content,
+                r#type,
+                tags,
+                keywords,
+                entities,
+                project_key,
+            } => {
+                if ids.len() < 2 {
+                    return Err(ToolError::InvalidArguments(
+                        "consolidate requires at least two source memory ids".to_string(),
+                    ));
+                }
+                let r#type = match r#type.as_deref() {
+                    Some(value) => Some(Self::parse_type(value)?),
+                    None => None,
+                };
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
+                    .await?;
+                let merged = bamboo_memory::memory_store::MemorySplitPiece {
+                    title,
+                    r#type,
+                    content,
+                    tags,
+                };
+                let ids: Vec<String> = ids.iter().map(|id| id.trim().to_string()).collect();
+                let Some(result) = memory_access
+                    .store
+                    .consolidate_memories_with_retrieval(
+                        &ids,
+                        memory_access.project_key.as_deref(),
+                        &merged,
+                        &MemoryRetrievalInput { keywords, entities },
+                        Some(session_id),
+                        "main-model",
+                    )
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to consolidate memories: {error}"))
+                    })?
+                else {
+                    return Err(ToolError::Execution(
+                        "one or more source memories not found".to_string(),
+                    ));
+                };
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "consolidate",
+                        "data": result,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+            MemoryArgs::Purge {
+                id,
+                scope,
+                reason,
+                project_key,
+                filters,
+                mode,
+            } => {
+                let mode = match mode
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(value) => Self::parse_status(value)?,
+                    None => DurableMemoryStatus::Archived,
+                };
+                let id = id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let requested_scope = match id {
+                    Some(_) => None,
+                    None => {
+                        let scope = Self::parse_scope(scope.as_deref())?;
+                        if scope == MemoryScope::Session {
+                            return Err(ToolError::InvalidArguments(
+                                "purge supports durable scopes only in v1".to_string(),
+                            ));
+                        }
+                        Some(scope)
+                    }
+                };
+                let memory_access = self
+                    .resolve_memory_access(
+                        project_key.as_deref(),
+                        Some(session_id),
+                        requested_scope,
+                    )
+                    .await?;
+
+                if let Some(id) = id {
+                    let Some(doc) = memory_access
+                        .store
+                        .archive_memory(
+                            id,
+                            memory_access.project_key.as_deref(),
+                            mode,
+                            reason.as_deref(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            ToolError::Execution(format!("Failed to purge memory: {error}"))
+                        })?
+                    else {
+                        return Err(ToolError::Execution(format!("memory not found: {}", id)));
+                    };
+                    Ok(ToolResult {
+                        success: true,
+                        result: json!({
+                            "action": "purge",
+                            "id": doc.frontmatter.id,
+                            "status": doc.frontmatter.status,
+                        })
+                        .to_string(),
+                        display_preference: Some("json".to_string()),
+                        images: Vec::new(),
+                    })
+                } else {
+                    let scope = requested_scope.expect("batch purge scope was parsed");
+                    let (filter_types, filter_statuses, filter_granularity) =
+                        Self::parse_query_filters(filters.as_ref())?;
+                    let result = memory_access
+                        .store
+                        .purge_memories(
+                            scope,
+                            memory_access.project_key.as_deref(),
+                            filter_types.as_ref(),
+                            filter_statuses.as_ref(),
+                            filter_granularity.as_ref(),
+                            mode,
+                            reason.as_deref(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            ToolError::Execution(format!("Failed to purge memory: {error}"))
+                        })?;
+                    Ok(ToolResult {
+                        success: true,
+                        result: json!({
+                            "action": "purge",
+                            "data": result,
+                        })
+                        .to_string(),
+                        display_preference: Some("json".to_string()),
+                        images: Vec::new(),
+                    })
+                }
+            }
+            MemoryArgs::Inspect { scope, project_key } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "inspect supports durable scopes only in v1".to_string(),
+                    ));
+                }
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .await?;
+                let result = memory_access
+                    .store
+                    .inspect_scope(scope, memory_access.project_key.as_deref())
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to inspect memory: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "inspect",
+                        "data": result,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+            MemoryArgs::Rebuild { scope, project_key } => {
+                let scope = Self::parse_scope(Some(&scope))?;
+                if scope == MemoryScope::Session {
+                    return Err(ToolError::InvalidArguments(
+                        "rebuild supports durable scopes only in v1".to_string(),
+                    ));
+                }
+                let memory_access = self
+                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .await?;
+                memory_access
+                    .store
+                    .rebuild_scope(scope, memory_access.project_key.as_deref())
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to rebuild memory artifacts: {error}"))
+                    })?;
+                let inspect = memory_access
+                    .store
+                    .inspect_scope(scope, memory_access.project_key.as_deref())
+                    .await
+                    .map_err(|error| {
+                        ToolError::Execution(format!("Failed to inspect rebuilt memory: {error}"))
+                    })?;
+                Ok(ToolResult {
+                    success: true,
+                    result: json!({
+                        "action": "rebuild",
+                        "scope": scope,
+                        "project_key": memory_access.project_key,
+                        "data": inspect,
+                    })
+                    .to_string(),
+                    display_preference: Some("json".to_string()),
+                    images: Vec::new(),
+                })
+            }
+        }?;
+        Ok(ToolOutcome::Completed(result))
+    }
+}
