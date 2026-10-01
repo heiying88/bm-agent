@@ -1,0 +1,290 @@
+import type { TaskListMsg } from "./todoList";
+import type { TokenUsage } from "./tokenBudget";
+import type { ProviderModelRef } from "./providerModelRef";
+import type { GoldConfig, GoalState, SessionPlacement } from "@services/chat/AgentService";
+
+export type AgentRole = "planner" | "actor";
+
+export type ActiveWorkflowSource = "builtin" | "project" | "workspace" | "user" | "plugin";
+
+/** Safe, public receipt returned by Bamboo's session-detail endpoint. */
+export interface ActiveWorkflowReceipt {
+  id: string;
+  name?: string;
+  source: ActiveWorkflowSource;
+  revision: number;
+  version?: string;
+  kind: "instruction" | "orchestration";
+  invokedBy: "user" | "model" | "api";
+  activatedAt: string;
+  status: "active" | "degraded" | "deactivated";
+}
+
+export type MessageType = "text" | "plan" | "question" | "tool_call" | "tool_result";
+
+export interface PlanMessage {
+  goal: string;
+  steps: PlanStep[];
+  estimated_total_time: string;
+  risks: string[];
+  prerequisites?: string[];
+}
+
+export interface PlanStep {
+  step_number: number;
+  action: string;
+  reason: string;
+  tools_needed: string[];
+  estimated_time: string;
+}
+
+export interface QuestionMessage {
+  type: "question";
+  question: string;
+  context: string;
+  severity: "critical" | "major" | "minor";
+  options: QuestionOption[];
+  default?: string;
+  allow_custom?: boolean;
+}
+
+export interface QuestionOption {
+  label: string;
+  value: string;
+  description: string;
+}
+
+export interface MessageImage {
+  id: string;
+  // For newly added images (before backend persistence), we keep base64.
+  // For persisted sessions, the backend stores attachments by reference; we render via URL.
+  base64?: string;
+  url?: string;
+  // Optional OCR text persisted on the backend (when enabled) for this image.
+  // UI can choose whether/how to display this.
+  ocrText?: string;
+  ocrError?: string;
+  name: string;
+  size: number;
+  type: string;
+  width?: number;
+  height?: number;
+}
+
+export type DisplayPreference = "Default" | "Collapsible" | "Hidden";
+
+export interface ToolExecutionResult {
+  tool_name: string;
+  result: string;
+  display_preference: DisplayPreference;
+}
+
+export type ExecutionStatus = "success" | "error" | "warning";
+
+interface BaseMessage {
+  id: string;
+  createdAt: string;
+  isError?: boolean;
+  isAuthError?: boolean;
+  isCompressed?: boolean;
+  compressedEventId?: string;
+}
+
+export interface CompressionEvent {
+  id: string;
+  createdAt: string;
+  messagesCompressed: number;
+  segmentsRemoved: number;
+}
+
+export interface SystemMessage extends BaseMessage {
+  role: "system";
+  content: string;
+}
+
+export interface UserMessage extends BaseMessage {
+  role: "user";
+  content: string;
+  images?: MessageImage[];
+}
+
+export interface UserFileReferenceMessage extends BaseMessage {
+  role: "user";
+  type: "file_reference";
+  paths: string[];
+  displayText: string;
+}
+
+export interface AssistantTextMessage extends BaseMessage {
+  role: "assistant";
+  type: "text";
+  content: string;
+  model?: string;
+  finishReason?: "stop" | "length" | "error";
+  tokenUsage?: { promptTokens: number; completionTokens: number };
+  latency?: { firstTokenMs: number; totalDurationMs: number };
+  metadata?: {
+    usage?: {
+      prompt_tokens: number;
+      completion_tokens: number;
+      total_tokens: number;
+    };
+    reasoning?: string;
+    should_continue?: boolean;
+    continue_reason?: string;
+    continuation_count?: number;
+    [key: string]: unknown;
+  };
+}
+
+export interface AssistantToolCallMessage extends BaseMessage {
+  role: "assistant";
+  type: "tool_call";
+  toolCalls: {
+    toolCallId: string;
+    toolName: string;
+    parameters: Record<string, unknown>;
+    // Optional live output streamed during tool execution (e.g. Claude Code CLI).
+    streamingOutput?: string;
+  }[];
+  model?: string;
+  finishReason?: "tool_calls";
+  /** Lifecycle metadata injected by ToolLifecycle events (timing, mutating flag) */
+  metadata?: {
+    elapsed_ms?: number;
+    is_mutating?: boolean;
+    summary?: string;
+    [key: string]: unknown;
+  };
+}
+
+export interface AssistantToolResultMessage extends BaseMessage {
+  role: "assistant";
+  type: "tool_result";
+  toolName: string;
+  toolCallId: string;
+  result: ToolExecutionResult;
+  isError: boolean;
+  /** Images returned by the tool (e.g. an MCP screenshot), for inline preview. */
+  images?: MessageImage[];
+}
+
+export interface WorkflowResultMessage extends BaseMessage {
+  role: "assistant";
+  type: "workflow_result";
+  workflowName: string;
+  parameters?: Record<string, unknown> | string | null;
+  status?: ExecutionStatus;
+  content: string;
+}
+
+export interface AssistantTaskListMessage extends BaseMessage {
+  role: "assistant";
+  type: "task_list";
+  taskList: TaskListMsg;
+}
+
+export type Message =
+  | UserMessage
+  | UserFileReferenceMessage
+  | AssistantTextMessage
+  | AssistantToolCallMessage
+  | AssistantToolResultMessage
+  | AssistantTaskListMessage
+  | WorkflowResultMessage
+  | SystemMessage;
+
+export interface ChatItem {
+  id: string;
+  // Backend session metadata (V2).
+  kind?: "root" | "child";
+  parentSessionId?: string | null;
+  rootSessionId?: string;
+  spawnDepth?: number;
+  createdByScheduleId?: string | null;
+  isRunning?: boolean;
+  updatedAt?: string;
+  lastActivityAt?: string;
+  messageCount?: number;
+  hasAttachments?: boolean;
+  lastRunStatus?: string;
+  lastRunError?: string;
+  /** Active plan mode runtime state mirrored from backend session summary/SSE. */
+  planMode?: import("@services/chat/AgentService").SessionPlanModeState | null;
+  /** Detail-only public receipt; list refreshes must preserve a hydrated value. */
+  activeWorkflow?: ActiveWorkflowReceipt | null;
+  /**
+   * SubAgent profile id for child sessions ("general-purpose", "plan", ...).
+   * Mirrored from `session.metadata["subagent_type"]` into the backend
+   * SessionIndexEntry; surfaced to the frontend via the lightweight
+   * `GET /v1/sessions` API. Always undefined for root sessions and for
+   * legacy children created before subagent profiles were introduced.
+   */
+  subagentType?: string | null;
+  /**
+   * Child lifecycle, mirrored from `session.metadata["lifecycle"]`:
+   * `"resident"` for a reusable resident agent (one stable agent reused for
+   * successive tasks), else undefined (one-shot). Lets the Sub-agents panel
+   * group residents separately from throwaway children.
+   */
+  lifecycle?: string | null;
+  /** For a resident agent, its stable reuse key (e.g. "essayist"). */
+  residentName?: string | null;
+  /**
+   * Which machine this session's agent runs on (deployment kind + host),
+   * mirrored from the backend `SessionSummary.placement`. Present for every
+   * session; local/root sessions carry the backend's own host, remote children
+   * carry their deployed node. Lets the header + sub-agents panel show
+   * "which machine this runs on".
+   */
+  placement?: SessionPlacement | null;
+  title: string;
+  /**
+   * Monotonic title version mirrored from the backend `SessionSummary.title_version`.
+   * Used by `applyServerTitle` and `applySessionsList` to determine title precedence:
+   * the highest `titleVersion` always wins, regardless of `updatedAt`. Optional and
+   * defaults to 0 for legacy sessions / locally-constructed `ChatItem`s that pre-date
+   * the title state machine (callers of `addChat` need not set this).
+   */
+  titleVersion?: number;
+  /**
+   * Explicit backend title lifecycle. `false` means first-message automatic
+   * title generation is still pending; `true` means generated, fallback, or
+   * manual title finalization has completed. Undefined is legacy/fail-safe.
+   */
+  titleGenerated?: boolean;
+  createdAt: number;
+  pinned?: boolean;
+  messages: Message[];
+  config: {
+    systemPromptId: string;
+    baseSystemPrompt: string;
+    lastUsedEnhancedPrompt: string | null;
+    agentRole?: AgentRole;
+    workspacePath?: string;
+    /** Stable Project identity for this session (from `SessionSummary.project_id`). */
+    projectId?: string | null;
+    model?: string;
+    model_ref?: ProviderModelRef | null;
+    reasoningEffort?: import("@services/chat/AgentService").ReasoningEffort | null;
+    /** Legacy compatibility mirror. True can mean Bypass or Auto on a new
+     * backend, so policy decisions must use `permissionMode` instead. */
+    bypassPermissions?: boolean;
+    /** Exact server-authoritative Default / Bypass / Auto state. */
+    permissionMode?: import("@shared/permissions/sessionPermissionMode").SessionPermissionMode;
+    /** Valid `permission_mode` presence from Bamboo; false disables Auto. */
+    permissionModeSupported?: boolean;
+    goldConfig?: GoldConfig | null;
+    goalState?: GoalState | null;
+    tokenUsage?: TokenUsage;
+    truncationOccurred?: boolean;
+    segmentsRemoved?: number;
+    compressionEvents?: CompressionEvent[];
+    syncCursor?: {
+      messageCount: number;
+      lastMessageId: string | null;
+      hasPendingQuestion: boolean;
+      pendingQuestionToolCallId: string | null;
+    };
+  };
+}

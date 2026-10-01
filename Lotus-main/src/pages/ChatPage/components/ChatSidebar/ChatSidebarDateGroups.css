@@ -1,0 +1,35 @@
+.chat-sidebar-date-group-action {
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.chat-sidebar-date-group-header:hover .chat-sidebar-date-group-action,
+.chat-sidebar-date-group-header:focus-within .chat-sidebar-date-group-action {
+  opacity: 1;
+}
+
+@media (hover: none), (max-width: 768px) {
+  .chat-sidebar-date-group-header .chat-sidebar-date-group-action {
+    opacity: 1;
+  }
+}
+.lotus-chat-group-unread {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--lotus-primary);
+}
+
+.lotus-chat-group-unread-description {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

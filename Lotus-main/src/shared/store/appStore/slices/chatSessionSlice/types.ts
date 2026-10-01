@@ -1,0 +1,121 @@
+import { ChatItem, Message } from "@shared/types/chat";
+import type { SessionSummary } from "@services/chat/AgentService";
+
+export type DeleteMessageFailureReason =
+  | "session_not_found"
+  | "message_not_found"
+  | "backend_not_found"
+  | "session_running"
+  | "backend_error";
+
+export type DeleteMessageResult =
+  | {
+      success: true;
+      sessionId: string;
+      messageId: string;
+    }
+  | {
+      success: false;
+      sessionId: string;
+      messageId: string;
+      reason: DeleteMessageFailureReason;
+      statusCode?: number;
+      errorMessage?: string;
+    };
+
+export interface ChatSlice {
+  // State (backend session list)
+  chats: ChatItem[];
+  currentSessionId: string | null;
+  latestActiveSessionId: string | null;
+
+  // Actions
+  addChat: (chat: Omit<ChatItem, "id">) => Promise<string>;
+  /**
+   * Copy a persisted session and atomically upsert/select Bamboo's
+   * authoritative root-session summary after the backend transaction commits.
+   */
+  copySession: (sourceSessionId: string) => Promise<SessionSummary>;
+  selectSession: (sessionId: string | null) => void;
+  /** Hydrate the detail-only, redacted active-Workflow receipt for one session. */
+  refreshSessionDetail: (sessionId: string, options?: { force?: boolean }) => Promise<boolean>;
+  deleteSession: (sessionId: string) => Promise<void>;
+  /** Bulk delete; resolves with the ids whose backend delete failed. */
+  deleteSessions: (sessionIds: string[]) => Promise<{ failedIds: string[] }>;
+  updateSession: (
+    sessionId: string,
+    updates: Partial<ChatItem>,
+    options?: { skipBackendPatch?: boolean },
+  ) => void;
+  /**
+   * Optimistically switch only `workspacePath`, persist it with session
+   * metadata CAS, then reconcile from Bamboo's authoritative response.
+   */
+  switchSessionWorkspace: (sessionId: string, workspacePath: string) => Promise<SessionSummary>;
+  /**
+   * Reassign a root session to a first-class Project using Bamboo's metadata
+   * CAS. Callers may select one authoritative workspace already bound to the
+   * target Project; otherwise its primary path is used.
+   */
+  assignSessionProject: (
+    sessionId: string,
+    projectId: string,
+    workspacePath?: string,
+  ) => Promise<SessionSummary>;
+  persistSessionTitle: (sessionId: string, title: string) => Promise<void>;
+  /**
+   * Apply an authoritative server title (from a `session_title_updated` SSE event).
+   * Updates `title` + `titleVersion` when the version advances and applies the
+   * explicit lifecycle monotonically (pending may finalize, never regress).
+   * Does NOT call `patchSession` — the backend has already persisted the change
+   * (the SSE event implies persistence).
+   */
+  applyServerTitle: (
+    sessionId: string,
+    title: string,
+    titleVersion: number,
+    titleGenerated: boolean,
+  ) => void;
+  /**
+   * Apply an authoritative server pinned flag (from a `session_pinned_updated`
+   * SSE event). Suppresses replays whose `updatedAt` is older than the local
+   * `updatedAt`, and skips writes when the flag already matches. Does NOT call
+   * `patchSession` — the SSE event implies persistence.
+   */
+  applyServerPinned: (sessionId: string, pinned: boolean, updatedAt: string) => void;
+  pinSession: (sessionId: string) => void;
+  unpinSession: (sessionId: string) => void;
+
+  addMessage: (sessionId: string, message: Message) => Promise<void>;
+  setMessages: (sessionId: string, messages: Message[]) => void;
+  updateMessage: (sessionId: string, messageId: string, updates: Partial<Message>) => void;
+  deleteMessage: (sessionId: string, messageId: string) => Promise<DeleteMessageResult>;
+
+  loadChats: () => Promise<void>;
+  refreshChats: () => Promise<void>;
+  refreshChatsNow: () => Promise<void>;
+  loadChatHistory: (
+    sessionId: string,
+    options?: {
+      mode?: "replace" | "monotonic";
+      retries?: number;
+      retryDelayMs?: number;
+      waitForAssistant?: boolean;
+    },
+    /** Returns true only when the fetched snapshot represents the rendered transcript. */
+  ) => Promise<boolean>;
+  /**
+   * Multi-device sync: reconcile the CURRENTLY-OPEN session against the server
+   * when an account-feed change event for it arrives (a message appended / run
+   * completed / clarification raised on ANOTHER device). Debounced per session.
+   *
+   * Safe to call during a live local stream: ordinary events load history in
+   * `monotonic` mode, so they only catch a *behind* passive viewer up and are a
+   * no-op on the device driving the run. `session_cleared` uses guarded
+   * `replace` mode because its authoritative history can be shorter.
+   * Also re-pulls the pending question so a clarification answered on another
+   * device clears here (and a new one appears). No-op unless `sessionId` is the
+   * open session.
+   */
+  reconcileOpenSession: (sessionId: string, reason?: string) => void;
+}

@@ -1,0 +1,355 @@
+import React, { memo } from "react";
+import { Space, Typography, Button, Alert, Tag, Collapse } from "antd";
+import { SettingOutlined } from "@ant-design/icons";
+import ReactMarkdown from "react-markdown";
+import { useTranslation } from "react-i18next";
+import type { Components } from "react-markdown";
+import type { PluggableList } from "unified";
+import {
+  isAssistantToolCallMessage,
+  isAssistantToolResultMessage,
+  isWorkflowResultMessage,
+  type Message,
+} from "@shared/types/chat";
+import ToolResultCard from "../ToolResultCard";
+import { type ToolCallCardProps } from "../ToolCallCard";
+import ToolStepsCard from "../ToolStepsCard";
+import WorkflowResultCard from "../WorkflowResultCard";
+import InteractiveQuestionToolCard from "./InteractiveQuestionToolCard";
+import { parseMcpToolAlias } from "../../utils/mcpAlias";
+import {
+  formatConclusionWithOptionsConclusionAsMarkdown,
+  formatConclusionToolResultAsMarkdown,
+  parseInteractiveQuestionToolResultPayload,
+  isPermissionApprovalResult,
+} from "@shared/utils/resultFormatters";
+
+const { Text } = Typography;
+
+type SelectionHint =
+  | { type: "mcp"; label: string; serverId?: string; toolName?: string }
+  | { type: "skill"; label: string; skillId?: string };
+
+const extractSelectionHints = (input: string): { cleanText: string; hints: SelectionHint[] } => {
+  if (!input) return { cleanText: input, hints: [] };
+
+  const lines = input.split("\n");
+  const hints: SelectionHint[] = [];
+  const keptLines: string[] = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+
+    const mcpMatch = line.match(/^\[User explicitly selected MCP tool:\s*(.+?)\s*\]$/);
+    if (mcpMatch) {
+      const label = mcpMatch[1] ?? "";
+      const parsed = parseMcpToolAlias(label);
+      hints.push({
+        type: "mcp",
+        label,
+        serverId: parsed?.serverId,
+        toolName: parsed?.toolName,
+      });
+      continue;
+    }
+
+    const skillMatch = line.match(/^\[User explicitly selected skill:\s*(.+?)\s*\]$/);
+    if (skillMatch) {
+      const label = skillMatch[1] ?? "";
+      const idMatch = label.match(/\(ID:\s*([^)]+)\)\s*$/i);
+      const skillId = idMatch?.[1]?.trim();
+      const displayLabel = idMatch ? label.replace(/\(ID:\s*([^)]+)\)\s*$/i, "").trim() : label;
+      hints.push({
+        type: "skill",
+        label: displayLabel || label,
+        skillId,
+      });
+      continue;
+    }
+
+    keptLines.push(rawLine);
+  }
+
+  const cleanText = keptLines.join("\n").trimStart();
+  return { cleanText, hints };
+};
+
+interface MessageCardContentProps {
+  sessionId: string | null;
+  message: Message;
+  messageText: string;
+  isUserToolCall: boolean;
+  formatUserToolCall: (toolCall: string) => string;
+  markdownComponents: Components;
+  markdownPlugins: PluggableList;
+  rehypePlugins: PluggableList;
+}
+
+const MessageCardContent: React.FC<MessageCardContentProps> = ({
+  sessionId,
+  message,
+  messageText,
+  isUserToolCall,
+  formatUserToolCall,
+  markdownComponents,
+  markdownPlugins,
+  rehypePlugins,
+}) => {
+  const { t } = useTranslation();
+  const isStructuredSummaryTool = (toolName: string | undefined): boolean => {
+    const normalized = (toolName ?? "").trim().toLowerCase();
+    return normalized === "conclusion";
+  };
+
+  if (isAssistantToolResultMessage(message)) {
+    const toolResultContent = message.result.result ?? "";
+    const toolResultErrorMessage = message.isError
+      ? toolResultContent || t("components.toolResult.executionFailed")
+      : undefined;
+    const toolResultIsLoading = !toolResultErrorMessage && toolResultContent.trim().length === 0;
+
+    if (message.result.display_preference === "Hidden") {
+      return null;
+    }
+
+    const normalizedToolName = (message.toolName ?? "").trim().toLowerCase();
+    const expandStructuredSummaryCardByDefault = normalizedToolName === "conclusion";
+    const interactiveQuestionPayload = parseInteractiveQuestionToolResultPayload(toolResultContent);
+    const shouldRenderInteractiveQuestion =
+      (normalizedToolName === "conclusion_with_options" ||
+        normalizedToolName === "exitplanmode" ||
+        normalizedToolName === "request_permissions" ||
+        // A permission gate can synthesize an Approve/Deny prompt for ANY tool
+        // (e.g. a gated Bash call); render it interactively, not as raw JSON.
+        isPermissionApprovalResult(toolResultContent)) &&
+      !message.isError &&
+      interactiveQuestionPayload;
+    const formattedConclusion =
+      normalizedToolName === "conclusion"
+        ? formatConclusionToolResultAsMarkdown(toolResultContent)
+        : null;
+
+    if (shouldRenderInteractiveQuestion && interactiveQuestionPayload) {
+      return (
+        <InteractiveQuestionToolCard
+          sessionId={sessionId}
+          question={interactiveQuestionPayload.question}
+          options={interactiveQuestionPayload.options}
+          allowCustom={interactiveQuestionPayload.allow_custom}
+          permissionRequest={interactiveQuestionPayload.permissionRequest}
+          toolCallId={message.toolCallId}
+          conclusionMarkdown={formatConclusionWithOptionsConclusionAsMarkdown(
+            interactiveQuestionPayload.conclusion,
+          )}
+          markdownComponents={markdownComponents}
+          markdownPlugins={markdownPlugins}
+          rehypePlugins={rehypePlugins}
+        />
+      );
+    }
+
+    if (formattedConclusion) {
+      return (
+        <Space direction="vertical" style={{ width: "100%" }} size="small">
+          <ReactMarkdown
+            remarkPlugins={markdownPlugins}
+            rehypePlugins={rehypePlugins}
+            components={markdownComponents}
+          >
+            {formattedConclusion}
+          </ReactMarkdown>
+        </Space>
+      );
+    }
+
+    return (
+      <ToolResultCard
+        content={toolResultContent}
+        toolName={message.toolName}
+        status={message.isError ? "error" : toolResultIsLoading ? "warning" : "success"}
+        timestamp={message.createdAt}
+        defaultCollapsed={!expandStructuredSummaryCardByDefault}
+        isLoading={toolResultIsLoading}
+        errorMessage={toolResultErrorMessage}
+      />
+    );
+  }
+
+  if (isWorkflowResultMessage(message)) {
+    const workflowContent = message.content ?? "";
+    const workflowErrorMessage =
+      message.status === "error"
+        ? workflowContent || t("components.workflowResult.executionFailed")
+        : undefined;
+    const workflowIsLoading = !workflowErrorMessage && workflowContent.trim().length === 0;
+
+    return (
+      <WorkflowResultCard
+        content={workflowContent}
+        workflowName={message.workflowName}
+        parameters={message.parameters}
+        status={workflowIsLoading ? "warning" : (message.status ?? "success")}
+        timestamp={message.createdAt}
+        isLoading={workflowIsLoading}
+        errorMessage={workflowErrorMessage}
+      />
+    );
+  }
+
+  if (isAssistantToolCallMessage(message)) {
+    const visibleToolCalls = message.toolCalls.filter(
+      (call) => !isStructuredSummaryTool(call.toolName),
+    );
+    if (visibleToolCalls.length === 0) {
+      return null;
+    }
+
+    return (
+      <ToolStepsCard
+        sessionId={sessionId}
+        toolCalls={visibleToolCalls}
+        metadata={message.metadata as ToolCallCardProps["metadata"]}
+        defaultExpanded={false}
+      />
+    );
+  }
+
+  // Check if this is an authentication error message
+  if (message.isAuthError) {
+    return (
+      <Space direction="vertical" style={{ width: "100%" }} size="middle">
+        <Alert
+          message={t("chat.messageCard.authRequired")}
+          description={
+            <ReactMarkdown
+              remarkPlugins={markdownPlugins}
+              rehypePlugins={rehypePlugins}
+              components={markdownComponents}
+            >
+              {messageText}
+            </ReactMarkdown>
+          }
+          type="error"
+          showIcon
+        />
+        <Button
+          type="primary"
+          icon={<SettingOutlined />}
+          onClick={() => {
+            // Navigate to settings - assuming there's a way to do this
+            // In Tauri/Electron, we might need to use IPC to switch tabs
+            window.location.hash = "/settings";
+          }}
+        >
+          {t("chat.messageCard.goToSettings")}
+        </Button>
+      </Space>
+    );
+  }
+
+  const { cleanText, hints } =
+    message.role === "user"
+      ? extractSelectionHints(messageText)
+      : { cleanText: messageText, hints: [] };
+  const assistantReasoning =
+    message.role === "assistant" &&
+    "type" in message &&
+    message.type === "text" &&
+    "metadata" in message &&
+    typeof (message.metadata as Record<string, unknown> | undefined)?.reasoning === "string"
+      ? ((message.metadata as Record<string, unknown>).reasoning as string)
+      : "";
+  const hasAssistantReasoning = assistantReasoning.trim().length > 0;
+
+  if (message.role === "assistant" && !messageText && !hasAssistantReasoning) {
+    return <Text italic>{t("chat.messageCard.assistantThinking")}</Text>;
+  }
+
+  return (
+    <Space direction="vertical" style={{ width: "100%" }} size="small">
+      {hasAssistantReasoning ? (
+        <Collapse
+          size="small"
+          defaultActiveKey={["reasoning"]}
+          items={[
+            {
+              key: "reasoning",
+              label: <Text strong>{t("chat.messageCard.reasoning")}</Text>,
+              children: (
+                <ReactMarkdown
+                  remarkPlugins={markdownPlugins}
+                  rehypePlugins={rehypePlugins}
+                  components={markdownComponents}
+                >
+                  {assistantReasoning}
+                </ReactMarkdown>
+              ),
+            },
+          ]}
+        />
+      ) : null}
+
+      {hints.map((hint, idx) => {
+        if (hint.type === "mcp") {
+          return (
+            <Alert
+              key={`hint-mcp-${idx}`}
+              type="info"
+              showIcon={false}
+              message={
+                <Space wrap size="small">
+                  <Tag color="purple">MCP</Tag>
+                  <Text strong>{t("chat.messageCard.selectedTool")}</Text>
+                  {hint.serverId && (
+                    <Text type="secondary">
+                      <Text code>{hint.serverId}</Text>
+                    </Text>
+                  )}
+                  {hint.toolName && (
+                    <Text type="secondary">
+                      <Text code>{hint.toolName}</Text>
+                    </Text>
+                  )}
+                </Space>
+              }
+              style={{ marginBottom: 0 }}
+            />
+          );
+        }
+
+        return (
+          <Alert
+            key={`hint-skill-${idx}`}
+            type="success"
+            showIcon={false}
+            message={
+              <Space wrap size="small">
+                <Tag color="success">Skill</Tag>
+                <Text strong>{t("chat.messageCard.selected")}</Text>
+                {hint.label && <Text>{hint.label}</Text>}
+                {hint.skillId && (
+                  <Text type="secondary">
+                    <Text code>{hint.skillId}</Text>
+                  </Text>
+                )}
+              </Space>
+            }
+            style={{ marginBottom: 0 }}
+          />
+        );
+      })}
+
+      {cleanText ? (
+        <ReactMarkdown
+          remarkPlugins={markdownPlugins}
+          rehypePlugins={rehypePlugins}
+          components={markdownComponents}
+        >
+          {isUserToolCall ? formatUserToolCall(cleanText) : cleanText}
+        </ReactMarkdown>
+      ) : null}
+    </Space>
+  );
+};
+
+export default memo(MessageCardContent);

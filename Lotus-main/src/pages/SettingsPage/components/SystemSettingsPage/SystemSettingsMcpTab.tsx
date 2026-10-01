@@ -1,0 +1,512 @@
+import { CopyOutlined, ReloadOutlined, UploadOutlined } from "@ant-design/icons";
+import {
+  Alert,
+  Button,
+  Card,
+  Modal,
+  Radio,
+  Space,
+  Tag,
+  Input,
+  Tooltip,
+  Typography,
+  message,
+  theme,
+} from "antd";
+import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { ServerStatus, type McpImportResponse, type McpServer } from "@services/mcp";
+import { useMcpSettings } from "./hooks/useMcpSettings";
+import { McpServerTable } from "./mcp/McpServerTable";
+import { McpServerFormModal } from "./mcp/McpServerFormModal";
+import { McpToolList } from "./mcp/McpToolList";
+import { toMainstreamMcpServersChunk } from "./mcp/mcpConfigInterop";
+import { copyText } from "@shared/utils/clipboard";
+import { configErrorMessage } from "@shared/utils/configErrors";
+
+const { Text } = Typography;
+const { useToken } = theme;
+const { TextArea } = Input;
+
+type ImportMode = "merge" | "replace";
+
+const statusColorMap: Record<ServerStatus, string> = {
+  [ServerStatus.Connecting]: "processing",
+  [ServerStatus.Ready]: "success",
+  [ServerStatus.Degraded]: "warning",
+  [ServerStatus.Stopped]: "default",
+  [ServerStatus.Error]: "error",
+};
+
+const makeStatusCounters = (): Record<ServerStatus, number> => ({
+  [ServerStatus.Connecting]: 0,
+  [ServerStatus.Ready]: 0,
+  [ServerStatus.Degraded]: 0,
+  [ServerStatus.Stopped]: 0,
+  [ServerStatus.Error]: 0,
+});
+
+const getErrorMessage = (error: unknown, fallback: string): string =>
+  configErrorMessage(error, fallback);
+
+const SystemSettingsMcpTab: React.FC = () => {
+  const { t } = useTranslation();
+  const { token } = useToken();
+  const [msgApi, contextHolder] = message.useMessage();
+  const {
+    servers,
+    credentialStatusByServer,
+    configRevision,
+    selectedServerId,
+    selectedServerTools,
+    isLoadingServers,
+    isMutatingConfig,
+    isRefreshingAll,
+    isSelectedServerToolsLoading,
+    configAvailable = true,
+    configError = null,
+    runtimeError = null,
+    error,
+    setSelectedServerId,
+    addServer,
+    updateServer,
+    deleteServer,
+    importServers,
+    connectServer,
+    disconnectServer,
+    refreshServerTools,
+    refreshAll,
+    isServerActionLoading,
+  } = useMcpSettings();
+  const operationError = error && error !== configError && error !== runtimeError ? error : null;
+
+  const statusLabelMap: Record<ServerStatus, string> = useMemo(
+    () => ({
+      [ServerStatus.Connecting]: t("settings.mcpTab.status.connecting"),
+      [ServerStatus.Ready]: t("settings.mcpTab.status.ready"),
+      [ServerStatus.Degraded]: t("settings.mcpTab.status.degraded"),
+      [ServerStatus.Stopped]: t("settings.mcpTab.status.stopped"),
+      [ServerStatus.Error]: t("settings.mcpTab.status.error"),
+    }),
+    [t],
+  );
+  const statusHelpMap: Record<ServerStatus, string> = useMemo(
+    () => ({
+      [ServerStatus.Connecting]: t("settings.mcpTab.statusHelp.connecting"),
+      [ServerStatus.Ready]: t("settings.mcpTab.statusHelp.ready"),
+      [ServerStatus.Degraded]: t("settings.mcpTab.statusHelp.degraded"),
+      [ServerStatus.Stopped]: t("settings.mcpTab.statusHelp.stopped"),
+      [ServerStatus.Error]: t("settings.mcpTab.statusHelp.error"),
+    }),
+    [t],
+  );
+
+  const [isServerModalOpen, setIsServerModalOpen] = useState(false);
+  const [serverModalMode, setServerModalMode] = useState<"create" | "edit">("create");
+  const [editingServer, setEditingServer] = useState<McpServer | null>(null);
+
+  const [isImportOpen, setIsImportOpen] = useState(false);
+  const [importMode, setImportMode] = useState<ImportMode>("merge");
+  const [importJson, setImportJson] = useState<string>("");
+  const [importError, setImportError] = useState<string | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+
+  const selectedServer = useMemo(() => {
+    if (!selectedServerId) {
+      return null;
+    }
+    return servers.find((server) => server.id === selectedServerId) ?? null;
+  }, [selectedServerId, servers]);
+
+  const latestEditingServer = useMemo(
+    () =>
+      editingServer ? (servers.find((server) => server.id === editingServer.id) ?? null) : null,
+    [editingServer, servers],
+  );
+
+  const statusSummary = useMemo(() => {
+    const byStatus = makeStatusCounters();
+    let toolCount = 0;
+
+    servers.forEach((server) => {
+      const status = server.runtime?.status ?? ServerStatus.Stopped;
+      byStatus[status] += 1;
+      toolCount += server.runtime?.tool_count ?? 0;
+    });
+
+    return {
+      byStatus,
+      totalServers: servers.length,
+      totalTools: toolCount,
+    };
+  }, [servers]);
+
+  const neutralTagStyle = {
+    background: token.colorFillSecondary,
+    borderColor: token.colorBorderSecondary,
+    color: token.colorTextSecondary,
+  } as const;
+
+  const handleDeleteServer = async (server: McpServer) => {
+    if (!configAvailable) return;
+    try {
+      await deleteServer(server.id);
+      msgApi.success(t("settings.mcpTab.serverDeleted"));
+    } catch (deleteError) {
+      msgApi.error(getErrorMessage(deleteError, t("settings.mcpTab.deleteServerFailed")));
+    }
+  };
+
+  const handleConnectServer = async (server: McpServer) => {
+    try {
+      await connectServer(server.id);
+      msgApi.success(t("settings.mcpTab.connectedTo", { name: server.name || server.id }));
+    } catch (connectError) {
+      msgApi.error(getErrorMessage(connectError, t("settings.mcpTab.connectServerFailed")));
+    }
+  };
+
+  const handleDisconnectServer = async (server: McpServer) => {
+    try {
+      await disconnectServer(server.id);
+      msgApi.success(t("settings.mcpTab.disconnected", { name: server.name || server.id }));
+    } catch (disconnectError) {
+      msgApi.error(getErrorMessage(disconnectError, t("settings.mcpTab.disconnectServerFailed")));
+    }
+  };
+
+  const handleRefreshServerTools = async (server: McpServer) => {
+    try {
+      await refreshServerTools(server.id);
+      msgApi.success(
+        t("settings.mcpTab.toolsRefreshedFor", {
+          name: server.name || server.id,
+        }),
+      );
+    } catch (refreshError) {
+      msgApi.error(getErrorMessage(refreshError, t("settings.mcpTab.refreshToolsFailed")));
+    }
+  };
+
+  const handleRefreshAll = async () => {
+    try {
+      await refreshAll();
+      msgApi.success(t("settings.mcpTab.statusRefreshed"));
+    } catch (refreshError) {
+      msgApi.error(getErrorMessage(refreshError, t("settings.mcpTab.refreshStatusFailed")));
+    }
+  };
+
+  const openCreateServerModal = () => {
+    if (!configAvailable) return;
+    setEditingServer(null);
+    setServerModalMode("create");
+    setIsServerModalOpen(true);
+  };
+
+  const openEditServerModal = (server: McpServer) => {
+    if (!configAvailable) return;
+    setEditingServer(server);
+    setServerModalMode("edit");
+    setIsServerModalOpen(true);
+  };
+
+  const handleSubmitServer = async (config: McpServer["config"], expectedRevision?: number) => {
+    if (!configAvailable) {
+      msgApi.error(t("settings.mcpTab.configurationUnavailable"));
+      return;
+    }
+    try {
+      if (serverModalMode === "edit") {
+        if (!editingServer) {
+          msgApi.error(t("settings.mcpTab.noServerForEditing"));
+          return;
+        }
+        if (expectedRevision === undefined) {
+          throw new Error(t("settings.mcpTab.missingEditRevision"));
+        }
+        await updateServer(editingServer.id, config, expectedRevision);
+        msgApi.success(
+          t("settings.mcpTab.savedServer", {
+            name: editingServer.name || editingServer.id,
+          }),
+        );
+      } else {
+        await addServer(config);
+        msgApi.success(t("settings.mcpTab.addedServer", { name: config.name || config.id }));
+      }
+      setIsServerModalOpen(false);
+      setEditingServer(null);
+    } catch (e) {
+      msgApi.error(getErrorMessage(e, t("settings.mcpTab.saveServerFailed")));
+      throw e;
+    }
+  };
+
+  const openImportModal = () => {
+    if (!configAvailable) return;
+    setIsImportOpen(true);
+    setImportError(null);
+    setImportMode("merge");
+    setImportJson("");
+  };
+
+  const handleExport = async () => {
+    const chunk = toMainstreamMcpServersChunk(servers);
+    const text = JSON.stringify(chunk, null, 2);
+
+    try {
+      await copyText(text);
+      msgApi.success(t("settings.mcpTab.copiedConfig"));
+    } catch {
+      // Clipboard can be blocked depending on platform/webview permissions.
+      // Fall back to showing the exported JSON in the modal for manual copy.
+      setIsImportOpen(true);
+      setImportError(null);
+      setImportMode("merge");
+      setImportJson(text);
+      msgApi.warning(t("settings.mcpTab.clipboardUnavailable"));
+    }
+  };
+
+  const handleImport = async () => {
+    if (!configAvailable) {
+      setImportError(t("settings.mcpTab.configurationUnavailable"));
+      return;
+    }
+    setImportError(null);
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(importJson);
+    } catch (e) {
+      setImportError(
+        `${t("settings.mcpTab.invalidJsonPrefix")}: ${
+          e instanceof Error ? e.message : t("settings.mcpTab.unknownError")
+        }`,
+      );
+      return;
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      setImportError(t("settings.mcpTab.jsonMustBeObject"));
+      return;
+    }
+
+    const record = parsed as Record<string, unknown>;
+    const mcpServers = record.mcpServers;
+    if (!mcpServers || typeof mcpServers !== "object") {
+      setImportError(t("settings.mcpTab.missingMcpServers"));
+      return;
+    }
+
+    setIsImporting(true);
+    try {
+      const response: McpImportResponse = await importServers(
+        mcpServers as Record<string, unknown>,
+        importMode,
+      );
+
+      const startFailures = response.start_errors?.length ?? 0;
+      msgApi.success(
+        t("settings.mcpTab.importSummary", {
+          count: response.server_ids.length,
+          added: response.added,
+          updated: response.updated,
+          removed: response.removed,
+          failed: startFailures,
+        }),
+      );
+      if (startFailures) {
+        msgApi.warning(t("settings.mcpTab.importStartFailures"));
+      }
+
+      setIsImportOpen(false);
+      setImportJson("");
+    } catch (error) {
+      setImportError(getErrorMessage(error, t("settings.mcpTab.importFailed")));
+      // Keep textarea content so the user can fix and retry.
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  return (
+    <Space direction="vertical" size={token.marginMD} style={{ width: "100%" }}>
+      {contextHolder}
+
+      {configError ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={t("settings.mcpTab.configurationUnavailable")}
+          description={configError}
+        />
+      ) : null}
+      {runtimeError ? <Alert type="error" showIcon message={runtimeError} /> : null}
+      {operationError ? <Alert type="error" showIcon message={operationError} /> : null}
+
+      <Card size="small" title={t("settings.mcpTab.overviewTitle")}>
+        <Space direction="vertical" size={token.marginXS} style={{ width: "100%" }}>
+          <Text type="secondary">{t("settings.mcpTab.overviewDescription")}</Text>
+          <Space wrap>
+            <Tag style={neutralTagStyle}>
+              {t("settings.mcpTab.totalServers", { count: statusSummary.totalServers })}
+            </Tag>
+            <Tag style={neutralTagStyle}>
+              {t("settings.mcpTab.totalTools", { count: statusSummary.totalTools })}
+            </Tag>
+            {Object.values(ServerStatus).map((status) => (
+              <Tooltip key={status} title={statusHelpMap[status]}>
+                <Tag
+                  color={status === ServerStatus.Stopped ? undefined : statusColorMap[status]}
+                  style={{
+                    cursor: "help",
+                    ...(status === ServerStatus.Stopped ? neutralTagStyle : undefined),
+                  }}
+                >
+                  {statusLabelMap[status]}: {statusSummary.byStatus[status]}
+                </Tag>
+              </Tooltip>
+            ))}
+          </Space>
+          <Text type="secondary">{t("settings.mcpTab.statusGuideTitle")}</Text>
+          <Space direction="vertical" size={2} style={{ width: "100%" }}>
+            {Object.values(ServerStatus).map((status) => (
+              <Text key={`guide-${status}`} type="secondary">
+                <Tag
+                  color={status === ServerStatus.Stopped ? undefined : statusColorMap[status]}
+                  style={{
+                    marginInlineEnd: 8,
+                    ...(status === ServerStatus.Stopped ? neutralTagStyle : undefined),
+                  }}
+                >
+                  {statusLabelMap[status]}
+                </Tag>
+                {statusHelpMap[status]}
+              </Text>
+            ))}
+          </Space>
+        </Space>
+      </Card>
+
+      <Card
+        size="small"
+        title={t("settings.mcpTab.serversTitle")}
+        extra={
+          <Space>
+            <Button type="primary" disabled={!configAvailable} onClick={openCreateServerModal}>
+              {t("settings.mcpTab.addServer")}
+            </Button>
+            <Button
+              icon={<ReloadOutlined />}
+              loading={isRefreshingAll}
+              onClick={() => {
+                void handleRefreshAll();
+              }}
+            >
+              {t("settings.mcpTab.refreshAll")}
+            </Button>
+            <Button icon={<CopyOutlined />} onClick={() => void handleExport()}>
+              {t("settings.mcpTab.export")}
+            </Button>
+            <Button icon={<UploadOutlined />} disabled={!configAvailable} onClick={openImportModal}>
+              {t("settings.mcpTab.import")}
+            </Button>
+          </Space>
+        }
+      >
+        <McpServerTable
+          servers={servers}
+          loading={isLoadingServers}
+          selectedServerId={selectedServerId}
+          onSelectServer={setSelectedServerId}
+          onEditServer={openEditServerModal}
+          onDeleteServer={handleDeleteServer}
+          onConnectServer={handleConnectServer}
+          onDisconnectServer={handleDisconnectServer}
+          onRefreshTools={handleRefreshServerTools}
+          isServerActionLoading={isServerActionLoading}
+          configReadOnly={!configAvailable}
+        />
+      </Card>
+
+      <McpToolList
+        server={selectedServer}
+        tools={selectedServerTools}
+        loading={isSelectedServerToolsLoading}
+      />
+
+      <McpServerFormModal
+        open={isServerModalOpen}
+        mode={serverModalMode}
+        initialConfig={editingServer?.config ?? null}
+        latestConfig={latestEditingServer?.config ?? null}
+        currentRevision={configRevision}
+        credentialStatus={editingServer ? credentialStatusByServer[editingServer.id] : undefined}
+        latestCredentialStatus={
+          latestEditingServer ? credentialStatusByServer[latestEditingServer.id] : undefined
+        }
+        confirmLoading={isMutatingConfig}
+        confirmDisabled={!configAvailable}
+        onCancel={() => {
+          if (isMutatingConfig) return;
+          setIsServerModalOpen(false);
+          setEditingServer(null);
+        }}
+        onSubmit={handleSubmitServer}
+      />
+
+      <Modal
+        open={isImportOpen}
+        title={t("settings.mcpTab.importModalTitle")}
+        okText={t("settings.mcpTab.import")}
+        onOk={() => void handleImport()}
+        okButtonProps={{ loading: isImporting, disabled: !configAvailable }}
+        onCancel={() => {
+          if (isImporting) return;
+          setIsImportOpen(false);
+          setImportError(null);
+        }}
+        width={800}
+        destroyOnClose={false}
+      >
+        <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          <Text type="secondary">
+            {t("settings.mcpTab.importHint")}
+            <br />
+            <Text
+              code
+            >{`{ "mcpServers": { "filesystem": { "command": "npx", "args": ["-y", "..."] } } }`}</Text>
+          </Text>
+
+          <Radio.Group
+            value={importMode}
+            onChange={(e) => setImportMode(e.target.value as ImportMode)}
+            optionType="button"
+            buttonStyle="solid"
+          >
+            <Radio.Button value="merge">{t("settings.mcpTab.importModeMerge")}</Radio.Button>
+            <Radio.Button value="replace">{t("settings.mcpTab.importModeReplace")}</Radio.Button>
+          </Radio.Group>
+
+          {importMode === "replace" ? (
+            <Alert type="warning" showIcon message={t("settings.mcpTab.replaceWarning")} />
+          ) : null}
+
+          {importError ? <Alert type="error" showIcon message={importError} /> : null}
+
+          <TextArea
+            value={importJson}
+            onChange={(e) => setImportJson(e.target.value)}
+            rows={14}
+            placeholder='{"mcpServers": { "filesystem": { "command": "...", "args": [], "env": {} } }}'
+            spellCheck={false}
+          />
+        </Space>
+      </Modal>
+    </Space>
+  );
+};
+
+export default SystemSettingsMcpTab;

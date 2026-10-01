@@ -1,0 +1,516 @@
+import { ApiError } from "@services/api";
+import type { CommandItem } from "@shared/types/command";
+import type { WorkflowMetadata } from "@pages/ChatPage/services/WorkflowManagerService";
+import { describe, expect, it, vi } from "vitest";
+import {
+  LegacyWorkflowCatalogAdapter,
+  NegotiatedWorkflowCatalogAdapter,
+  TypedWorkflowCatalogAdapter,
+  type WorkflowCatalogAdapter,
+} from "../catalogAdapters";
+import type { WorkflowCatalogView } from "../domain";
+import { workflowCatalogItemKey } from "../domain";
+
+const command = (overrides: Partial<CommandItem> = {}): CommandItem => ({
+  id: "skill-review",
+  name: "review",
+  displayName: "Review",
+  description: "Review changes against evidence.",
+  type: "skill",
+  metadata: {},
+  ...overrides,
+});
+
+const legacyView: WorkflowCatalogView = {
+  items: [],
+  diagnostics: [],
+  capabilities: {
+    mode: "legacy",
+    clone: false,
+    edit: false,
+    activate: false,
+    run: false,
+    cancel: false,
+  },
+};
+
+describe("TypedWorkflowCatalogAdapter", () => {
+  it("maps instruction and orchestration identities and scopes the request", async () => {
+    const signal = new AbortController().signal;
+    const get = vi.fn(async () => ({
+      revision: 41,
+      entries: [
+        {
+          id: "review",
+          name: "Review",
+          description: "Review changes against evidence.",
+          kind: "instruction",
+          source: "builtin",
+          revision: 7,
+          version: "3",
+          invocation_policy: { explicit: true, automatic: false },
+          argument_schema: { type: "object", additionalProperties: false },
+          status: "valid",
+          winner: true,
+          shadowed_candidates: [
+            { source: "project", status: "valid" },
+            { source: "user", status: "invalid", last_error: "invalid override" },
+          ],
+        },
+        {
+          id: "release-train",
+          name: "Release train",
+          description: "Coordinate a durable release.",
+          kind: "orchestration",
+          source: "plugin",
+          revision: 2,
+          invocation_policy: { explicit: true, automatic: true },
+          argument_hint: "release version",
+          status: "valid",
+          winner: true,
+        },
+        {
+          id: "legacy-review",
+          name: "Legacy review",
+          description: "Legacy repository review workflow.",
+          kind: "instruction",
+          source: "workspace",
+          revision: 4,
+          invocation_policy: { explicit: true, automatic: false },
+          status: "valid",
+          winner: true,
+          legacy: true,
+          migration_status: "available",
+          shadowed_candidates: [
+            {
+              source: "plugin",
+              status: "valid",
+              legacy: true,
+              migration_status: "available",
+            },
+          ],
+        },
+      ],
+    }));
+
+    const result = await new TypedWorkflowCatalogAdapter(get).load({
+      sessionId: "  session/one  ",
+      signal,
+    });
+
+    expect(get).toHaveBeenCalledWith("bamboo/workflow-catalog?session_id=session%2Fone", {
+      signal,
+    });
+    expect(result).toEqual({
+      revision: 41,
+      items: [
+        {
+          id: "review",
+          name: "Review",
+          description: "Review changes against evidence.",
+          kind: "instruction",
+          source: "builtin",
+          status: "valid",
+          winner: true,
+          invocationPolicy: "manual",
+          argumentHint: undefined,
+          argumentSchema: { type: "object", additionalProperties: false },
+          readOnly: true,
+          revision: 7,
+          version: "3",
+          lastError: undefined,
+          shadowedCandidates: [
+            { source: "project", status: "valid", lastError: undefined },
+            { source: "user", status: "invalid", lastError: "invalid override" },
+          ],
+        },
+        {
+          id: "release-train",
+          name: "Release train",
+          description: "Coordinate a durable release.",
+          kind: "orchestration",
+          source: "plugin",
+          status: "valid",
+          winner: true,
+          invocationPolicy: "both",
+          argumentHint: "release version",
+          argumentSchema: undefined,
+          readOnly: true,
+          revision: 2,
+          version: undefined,
+          lastError: undefined,
+        },
+        {
+          id: "legacy-review",
+          name: "Legacy review",
+          description: "Legacy repository review workflow.",
+          kind: "instruction",
+          source: "workspace",
+          status: "valid",
+          winner: true,
+          legacy: true,
+          migrationStatus: "available",
+          invocationPolicy: "manual",
+          argumentHint: undefined,
+          argumentSchema: undefined,
+          readOnly: false,
+          revision: 4,
+          version: undefined,
+          lastError: undefined,
+          shadowedCandidates: [
+            {
+              source: "plugin",
+              status: "valid",
+              legacy: true,
+              migrationStatus: "available",
+              lastError: undefined,
+            },
+          ],
+        },
+      ],
+      diagnostics: [],
+      capabilities: {
+        mode: "typed",
+        clone: false,
+        edit: false,
+        activate: true,
+        run: false,
+        cancel: false,
+      },
+    });
+    expect(result.items.some((item) => item.id === "review")).toBe(true);
+  });
+
+  it("keeps valid instruction and orchestration rows when another entry is invalid", async () => {
+    const adapter = new TypedWorkflowCatalogAdapter(async () => ({
+      revision: 9,
+      entries: [
+        {
+          id: "research",
+          name: "Research",
+          description: "Research with sources.",
+          kind: "orchestration",
+          source: "user",
+          revision: 3,
+          invocation_policy: { automatic: true },
+          status: "valid",
+          winner: true,
+        },
+        {
+          id: "ordinary-skill",
+          name: "Ordinary Skill",
+          description: "A prompt instruction, not a Workflow.",
+          kind: "instruction",
+          source: "user",
+          revision: 4,
+          invocation_policy: { explicit: true },
+          status: "valid",
+          winner: true,
+        },
+        {
+          id: "broken",
+          name: "Broken",
+          description: "",
+          kind: "orchestration",
+          source: "user",
+          revision: 5,
+          invocation_policy: { explicit: true },
+          status: "valid",
+          winner: true,
+        },
+        "not-an-entry",
+      ],
+    }));
+
+    const result = await adapter.load();
+
+    expect(result.items).toHaveLength(2);
+    expect(result.items[0]).toMatchObject({
+      id: "research",
+      invocationPolicy: "automatic",
+      readOnly: false,
+    });
+    expect(result.items[1]).toMatchObject({
+      id: "ordinary-skill",
+      kind: "instruction",
+      invocationPolicy: "manual",
+    });
+    expect(result.diagnostics).toEqual([
+      { entryIndex: 2, itemId: "broken", message: "missing description" },
+      { entryIndex: 3, itemId: undefined, message: "entry is not an object" },
+    ]);
+  });
+
+  it("derives safe argument hints, preserves LKG diagnostics, and drops private response fields", async () => {
+    const adapter = new TypedWorkflowCatalogAdapter(async () => ({
+      revision: 12,
+      entries: [
+        {
+          id: "review",
+          name: "Review",
+          description: "Review a scoped change.",
+          kind: "instruction",
+          source: "builtin",
+          revision: 8,
+          version: "2",
+          invocation_policy: { explicit: true, automatic: true },
+          argument_schema: {
+            type: "object",
+            properties: { target: { type: "string" }, force: { type: "boolean" } },
+            required: ["target"],
+          },
+          status: "invalid",
+          winner: true,
+          last_error: "Using sanitized last-known-good metadata",
+          instructions: "PRIVATE EXPANDED INSTRUCTIONS",
+          resources: ["PRIVATE RESOURCE"],
+          args: { token: "PRIVATE ARGUMENT" },
+          dynamic_context: "PRIVATE DYNAMIC CONTEXT",
+          storage_path: "/private/catalog/storage-path",
+          content: "PRIVATE BODY",
+        },
+        {
+          id: "review",
+          name: "Review override",
+          description: "A retained shadowed override.",
+          kind: "instruction",
+          source: "project",
+          revision: 9,
+          invocation_policy: { explicit: false, automatic: false },
+          argument_schema: { type: "object" },
+          status: "valid",
+          winner: false,
+        },
+      ],
+    }));
+
+    const result = await adapter.load();
+
+    expect(result.items[0]).toMatchObject({
+      id: "review",
+      kind: "instruction",
+      status: "invalid",
+      lastKnownGood: true,
+      argumentHint: "<target> [force]",
+      invocationPolicy: "both",
+    });
+    expect(result.items[1]).toMatchObject({
+      id: "review",
+      source: "project",
+      status: "shadowed",
+      winner: false,
+      invocationPolicy: "unavailable",
+    });
+    expect(workflowCatalogItemKey(result.items[0])).not.toBe(
+      workflowCatalogItemKey(result.items[1]),
+    );
+    const retained = JSON.stringify(result);
+    for (const privateValue of [
+      "PRIVATE EXPANDED INSTRUCTIONS",
+      "PRIVATE RESOURCE",
+      "PRIVATE ARGUMENT",
+      "PRIVATE DYNAMIC CONTEXT",
+      "/private/catalog/storage-path",
+      "PRIVATE BODY",
+    ]) {
+      expect(retained).not.toContain(privateValue);
+    }
+  });
+
+  it("rejects a malformed top-level snapshot rather than presenting fake data", async () => {
+    const adapter = new TypedWorkflowCatalogAdapter(async () => ({
+      revision: -1,
+      entries: [],
+    }));
+
+    await expect(adapter.load()).rejects.toThrow("Invalid typed workflow catalog response");
+  });
+});
+
+describe("LegacyWorkflowCatalogAdapter", () => {
+  it("maps only workflow-shaped commands and legacy workflow metadata", async () => {
+    const orchestrationSkill = command({
+      metadata: {
+        kind: "orchestration",
+        source: "workspace",
+        status: "degraded",
+        invocationPolicy: { explicit: true, automatic: true },
+        argumentHint: "target environment",
+        lastError: "dependency unavailable",
+      } as CommandItem["metadata"],
+    });
+    const workflowCommand = command({
+      id: "workflow-release",
+      name: "release",
+      displayName: "Release",
+      description: "Release through a true workflow command.",
+      type: "workflow",
+      metadata: {
+        kind: "orchestration",
+        source: "workspace",
+        status: "degraded",
+        invocationPolicy: { explicit: true, automatic: true },
+        argumentHint: "target environment",
+        lastError: "dependency unavailable",
+      } as CommandItem["metadata"],
+    });
+    const promptWorkflow = command({
+      id: "workflow-deploy",
+      name: "deploy",
+      displayName: "Deploy",
+      description: "Deploy with the legacy prompt path.",
+      type: "workflow",
+      metadata: { source: "global" },
+    });
+    const ordinarySkill = command({
+      id: "skill-plan",
+      name: "plan",
+      displayName: "Plan",
+      description: "An instruction Skill.",
+      type: "skill",
+      metadata: { kind: "instruction", source: "global" } as CommandItem["metadata"],
+    });
+    const mcp = command({ id: "mcp-read", name: "read", type: "mcp" });
+    const workflows: WorkflowMetadata[] = [
+      {
+        name: "deploy",
+        filename: "deploy.md",
+        source: "global",
+        size: 100,
+      },
+      {
+        name: "triage",
+        filename: "triage.md",
+        source: "workspace",
+        size: 80,
+      },
+    ];
+    const listCommands = vi.fn(async () => [
+      orchestrationSkill,
+      workflowCommand,
+      promptWorkflow,
+      ordinarySkill,
+      mcp,
+    ]);
+    const listWorkflows = vi.fn(async () => workflows);
+
+    const result = await new LegacyWorkflowCatalogAdapter({
+      listCommands,
+      listWorkflows,
+    }).load({ sessionId: "session-9" });
+
+    expect(listCommands).toHaveBeenCalledWith("session-9");
+    expect(result.revision).toBeUndefined();
+    expect(result.items).toEqual([
+      {
+        id: "deploy",
+        name: "Deploy",
+        description: "Deploy with the legacy prompt path.",
+        kind: "orchestration",
+        source: "legacy",
+        status: "valid",
+        legacy: true,
+        invocationPolicy: "manual",
+        argumentHint: undefined,
+        argumentSchema: undefined,
+        readOnly: false,
+        lastError: undefined,
+      },
+      {
+        id: "release",
+        name: "Release",
+        description: "Release through a true workflow command.",
+        kind: "orchestration",
+        source: "project",
+        status: "degraded",
+        invocationPolicy: "both",
+        argumentHint: "target environment",
+        argumentSchema: undefined,
+        readOnly: false,
+        lastError: "dependency unavailable",
+      },
+      {
+        id: "triage",
+        name: "triage",
+        description: "Legacy workflow triage",
+        kind: "orchestration",
+        source: "project",
+        status: "valid",
+        legacy: true,
+        invocationPolicy: "manual",
+        readOnly: false,
+      },
+    ]);
+    expect(result.items.some((item) => item.id === "review")).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("triage.md");
+    expect(result.capabilities).toMatchObject({
+      mode: "legacy",
+      edit: true,
+      activate: false,
+      run: false,
+    });
+  });
+
+  it("returns a diagnostic when one legacy source is unavailable", async () => {
+    const adapter = new LegacyWorkflowCatalogAdapter({
+      listCommands: async () => {
+        throw new Error("commands unavailable");
+      },
+      listWorkflows: async () => [
+        { name: "review", filename: "review.md", source: "global", size: 10 },
+      ],
+    });
+
+    const result = await adapter.load();
+
+    expect(result.items).toHaveLength(1);
+    expect(JSON.stringify(result)).not.toContain("review.md");
+    expect(result.diagnostics).toEqual([{ message: "Legacy command catalog is unavailable" }]);
+  });
+});
+
+describe("NegotiatedWorkflowCatalogAdapter", () => {
+  it.each([404, 405])("falls back on typed endpoint availability status %s", async (status) => {
+    const typed: WorkflowCatalogAdapter = {
+      load: vi.fn(async () => {
+        throw new ApiError("not available", status, "Not Available");
+      }),
+    };
+    const legacy: WorkflowCatalogAdapter = { load: vi.fn(async () => legacyView) };
+    const adapter = new NegotiatedWorkflowCatalogAdapter(typed, legacy);
+    const options = status === 404 ? {} : { sessionId: "session-1" };
+
+    await expect(adapter.load(options)).resolves.toBe(legacyView);
+    expect(legacy.load).toHaveBeenCalledWith(options);
+  });
+
+  it("does not hide typed contract failures behind legacy data", async () => {
+    const typedError = new ApiError("server failure", 500, "Server Error");
+    const typed: WorkflowCatalogAdapter = {
+      load: vi.fn(async () => {
+        throw typedError;
+      }),
+    };
+    const legacy: WorkflowCatalogAdapter = { load: vi.fn(async () => legacyView) };
+
+    await expect(new NegotiatedWorkflowCatalogAdapter(typed, legacy).load()).rejects.toBe(
+      typedError,
+    );
+    expect(legacy.load).not.toHaveBeenCalled();
+  });
+
+  it("does not turn a missing scoped Session into an unscoped legacy catalog", async () => {
+    const missingSession = new ApiError("session not found", 404, "Not Found");
+    const typed: WorkflowCatalogAdapter = {
+      load: vi.fn(async () => {
+        throw missingSession;
+      }),
+    };
+    const legacy: WorkflowCatalogAdapter = { load: vi.fn(async () => legacyView) };
+
+    await expect(
+      new NegotiatedWorkflowCatalogAdapter(typed, legacy).load({ sessionId: "missing-session" }),
+    ).rejects.toBe(missingSession);
+    expect(legacy.load).not.toHaveBeenCalled();
+  });
+});

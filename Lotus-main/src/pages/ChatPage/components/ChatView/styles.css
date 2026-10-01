@@ -1,0 +1,462 @@
+.chat-view-messages-list {
+  transition: opacity 0.3s ease-in-out;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.chat-view-messages-list::-webkit-scrollbar {
+  display: none;
+}
+
+.chat-view-messages-list.hidden {
+  display: none;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.chat-view-messages-list.visible {
+  display: block;
+  opacity: 1;
+  padding-bottom: 24px;
+}
+
+.chat-view-messages-list .ant-list-item,
+.chat-view-messages-list .ant-card,
+.chat-view-messages-list .ant-space-item {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.chat-view-messages-list .ant-card {
+  max-width: 100%;
+  overflow-wrap: break-word;
+  word-wrap: break-word;
+}
+
+.chat-view-messages-list pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.chat-view-input-container-wrapper {
+  transition: all 0.3s ease-in-out;
+  width: 100%;
+  padding: 0;
+  /* Avoid reserving excessive vertical space; the content defines its own height. */
+  min-height: 0;
+}
+
+.chat-view-input-container-wrapper.centered-view {
+  /* Normal flow inside the centered chat-bottom-stack (see .is-empty-centered).
+     Was position:absolute + top:55% + translateY(-50%), which sized against a
+     collapsed containing block (.chat-bottom-stack) and clipped the launcher's
+     top whenever its content was taller than the pane. */
+  position: static;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  min-height: 0;
+  max-height: 100%;
+  opacity: 1;
+}
+
+/* Launcher + composer block: never taller than the pane, so centering never
+   pushes its top out of view. */
+.chat-view-input-container-wrapper.centered-view > div {
+  min-height: 0;
+  max-height: 100%;
+}
+
+/* Launcher takes the room above the composer and scrolls internally, so its top
+   (header, search, first category) is always reachable. It was capped to
+   calc(100vh - 240px) — taller than the (shorter) pane — which clipped the top. */
+.chat-view-input-container-wrapper.centered-view > div > .lotus-empty-task-launcher {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: none;
+}
+
+/* Keep the composer fully visible below the scrolling launcher. */
+.chat-view-input-container-wrapper.centered-view > div > :last-child {
+  flex-shrink: 0;
+}
+
+.chat-view-input-container-wrapper.messages-view {
+  position: sticky;
+  bottom: 0;
+  opacity: 1;
+  margin-top: auto;
+  background: transparent;
+  backdrop-filter: none;
+  z-index: 10;
+  padding-top: 8px;
+  padding-bottom: 12px;
+}
+
+.chat-view-input-container-wrapper .active-tool-card-wrapper {
+  /* Render in normal flow above the input so it doesn't cover the messages. */
+  width: 100%;
+  margin-bottom: 8px;
+  opacity: 0;
+  transform: translateY(8px);
+  transition:
+    opacity 220ms ease,
+    transform 220ms ease;
+  pointer-events: none;
+}
+
+.chat-view-input-container-wrapper .active-tool-card-wrapper.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+@keyframes highlight-pulse {
+  0% {
+    background-color: color-mix(in srgb, var(--ant-color-primary) 10%, transparent);
+  }
+  50% {
+    background-color: color-mix(in srgb, var(--ant-color-primary) 30%, transparent);
+  }
+  100% {
+    background-color: color-mix(in srgb, var(--ant-color-primary) 10%, transparent);
+  }
+}
+
+.highlight-message {
+  animation: highlight-pulse 1.5s ease-in-out;
+  border: 2px solid var(--ant-color-primary);
+  transition: all 0.3s ease-in-out;
+}
+
+@media (max-width: 900px) {
+  .chat-view-input-container-wrapper > div {
+    max-width: 98vw;
+  }
+}
+
+@media (max-width: 600px) {
+  .chat-view-input-container-wrapper > div {
+    max-width: 100vw;
+    margin: 0;
+  }
+}
+
+@media (max-width: 768px) {
+  .chat-view-messages-list.visible {
+    padding-bottom: 12px;
+  }
+
+  .chat-view-input-container-wrapper.messages-view {
+    padding-top: 4px;
+    padding-bottom: 8px;
+  }
+
+  .chat-scroll-capsule-wrapper {
+    right: 8px;
+    bottom: calc(100% + 8px);
+  }
+
+  .chat-scroll-capsule {
+    max-width: min(100%, calc(100vw - 24px));
+    gap: 6px;
+    padding: 4px;
+  }
+
+  .chat-scroll-capsule__button.chat-scroll-capsule__button {
+    min-height: 32px;
+    padding-inline: 10px;
+  }
+
+  .lotus-message-input-shell {
+    border-radius: 18px !important;
+  }
+
+  .message-input-send-button.message-input-send-button {
+    width: 40px !important;
+    height: 40px !important;
+    min-width: 40px !important;
+    border-radius: 20px !important;
+  }
+
+  .message-input-send-button.message-input-send-button:hover:not(:disabled),
+  .message-input-send-button.message-input-send-button:active:not(:disabled) {
+    transform: none;
+  }
+
+  /* Shrink the composer toolbar icon buttons so they match the now-compact
+     composer (the round icon buttons + their glyphs were oversized on phones). */
+  .message-input-container .ant-btn:not(.message-input-send-button) {
+    height: 30px;
+    min-width: 30px;
+    padding-inline: 8px;
+  }
+  .message-input-container .ant-btn .anticon {
+    font-size: 15px;
+  }
+}
+
+/* Sidebar Date Group Hover Effect — doubled selector for specificity */
+.chat-sidebar-date-group-header.chat-sidebar-date-group-header:hover {
+  background: var(--lotus-item-hover-bg);
+}
+.chat-sidebar-date-group-header:hover
+  .chat-sidebar-date-group-delete.chat-sidebar-date-group-delete {
+  opacity: 1;
+}
+[data-theme="dark"] .chat-sidebar-date-group-header.chat-sidebar-date-group-header:hover {
+  background: var(--lotus-item-hover-bg);
+}
+
+.tool-call-card-collapse.tool-call-card-collapse:hover {
+  box-shadow: var(--lotus-card-hover-shadow);
+  border-color: var(--lotus-card-hover-border);
+  transform: translateY(-1px);
+}
+
+.tool-call-card-collapse .ant-collapse-header.ant-collapse-header {
+  align-items: center;
+}
+
+.tool-call-card-collapse .ant-tag {
+  border: none;
+}
+
+[data-theme="dark"] .tool-call-card-collapse.tool-call-card-collapse:hover {
+  box-shadow: var(--lotus-card-hover-shadow);
+  background: var(--lotus-tool-card-bg);
+}
+
+/* ── Animations ─────────────────────────────────────────────────── */
+
+/* Message entrance — fade-in with subtle vertical motion */
+@keyframes messageSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.messageEnter {
+  animation: messageSlideIn 0.3s ease-out;
+}
+
+/* Streaming card entrance — softer rise */
+@keyframes streamingEnter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.streaming-card-enter {
+  animation: streamingEnter 0.25s ease-out both;
+}
+
+.chat-bottom-stack {
+  position: relative;
+  width: 100%;
+}
+
+/* Empty/centered chat view: fill the pane below the meta strip and vertically
+   center the launcher + composer in normal flow. This gives the launcher a real,
+   pane-bounded height to scroll within, instead of the old absolutely-positioned
+   wrapper whose top overflowed (and was clipped) above the pane. */
+.chat-bottom-stack.is-empty-centered {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  overflow: hidden;
+}
+
+.chat-scroll-capsule-wrapper {
+  position: absolute;
+  right: 12px;
+  bottom: calc(100% + 10px);
+  display: flex;
+  justify-content: flex-end;
+  pointer-events: none;
+  z-index: 12;
+}
+
+.chat-scroll-capsule {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ant-color-bg-elevated) 88%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ant-color-border-secondary) 85%, transparent);
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.16);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.chat-scroll-capsule__count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--ant-color-error);
+  color: white;
+  font-size: 12px;
+  line-height: 1;
+  box-shadow: 0 0 0 2px var(--ant-color-bg-elevated);
+}
+
+.chat-scroll-capsule .ant-badge {
+  display: inline-flex;
+}
+
+.chat-scroll-capsule__button.chat-scroll-capsule__button {
+  border-radius: 999px;
+  border: none;
+  min-height: 34px;
+  padding-inline: 12px;
+  box-shadow: none;
+}
+
+.chat-scroll-capsule__button.chat-scroll-capsule__button--active {
+  box-shadow: 0 10px 24px color-mix(in srgb, var(--ant-color-primary) 28%, transparent);
+}
+
+.chat-scroll-capsule .ant-badge-count {
+  box-shadow: 0 0 0 2px var(--ant-color-bg-elevated);
+}
+
+/* Send button micro-interactions — doubled for specificity */
+.message-input-send-button.message-input-send-button:hover:not(:disabled) {
+  transform: scale(1.05);
+  box-shadow: var(--lotus-send-btn-shadow);
+}
+
+.message-input-send-button.message-input-send-button:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+/* ── Sidebar chat item animations ───────────────────────────────── */
+
+/* Subtle fade for new chat items in sidebar */
+@keyframes sidebarItemEnter {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.sidebar-item-enter {
+  animation: sidebarItemEnter 0.22s ease-out both;
+}
+
+/* ── Settings card entrance ─────────────────────────────────────── */
+@keyframes settingsCardEnter {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.settings-card-enter {
+  animation: settingsCardEnter 0.3s ease-out both;
+}
+
+/* ── Tool call collapse expand/collapse ─────────────────────────── */
+.tool-call-card-collapse {
+  transition:
+    box-shadow 0.22s ease,
+    border-color 0.22s ease,
+    transform 0.22s ease;
+}
+
+/* ── Thinking shimmer — continuous left-to-right highlight sweep ── */
+@keyframes thinkingShimmer {
+  0% {
+    background-position: 100% center;
+  }
+  100% {
+    background-position: 0% center;
+  }
+}
+
+.thinking-shimmer {
+  display: inline-block;
+  background: linear-gradient(
+    90deg,
+    currentColor 0%,
+    currentColor 30%,
+    rgba(45, 212, 191, 0.85) 50%,
+    currentColor 70%,
+    currentColor 100%
+  );
+  background-size: 300% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: thinkingShimmer 2.5s linear infinite;
+}
+
+/* Dark mode: brighter highlight */
+body[data-theme="dark"] .thinking-shimmer {
+  background: linear-gradient(
+    90deg,
+    rgba(226, 232, 240, 0.7) 0%,
+    rgba(226, 232, 240, 0.7) 30%,
+    rgba(94, 234, 212, 1) 50%,
+    rgba(226, 232, 240, 0.7) 70%,
+    rgba(226, 232, 240, 0.7) 100%
+  );
+  background-size: 300% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: thinkingShimmer 2.5s linear infinite;
+}
+
+/* ── Reduced motion — disable all custom animations ─────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .messageEnter,
+  .streaming-card-enter,
+  .sidebar-item-enter,
+  .settings-card-enter,
+  .thinking-shimmer {
+    animation: none !important;
+  }
+
+  .thinking-shimmer {
+    background: none !important;
+    -webkit-text-fill-color: unset !important;
+  }
+
+  .tool-call-card-collapse,
+  .message-input-send-button {
+    transition: none !important;
+    transform: none !important;
+  }
+}
