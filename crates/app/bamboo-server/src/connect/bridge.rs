@@ -976,7 +976,16 @@ impl ConnectBridge {
         // 第一条消息前注入一次约定说明，让模型知道 [SEND_FILE: 路径] 标记——
         // 纯网关侧约定，标记的解析与投递由各适配器自行实现，引擎无感知。
         let preamble;
-        let text = if platform.capabilities().attachments && session.messages.is_empty() {
+        // 注入条件不能是 messages.is_empty()：会话创建时 messages[0] 已经
+        // 有一条 System 消息（prepare_session_for_execution），判空永远为
+        // false，约定说明从未注入过——模型因此不知道自己能发文件。改为
+        // "会话里还没有出现过这段提示"：首条用户消息注入，且长会话上下文
+        // 压缩把它摘要掉之后也会自动补一次（对存量"中毒"会话同样自愈）。
+        let preamble_missing = !session.messages.iter().any(|message| {
+            matches!(message.role, bamboo_agent_core::Role::User)
+                && message.content.contains("[渠道能力提示")
+        });
+        let text = if platform.capabilities().attachments && preamble_missing {
             preamble = format!(
                 "[渠道能力提示：本会话经聊天渠道接入。所有面向用户的文字（回复正文、\
                  向用户提出的问题、问题的候选项）一律使用简体中文。用户消息中的 \
@@ -2865,6 +2874,48 @@ mod tests {
             .as_ref()
             .map(|state| state.effective_permission_mode());
         assert_eq!(mode, Some(bamboo_domain::SessionPermissionMode::Default));
+    }
+
+    #[tokio::test]
+    async fn attachments_preamble_injected_despite_system_message() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx);
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx.clone(), None, responder));
+        let mut caps = super::super::platform::Capabilities::default();
+        caps.attachments = true;
+        let platform = FakePlatform::with_capabilities("fake", caps);
+        let key = key_for("chat1", "u1");
+
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "pre-1", "把结果文件发给我"),
+        )
+        .await;
+
+        // 会话创建时 messages[0] 是 System 消息——旧判空逻辑因此从未注入
+        // 过 [SEND_FILE] 约定。回归：首条用户消息必须带上渠道能力提示。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut injected_count = 0;
+        while std::time::Instant::now() < deadline {
+            if let Some(session_id) = bridge.session_id_for_key(&key).await {
+                if let Some(session) = ctx.session_repo.load_merged(&session_id).await {
+                    injected_count = session
+                        .messages
+                        .iter()
+                        .filter(|m| matches!(m.role, bamboo_agent_core::Role::User))
+                        .filter(|m| m.content.contains("[渠道能力提示"))
+                        .count();
+                    if injected_count >= 1 {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(injected_count >= 1, "preamble must be injected");
     }
 
     #[tokio::test]
