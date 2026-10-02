@@ -100,7 +100,35 @@ iLink 的 token 通过**扫码授权**取得，Bamboo v1 本身不提供独立�
 2. 手机微信确认后，从该工具的配置/状态目录里复制 `bot_token`；
 3. 填入上面的 `token` 字段并重启 `bamboo serve`。
 
-### 4.2 会话过期与自动重登
+### 4.3 语音能力（connect.json 的 `voice` 段）
+
+```jsonc
+{
+  "type": "wechat",
+  "token": "...",
+  "allow_from": ["wxid_xxx@im.wechat"],
+  "voice": {
+    "siliconflow_api_key": "sk-…",
+    "siliconflow_base_url": "https://api.siliconflow.cn",   // 可选
+    "tts_model": "FunAudioLLM/CosyVoice2-0.5B",             // 可选
+    "tts_voice": "FunAudioLLM/CosyVoice2-0.5B:anna",        // 可选，音色：alex/benjamin/charles/david/anna/bella/claire/diana
+    "tts_sample_rate": 16000,                                // 可选 16000/24000
+    "reply_mode": "off",                                     // TTS 总开关：off(默认)/mirror/always
+    "asr_model": "FunAudioLLM/SenseVoiceSmall",              // 可选，免费档
+    "file_asr": "off"                                        // 音频文件转写：off(默认)/on
+  }
+}
+```
+
+- **两个开关都默认关**：配好 `siliconflow_api_key` 也不会发语音/转写，
+  必须显式设 `reply_mode`/`file_asr`；整段不配则行为与无语音版完全一致；
+- **写入必须走正规路径**（`bamboo config set` / 设置 API 的 connect 分区
+  PUT），connect.json 受分区哈希账本保护，**手改文件会导致 serve 拒绝启动**；
+- `siliconflow_api_key` 是明文存储（与 token 的加密管道不同）；TTS 按
+  UTF-8 字节计费，`mirror/always` 模式受内容门槛约束（代码/链接/超长
+  降级文字），显式 `[SEND_VOICE]` 每条回复最多 3 段、每段 ≤250 字。
+
+### 4.4 会话过期与自动重登
 
 iLink 的 token 有效期未公开，实测错误码 `ret=-14` 表示会话过期。适配器
 遇到它会自动进入**扫码重登**：把登录二维码保存到
@@ -108,7 +136,7 @@ iLink 的 token 有效期未公开，实测错误码 `ret=-14` 表示会话过�
 它会自动恢复收发。**重登拿到的新 token 只存在于进程内存中**——重启即失效，
 建议扫码成功后顺手把它抄进 `connect.json` 持久化。
 
-### 4.3 行为与已知限制
+### 4.5 行为与已知限制
 
 - `allow_from` 填微信用户 id（形如 `wxid_xxx@im.wechat`，可从启动后的日志
   里找到被拒绝的发送者 id）；为空时与其他平台一样**默认全部拒绝**。
@@ -124,6 +152,16 @@ iLink 的 token 有效期未公开，实测错误码 `ret=-14` 表示会话过�
     Agent 需要给你发文件时，会在回复中写 `[SEND_FILE: 文件绝对路径]` 标记行，
     网关自动经 iLink CDN（getuploadurl → AES 加密 → 上传 → sendmessage）投递，
     标记行不会显示。图片按魔数自动识别为图片消息，视频按 MP4 识别，其余按文件。
+  - **语音条回复（TTS，硅基流动）**：`voice.reply_mode` 决定出站形态——
+    `off`（**默认**，完全关闭）/ `mirror`（语音回语音、文字回文字）/
+    `always`（普通回复总是语音）。代码/表格/链接/文件/超长内容自动降级文字；
+    模型仅在用户明确要求朗读时写 `[SEND_VOICE: 要念的文本]` 标记。
+    链路：TTS(PCM 16k) → 纯 Rust SILK 编码 → CDN 上传 → voice_item；
+    合成失败回退文字，绝不卡住。配置见下方"语音能力"。
+  - **音频文件转写（ASR，硅基流动 SenseVoiceSmall，免费）**：
+    `voice.file_asr = "on"` 时，发给机器人的音频**文件**（mp3/wav/m4a 等）
+    会在消息里追加 `[音频转写] 文本` 行；音乐/超限/失败静默跳过。
+    **微信语音条永远用微信自带转写**（不走硅基流动）。
   - 审批/澄清提示整体中文化：权限提示的问题正文（引擎生成的英文模板）
     在展示层翻译成中文（如“⚠️ 需要权限确认：执行命令”），选项显示为
     “1. 允许 / 2. 拒绝”。回复数字、选项文字、中英文意图词均可命中：

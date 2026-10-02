@@ -650,6 +650,7 @@ mod connect_project_mapping_tests {
         project_id: bamboo_domain::ProjectId,
     ) -> bamboo_config::ConnectPlatformConfig {
         bamboo_config::ConnectPlatformConfig {
+            voice: None,
             id: None,
             project_id: Some(project_id),
             platform_type: "telegram".to_string(),

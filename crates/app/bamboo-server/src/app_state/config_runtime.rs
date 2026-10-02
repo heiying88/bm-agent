@@ -7579,6 +7579,7 @@ for line in sys.stdin:
             live.connect
                 .platforms
                 .push(bamboo_config::ConnectPlatformConfig {
+            voice: None,
                     id: None,
                     project_id: None,
                     platform_type: "runtime-sentinel".to_string(),

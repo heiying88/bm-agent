@@ -215,10 +215,24 @@ impl ConnectManager {
                     let state_dir = data_dir
                         .as_ref()
                         .map(|dir| dir.join("connect_wechat"));
+                    // 语音能力（voice 段）：无 siliconflow_api_key 时为 None，
+                    // 全部语音行为关闭。
+                    let voice = platform_cfg
+                        .voice
+                        .as_ref()
+                        .and_then(platforms::wechat_voice::VoiceConfig::from_config);
+                    if let Some(voice) = &voice {
+                        tracing::info!(
+                            "connect: wechat voice enabled reply_mode={:?} file_asr={}",
+                            voice.reply_mode,
+                            voice.file_asr
+                        );
+                    }
                     let platform: Arc<dyn Platform> = Arc::new(platforms::wechat::WechatPlatform::new(
                         token,
                         base_url,
                         state_dir,
+                        voice,
                     ));
                     spawn_platform_tasks(
                         &mut tasks,
@@ -425,6 +439,7 @@ mod tests {
 
     fn platform(platform_type: &str, token: Option<&str>) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
+            voice: None,
             id: None,
             project_id: None,
             platform_type: platform_type.to_string(),

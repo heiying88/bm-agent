@@ -1407,6 +1407,7 @@ dependencies = [
  "bytes",
  "cap-fs-ext",
  "cap-std",
+ "cc",
  "chrono",
  "chrono-tz",
  "cron",

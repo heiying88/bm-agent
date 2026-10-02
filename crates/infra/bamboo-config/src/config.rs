@@ -1153,11 +1153,57 @@ pub struct NotificationsConfig {
     pub bark: BarkChannelConfig,
 }
 
+/// 微信（iLink）适配器的语音能力配置（`[[connect.platforms]]` 里
+/// type=wechat 条目的 `voice` 段）：硅基流动 TTS 语音条回复 + 音频文件
+/// ASR。整段可选，缺省时行为与无语音版完全一致。
+/// `siliconflow_api_key` 为**明文**存储（与 `token` 的加密管道不同——
+/// 按部署方的明文配置偏好；写入仍须走 `config set` / 设置 API，
+/// connect.json 受分区哈希账本保护，手改会拒绝启动）。
+/// 行为规范见 docs/design/wechat-voice-tts-asr-plan.md。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WechatVoiceConfig {
+    /// 硅基流动 API key（`sk-…`，Bearer）。缺省 = 语音功能整体禁用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub siliconflow_api_key: Option<String>,
+    /// 自定义 API 地址（默认 `https://api.siliconflow.cn`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub siliconflow_base_url: Option<String>,
+    /// TTS 模型（默认 `FunAudioLLM/CosyVoice2-0.5B`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_model: Option<String>,
+    /// TTS 音色（默认 `FunAudioLLM/CosyVoice2-0.5B:anna`，格式 `模型名:音色名`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_voice: Option<String>,
+    /// TTS 采样率（默认 16000；可选 16000/24000，须为 SILK 支持档位）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_sample_rate: Option<u32>,
+    /// TTS 语速 0.25–4.0（默认 1.0）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_speed: Option<f64>,
+    /// SILK 目标比特率 bps（默认 25000）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts_bitrate: Option<i32>,
+    /// 出站语音/文字决策（`off` | `mirror` | `always`，**默认 `off`**——
+    /// TTS 总开关，配好密钥也不会发语音，须显式开启）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_mode: Option<String>,
+    /// ASR 模型（默认 `FunAudioLLM/SenseVoiceSmall`，免费档）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr_model: Option<String>,
+    /// 音频文件转写开关（`off` | `on`，默认 `off`）。只影响用户发来的
+    /// 音频**文件**附件（mp3/wav/m4a 等）；微信语音条永远用微信自带转写。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_asr: Option<String>,
+}
+
 /// One IM-platform bridge configured under `[[connect.platforms]]` —
 /// bamboo-connect (issue #452 / epic #447): drives a bamboo session from an
 /// external chat platform (Telegram first).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConnectPlatformConfig {
+    /// 微信适配器语音能力（见 [`WechatVoiceConfig`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<WechatVoiceConfig>,
     /// Stable per-entry identifier (#496). Not part of the original schema —
     /// absent on legacy/hand-written entries and on a freshly-echoed new
     /// entry from a client. [`Config::save_to_dir`] assigns one (a random

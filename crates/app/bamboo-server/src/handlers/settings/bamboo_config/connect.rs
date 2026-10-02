@@ -245,6 +245,7 @@ pub async fn put_connect_config(
                     existing.is_some_and(|platform| platform.app_secret_configured),
                 );
                 platforms.push(bamboo_config::ConnectPlatformConfig {
+            voice: None,
                     id: input.id,
                     project_id: input.project_id,
                     platform_type: input.platform_type,
