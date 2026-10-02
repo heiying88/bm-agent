@@ -22,9 +22,9 @@ impl PendingInteractionKind {
     }
 }
 
-pub(super) struct PendingInteraction {
-    pub(super) kind: PendingInteractionKind,
-    pub(super) permission_request: Option<PermissionRequest>,
+pub(crate) struct PendingInteraction {
+    pub(crate) kind: PendingInteractionKind,
+    pub(crate) permission_request: Option<PermissionRequest>,
 }
 
 fn request_matches_pending(
@@ -118,7 +118,7 @@ pub(super) fn persisted_permission_decision_receipt(
         })
 }
 
-pub(super) fn resolve_pending_interaction(
+pub(crate) fn resolve_pending_interaction(
     session: &Session,
     pending: &PendingQuestion,
     in_memory_request: Option<PermissionRequest>,

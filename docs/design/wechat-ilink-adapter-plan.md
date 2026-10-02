@@ -57,11 +57,13 @@
 
 ### 2d. 推迟项
 
-- ~~入站媒体~~（已实现：语音转写 + 图片 CDN 下载/AES-128-ECB 解密/落盘）；
-- **出站媒体**（发图片/文件/语音条）：`OutboundMessage` 共享契约目前只有文本
-  字段，出站媒体需要扩展 connect 的跨平台契约 + render 层支持（独立立项）；
+- ~~入站媒体~~（已实现：语音转写 + 图片/文件/视频 CDN 下载/AES-128-ECB 解密/落盘）；
+- ~~出站任意格式文件~~（已实现，纯网关层方案：`[SEND_FILE: 路径]` 回复标记约定 +
+  bridge 首条消息注入说明 + 适配器解析标记并经 getuploadurl→AES 加密→CDN 上传→
+  sendmessage 投递；引擎与共享 OutboundMessage 契约零改动）；
 - 输入中指示（getconfig/sendtyping）；
 - 群聊（`@chatroom` id 路由 + 群内发送者识别，协议字段未公开，需 spike）；
+- 出站语音（SILK/AMR 编码，cc-connect 亦仅支持 AMR 转码）；
 - `bamboo connect wechat login` 独立 CLI；多账号（`wechat:<bot_id>` 折叠键，同 feishu 计划 §2d）；
 - 同一 context_token 多次回复的合法性未知（legacy 渲染一次 run 会发多条）——spike 项；若被拒，缓解方案是适配器内做短窗口合并。
 

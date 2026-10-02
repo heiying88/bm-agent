@@ -23,6 +23,10 @@ use tokio::sync::broadcast;
 
 use bamboo_agent_core::tools::ToolExecutionContext;
 use bamboo_agent_core::{AgentEvent, Session};
+use bamboo_tools::permission::{
+    PermissionDecision, PermissionDecisionKind, PermissionDecisionReceipt, PermissionMatcher,
+    PermissionMatcherKind,
+};
 use bamboo_engine::execution::{
     create_event_forwarder_with_history_commit_barrier, get_or_create_event_sender,
     reserve_session_execution, SessionExecutionReserveOutcome,
@@ -39,6 +43,7 @@ use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot;
 use bamboo_engine::session_app::respond::{
     acquire_pending_response_guard, inspect_pending_response_guarded,
+    submit_pending_permission_response_checked_guarded,
     submit_pending_response_checked_guarded, validate_pending_response,
     PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
 };
@@ -116,14 +121,88 @@ fn truncate_label(text: &str) -> String {
     out
 }
 
+/// 权限提示的选项固定为 Approve/Deny（engine 的 permission gate 只合成
+/// 这两个选项）。
+fn is_permission_ask(options: &[String]) -> bool {
+    options.len() == 2
+        && options[0].eq_ignore_ascii_case("approve")
+        && options[1].eq_ignore_ascii_case("deny")
+}
+
+/// 权限提示展示层统一换成中文标签，更贴合 IM 用户；存储的英文
+/// 选项仍是应答匹配词表——数字（"1"/"2"）、英文原文（"approve"）、
+/// 中英文肯定/否定关键词（"允许"/"拒绝"）都能命中，见 `match_text_answer`。
+fn option_display_label(options: &[String], index: usize) -> &str {
+    if is_permission_ask(options) {
+        if index == 0 {
+            "允许"
+        } else {
+            "拒绝"
+        }
+    } else {
+        options[index].as_str()
+    }
+}
+
+/// 权限提示正文整体汉化（仅展示层；应答匹配仍基于存储的英文选项）。
+/// engine 的 permission gate 生成固定英文模板：
+/// `**Permission required**\n\nThe \`{tool}\` tool needs approval to {action} on:\n\n\`{resource}\``
+/// 解析失败或未知动作时原样返回，绝不阻断渲染。
+fn translate_permission_question(question: &str) -> String {
+    let trimmed = question.trim();
+    let Some(body) = trimmed
+        .strip_prefix("**Permission required**")
+        .map(str::trim)
+        .and_then(|rest| rest.strip_prefix("The `"))
+    else {
+        return trimmed.to_string();
+    };
+    let Some((tool, tail)) = body.split_once("` tool needs approval to ") else {
+        return trimmed.to_string();
+    };
+    let Some((action, resource_part)) = tail.split_once(" on:") else {
+        return trimmed.to_string();
+    };
+    let resource = resource_part.trim().trim_matches('`');
+    let action_cn = match action.trim() {
+        "Write files to disk" => "写入文件",
+        "Execute shell commands" => "执行命令",
+        "Perform Git write operations (commit, push, etc.)" => "执行 Git 写操作（commit、push 等）",
+        "Make HTTP requests to external services" => "发起外部 HTTP 请求",
+        "Delete files or directories" => "删除文件或目录",
+        "Run interactive terminal sessions" => "运行交互式终端会话",
+        "Interact with a browser page" => "操作浏览器页面",
+        _ => {
+            return format!("⚠️ 需要权限确认\n\n{action}：\n\n{resource}");
+        }
+    };
+    format!(
+        "⚠️ 需要权限确认：{action_cn}\n\n{resource}\n\n（来自工具 {tool}）"
+    )
+}
+
 /// Format the ask's question + a numbered option list (text replies remain
 /// first-class even when buttons are ALSO rendered).
 fn format_ask_text(ask: &ParkedAsk) -> String {
-    let mut text = ask.question.clone();
+    let question = if is_permission_ask(&ask.options) {
+        translate_permission_question(&ask.question)
+    } else {
+        ask.question.clone()
+    };
+    let mut text = question;
     if !ask.options.is_empty() {
         text.push_str("\n\n");
-        for (index, option) in ask.options.iter().enumerate() {
-            text.push_str(&format!("{}. {}\n", index + 1, option));
+        for (index, _option) in ask.options.iter().enumerate() {
+            text.push_str(&format!(
+                "{}. {}\n",
+                index + 1,
+                option_display_label(&ask.options, index)
+            ));
+        }
+        if is_permission_ask(&ask.options) {
+            text.push_str("（回复数字选择；回复\"都允许\"本次会话内不再逐条询问）");
+        } else {
+            text.push_str("（回复数字即可选择）");
         }
     }
     if ask.allow_custom {
@@ -150,9 +229,9 @@ pub async fn render_ask(
             .options
             .iter()
             .enumerate()
-            .map(|(index, option)| {
+            .map(|(index, _option)| {
                 vec![Button::new(
-                    truncate_label(option),
+                    truncate_label(option_display_label(&ask.options, index)),
                     format!("{}:{index}", ask.nonce),
                 )]
             })
@@ -174,7 +253,11 @@ pub async fn render_read_only_ask(
     ask: &PendingAsk,
     reason: &str,
 ) -> PlatformResult<()> {
-    let mut text = ask.question.clone();
+    let mut text = if is_permission_ask(&ask.options) {
+        translate_permission_question(&ask.question)
+    } else {
+        ask.question.clone()
+    };
     if !ask.options.is_empty() {
         text.push_str("\n\n");
         for (index, option) in ask.options.iter().enumerate() {
@@ -206,6 +289,20 @@ const AFFIRMATIVE_KEYWORDS: &[&str] = &[
 /// literally titled "Stay" resolves on the exact match and never reaches
 /// here.
 const NEGATIVE_KEYWORDS: &[&str] = &["拒绝", "不", "否", "no", "deny", "reject", "stay"];
+/// 跳过/取消意图（跨语言）：回复"跳过"可命中英文选项 "Skip"，反之亦然。
+const SKIP_KEYWORDS: &[&str] = &["跳过", "略过", "忽略", "skip", "ignore"];
+const CANCEL_KEYWORDS: &[&str] = &["取消", "算了", "cancel", "abort"];
+
+/// 在选项里找包含任一关键词的选项（小写比较）。
+fn pick_option_by_keyword(options: &[String], keywords: &[&str]) -> Option<String> {
+    options
+        .iter()
+        .find(|option| {
+            let lower = option.to_lowercase();
+            keywords.iter().any(|keyword| lower.contains(keyword))
+        })
+        .cloned()
+}
 
 fn classify_intent(text: &str) -> Option<bool> {
     let lower = text.trim().to_lowercase();
@@ -244,6 +341,25 @@ fn pick_option_by_intent(options: &[String], affirmative: bool) -> Option<String
     None
 }
 
+/// 判断聊天回复是否表达"接下来都允许"这类**会话级持续授权**意图。
+/// 命中后本次仍按"允许"应答（AllowOnce 回执），并额外安装一个会话
+/// 范围的类型化授权——本会话后续同类操作不再逐条询问。负向词优先：
+/// "以后都不允许"不会被判成持续授权。
+pub fn wants_session_scope(text: &str) -> bool {
+    const SESSION_ALLOW_PHRASES: &[&str] = &[
+        "都允许", "全部允许", "总是允许", "一律允许", "始终允许", "都同意", "全部同意",
+        "不再询问", "别再问", "不用再问", "别问了", "always allow", "allow all",
+        "stop asking", "don't ask again",
+    ];
+    const NEGATIVE_MARKERS: &[&str] =
+        &["不允许", "不准", "不要", "拒绝", "不同意", "deny", "reject"];
+    let trimmed = text.trim();
+    let lower = trimmed.to_lowercase();
+    trimmed.chars().count() <= 40
+        && SESSION_ALLOW_PHRASES.iter().any(|phrase| lower.contains(phrase))
+        && !NEGATIVE_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 /// Match a text reply against `ask`, returning the answer to submit, or
 /// `None` when it doesn't resolve the ask at all (issue #458: a non-matching
 /// text on a CLOSED ask — no free text allowed — falls through to the
@@ -251,8 +367,9 @@ fn pick_option_by_intent(options: &[String], affirmative: bool) -> Option<String
 /// doomed-to-fail answer).
 ///
 /// Tried in order: 1-based numeric option index, exact (case-insensitive)
-/// option text, then — for a closed (non-`allow_custom`) ask — the
-/// affirmative/negative keyword mapping. An OPEN ask (`allow_custom`) always
+/// option text, session-scope allow phrases ("接下来都允许"), then — for a
+/// closed (non-`allow_custom`) ask — the affirmative/negative keyword
+/// mapping. An OPEN ask (`allow_custom`) always
 /// matches: any non-empty text IS the answer, verbatim (matching
 /// `validate_pending_response`'s server-side rule).
 pub fn match_text_answer(ask: &ParkedAsk, text: &str) -> Option<String> {
@@ -272,10 +389,41 @@ pub fn match_text_answer(ask: &ParkedAsk, text: &str) -> Option<String> {
     {
         return Some(option.clone());
     }
+    if !ask.allow_custom && wants_session_scope(trimmed) {
+        // "接下来都允许"这类持续授权短语：本次映射到肯定选项，会话级
+        // 授权由 `typed_permission_receipt` 的 session_scope 参数安装。
+        if let Some(option) = pick_option_by_intent(&ask.options, true) {
+            return Some(option.clone());
+        }
+    }
     if !ask.allow_custom {
         if let Some(intent) = classify_intent(trimmed) {
             if let Some(option) = pick_option_by_intent(&ask.options, intent) {
-                return Some(option);
+                return Some(option.clone());
+            }
+        }
+    }
+    if !ask.allow_custom {
+        // 通用子串层：短回复唯一命中一个选项（"跳过"→"跳过该文件"、
+        // "skip"→"Skip"）。仅当恰好一个选项包含该词时生效，避免歧义。
+        let lower = trimmed.to_lowercase();
+        if (2..=12).contains(&lower.chars().count()) {
+            let hits: Vec<&String> = ask
+                .options
+                .iter()
+                .filter(|option| option.to_lowercase().contains(&lower))
+                .collect();
+            if hits.len() == 1 {
+                return Some(hits[0].clone());
+            }
+        }
+        // 跨语言意图层：回复"跳过"命中英文选项 "Skip"，回复"取消"命中
+        // "Cancel"（选项文字与用户语言不一致时兜底）。
+        for keywords in [SKIP_KEYWORDS, CANCEL_KEYWORDS] {
+            if keywords.iter().any(|keyword| lower == *keyword) {
+                if let Some(option) = pick_option_by_keyword(&ask.options, keywords) {
+                    return Some(option);
+                }
             }
         }
     }
@@ -345,6 +493,7 @@ pub trait Responder: Send + Sync {
         session_id: &str,
         expected_tool_call_id: Option<&str>,
         answer: String,
+        session_scope: bool,
     ) -> Result<RespondAndResumeOutcome, ResponderError>;
 }
 
@@ -378,6 +527,15 @@ impl EngineResponder {
     }
 }
 
+/// 安全拒绝恢复时必须给等待中的渲染流一个终结事件：只写日志直接
+/// return 的话，事件通道不会再有任何输出，桥接的 stream_execution
+/// 永远收不到事件、会话 busy 标记无法释放——用户侧就是"选了没反应、
+/// 卡死到 /new"。`AgentEvent::Error` 会被渲染为 "Error: …" 并正常结束
+/// 本轮，会话保持可继续对话。
+async fn refuse_resume(mpsc_tx: &tokio::sync::mpsc::Sender<AgentEvent>, message: String) {
+    let _ = mpsc_tx.send(AgentEvent::Error { message }).await;
+}
+
 #[async_trait::async_trait]
 impl Responder for EngineResponder {
     async fn respond_and_resume(
@@ -385,6 +543,7 @@ impl Responder for EngineResponder {
         session_id: &str,
         expected_tool_call_id: Option<&str>,
         answer: String,
+        session_scope: bool,
     ) -> Result<RespondAndResumeOutcome, ResponderError> {
         let response_guard = acquire_pending_response_guard(session_id).await;
         let current =
@@ -400,6 +559,21 @@ impl Responder for EngineResponder {
             return Err(ResponderError::PendingQuestionChanged);
         }
         validate_pending_response(pending, &answer).map_err(ResponderError::InvalidResponse)?;
+
+        // 聊天渠道敲进来的 "1"/"2"（Approve/Deny）必须走 typed 提交路径：
+        // legacy 文本路径写入的 re-execute 标记不带 generation 绑定，恢复端
+        // 会以 "typed permission replay is missing its generation marker"
+        // 拒绝重放并直接返回——不产生任何事件、渲染任务永远收不到输出，
+        // 会话表现为"选了没反应、卡死到 /new"。这里像 HTTP 决策端点一样
+        // 合成结构化 AllowOnce/DenyOnce 回执（授权在响应 CAS 之前安装）。
+        let typed_permission = typed_permission_receipt(
+            &self.ctx.permission_checker,
+            session_id,
+            &current,
+            pending,
+            &answer,
+            session_scope,
+        );
 
         let port = ConnectResumePort {
             ctx: self.ctx.clone(),
@@ -431,14 +605,32 @@ impl Responder for EngineResponder {
             reasoning_effort: None,
         };
 
-        let submission = submit_pending_response_checked_guarded(
-            &self.ctx.session_repo,
-            input,
-            expected_tool_call_id.map(str::to_string),
-            &response_guard,
-        )
-        .await;
-        let (session, _submitted_answer, plan_mode_transition, permission_grants) = match submission
+        let submission = match typed_permission.as_ref() {
+            Ok(Some(receipt)) => {
+                submit_pending_permission_response_checked_guarded(
+                    &self.ctx.session_repo,
+                    input,
+                    expected_tool_call_id.map(str::to_string),
+                    receipt.clone(),
+                    &response_guard,
+                )
+                .await
+            }
+            Ok(None) => {
+                submit_pending_response_checked_guarded(
+                    &self.ctx.session_repo,
+                    input,
+                    expected_tool_call_id.map(str::to_string),
+                    &response_guard,
+                )
+                .await
+            }
+            Err(reason) => {
+                handoff.abandon().await;
+                return Err(ResponderError::InvalidResponse(reason.clone()));
+            }
+        };
+        let (mut session, _submitted_answer, plan_mode_transition, permission_grants) = match submission
         {
             Ok(submission) => submission,
             Err(error) => {
@@ -449,14 +641,36 @@ impl Responder for EngineResponder {
 
         // Mirrors `handlers::agent::respond::handlers::submit`: record any
         // permission grant so the resumed re-execution of the gated tool
-        // passes the check without re-prompting.
+        // passes the check without re-prompting. Typed decisions already
+        // installed their exact scope/generation before the response CAS.
+        let typed_permission_response = matches!(typed_permission, Ok(Some(_)));
         for (perm_type, resource) in &permission_grants {
-            if let Some(request_id) = session.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY) {
-                self.ctx.permission_checker.grant_once(
-                    session_id,
-                    request_id,
-                    *perm_type,
-                    resource.clone(),
+            if !typed_permission_response {
+                if let Some(request_id) = session.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY) {
+                    self.ctx.permission_checker.grant_once(
+                        session_id,
+                        request_id,
+                        *perm_type,
+                        resource.clone(),
+                    );
+                }
+            }
+        }
+
+        // "接下来都允许"（权限问题专属）：把本会话切到 Auto 审批模式，
+        // 后续同类/异类操作都不再逐条询问。必须**直存磁盘**（镜像 PATCH
+        // 端点）：后续 resume 流程的 save_and_cache 带
+        // adopt_fresher_disk_permission_posture 合并，会把"与磁盘不同的
+        // 模式"当作过期写入回退掉——只改内存副本会被磁盘旧状态覆盖。
+        // 非权限澄清不适用（用户只是在回答模型的问题，没有提权意图）。
+        if session_scope && typed_permission_response {
+            apply_session_auto_approve(&mut session);
+            session.updated_at = chrono::Utc::now();
+            if let Err(error) = self.ctx.session_repo.storage().save_session(&session).await {
+                tracing::warn!(
+                    %session_id,
+                    %error,
+                    "connect: failed to persist session approval mode"
                 );
             }
         }
@@ -497,6 +711,173 @@ impl Responder for EngineResponder {
             ),
         }
     }
+}
+
+/// 为聊天文本应答（"1"/"2"/"允许"/"拒绝" 映射到 "Approve"/"Deny" 之后）
+/// 合成权限决策的结构化回执，与 HTTP 决策端点的 AllowOnce/DenyOnce 处理
+/// 一致：先安装 one-shot 授权（绑定 generation），再记录决策、取回执。
+/// `session_scope` 为真时（"接下来都允许"类短语）额外安装一个会话范围
+/// 的类型化授权，本会话后续同类操作不再询问——本次仍按 AllowOnce 提交。
+/// `Ok(None)` 表示当前待答问题不是权限请求（普通澄清），调用方保持
+/// legacy 文本提交路径不变；`Err` 表示安装失败，应作为可见错误返回。
+#[allow(clippy::too_many_arguments)]
+fn typed_permission_receipt(
+    checker: &Arc<dyn bamboo_tools::permission::PermissionChecker>,
+    session_id: &str,
+    session: &bamboo_agent_core::Session,
+    pending: &bamboo_agent_core::PendingQuestion,
+    answer: &str,
+    session_scope: bool,
+) -> Result<Option<PermissionDecisionReceipt>, String> {
+    let decision_kind = match answer.trim().to_ascii_lowercase().as_str() {
+        "approve" | "allow" | "允许" | "同意" | "批准" => PermissionDecisionKind::AllowOnce,
+        "deny" | "reject" | "拒绝" | "不允许" => PermissionDecisionKind::DenyOnce,
+        _ => return Ok(None),
+    };
+    let Some(config) = checker.permission_config() else {
+        return Ok(None);
+    };
+    let in_memory = config.pending_request(session_id, &pending.tool_call_id);
+    let request =
+        crate::handlers::agent::respond::handlers::pending::resolve_pending_interaction(
+            session,
+            pending,
+            in_memory,
+        )
+        .permission_request
+        .filter(|request| request.request_id == pending.tool_call_id);
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    // 宿主 Supervisor 会话（默认根编排会话）上的审批必须走正式 typed
+    // 决策端点：其重放绑定要求正式安装 supervisor 授权，聊天文本应答
+    // 不得代为铸造回执（supervisor_approval_tests::
+    // connect_supervisor_text_answer_cannot_replace_a_typed_receipt）。
+    // 普通用户会话（聊天渠道桥接创建的会话）没有该权威记录，不受限。
+    let supervisor_bound = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.tool_call_id.as_deref() == Some(pending.tool_call_id.as_str()))
+        .and_then(|message| message.metadata.as_ref())
+        .and_then(|metadata| {
+            metadata.get(
+                bamboo_agent_core::tools::ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY,
+            )
+        })
+        .is_some();
+    if supervisor_bound {
+        return Ok(None);
+    }
+    if !request.allowed_decisions.contains(&decision_kind) {
+        return Err(format!(
+            "decision {decision_kind:?} is not allowed for this request"
+        ));
+    }
+    if decision_kind == PermissionDecisionKind::AllowOnce {
+        config.grant_once_for_generation(
+            session_id,
+            &request.request_id,
+            &request.request_generation,
+            request.permission_type,
+            request.resource.clone(),
+        )?;
+    }
+    if session_scope {
+        // 会话级持续授权（"接下来都允许"）：从建议 matcher 里取最宽的
+        // 一个（conservative_matchers 按窄→宽排序，末位是命令前缀/目录
+        // 子树/HTTP origin），没有建议时退回精确资源匹配。安装失败不
+        // 阻塞本次批准——本次仍按 AllowOnce 正常放行。
+        let matcher = request
+            .suggested_matchers
+            .iter()
+            .rev()
+            .find(|matcher| matcher.validate(request.permission_type).is_ok())
+            .cloned()
+            .unwrap_or(PermissionMatcher {
+                id: "exact_resource".to_string(),
+                kind: PermissionMatcherKind::ExactResource,
+                value: request.resource.clone(),
+            });
+        if let Err(error) = config.grant_typed_scoped_session_permission(
+            session_id,
+            request.permission_type,
+            matcher,
+        ) {
+            tracing::warn!("connect: session-scope permission grant failed: {error}");
+        }
+    }
+    let decision = PermissionDecision {
+        request_id: request.request_id.clone(),
+        request_generation: request.request_generation.clone(),
+        decision: decision_kind,
+        matcher_id: None,
+        expected_policy_revision: None,
+        confirm_global: false,
+    };
+    config.record_decision(session_id, decision.clone())?;
+    match config.decision_receipt(session_id, &decision.request_id, &decision.request_generation) {
+        Some(receipt) => Ok(Some(receipt)),
+        None => Err("permission decision receipt was not recorded".to_string()),
+    }
+}
+
+/// "都允许"的会话级开关：把本会话的请求权限模式切到 Auto——引擎的
+/// per-session 机制（`ToolExecutionSessionFlags::from_session_and_configured_mode`
+/// 读取），后续本会话的工具调用抑制审批提示；硬拒绝（危险命令、平台/
+/// 持久化拒绝规则）与计划模式边界仍然生效。/new 或会话轮换后回到默认。
+/// 镜像 `handlers::agent::sessions::handlers::crud::patch` 的权限模式变更
+/// （typed 模式 + legacy 镜像原子更新 + 审计元数据 + metadata_version）。
+pub(crate) fn apply_session_auto_approve(session: &mut bamboo_agent_core::Session) {
+    use bamboo_domain::SessionPermissionMode;
+    apply_session_permission_mode(session, SessionPermissionMode::Auto);
+}
+
+/// 切换本会话的请求权限模式（Auto = 不再逐条询问；Default = 恢复），
+/// 记录审计元数据并提升 `metadata_version`，使运行中回合的磁盘审计
+/// 刷新（`fresher_disk_permission_audit`）能在下一回合边界生效。
+pub(crate) fn apply_session_permission_mode(
+    session: &mut bamboo_agent_core::Session,
+    mode: bamboo_domain::SessionPermissionMode,
+) {
+    use bamboo_domain::{AgentRuntimeState, PermissionAuditSeed};
+    let runtime = session
+        .agent_runtime_state
+        .get_or_insert_with(AgentRuntimeState::default);
+    if runtime.effective_permission_mode() == mode {
+        return;
+    }
+    runtime.set_permission_mode(mode);
+    let configured = bamboo_domain::PermissionMode::Default;
+    let resolution = bamboo_domain::resolve_permission_mode(mode, configured);
+    let transitioned_at = chrono::Utc::now().to_rfc3339();
+    let _ = bamboo_domain::record_permission_audit(
+        &mut session.metadata,
+        &PermissionAuditSeed::bamboo_runtime(0, resolution),
+        Some(transitioned_at.as_str()),
+    );
+    session.metadata_version = session.metadata_version.saturating_add(1);
+}
+
+/// 单独发送的"接下来都允许"类消息（不是对审批弹窗的回复）也当作会话
+/// 指令处理：消息很短且整体就是持续授权/恢复确认短语。`Some(true)` 切
+/// Auto，`Some(false)` 恢复逐条确认，`None` 不是指令（进正常消息流）。
+pub fn standalone_session_scope_command(text: &str) -> Option<bool> {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > 12 {
+        return None;
+    }
+    if wants_session_scope(trimmed) {
+        return Some(true);
+    }
+    const RESTORE_PHRASES: &[&str] = &[
+        "恢复确认", "恢复询问", "重新询问", "恢复逐条", "每次都问", "恢复默认", "ask again",
+    ];
+    let lower = trimmed.to_lowercase();
+    if RESTORE_PHRASES.iter().any(|phrase| lower.contains(phrase)) {
+        return Some(false);
+    }
+    None
 }
 
 fn plan_mode_transition_event(
@@ -657,6 +1038,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                     %session_id,
                     "connect found orphaned permission replay generation marker; refusing to resume"
                 );
+                refuse_resume(
+                    &mpsc_tx,
+                    "内部状态异常（权限重放标记孤立），本轮已停止；重新发送消息即可继续".to_string(),
+                )
+                .await;
                 return;
             }
             consume_pending_clarification_resume(&mut session);
@@ -715,6 +1101,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                         tool_call_id = %reexecute_tool_call_id,
                         "connect typed permission replay is missing its generation marker; refusing to resume"
                     );
+                    refuse_resume(
+                        &mpsc_tx,
+                        "权限审批记录不完整，本轮已停止；重新发送消息即可继续".to_string(),
+                    )
+                    .await;
                     return;
                 }
                 let tool_call = replay_target.tool_call().clone();
@@ -725,6 +1116,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                 });
                 if replay_owner.is_none() && reexecute_request_generation.is_some() {
                     tracing::error!(%session_id, %tool_name, "connect approved replay has no registered execution owner; markers retained");
+                    refuse_resume(
+                        &mpsc_tx,
+                        format!("审批通过的工具「{tool_name}」当前不可用，本轮已停止"),
+                    )
+                    .await;
                     return;
                 }
                 let executing_supervisor = match validate_permission_replay_authority(
@@ -735,6 +1131,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                     Ok(observation) => observation,
                     Err(error) => {
                         tracing::error!(%session_id, %error, "Supervisor approval replay binding failed closed");
+                        refuse_resume(
+                            &mpsc_tx,
+                            format!("审批重放校验失败，本轮已停止（{error}）"),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -759,6 +1160,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                             %error,
                             "connect approval replay posture refresh failed closed"
                         );
+                        refuse_resume(
+                            &mpsc_tx,
+                            format!("权限状态刷新失败，本轮已停止（{error}）"),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -803,6 +1209,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                                 tool_call_id = %reexecute_tool_call_id,
                                 "connect typed approval replay has no permission configuration; refusing to resume"
                             );
+                            refuse_resume(
+                                &mpsc_tx,
+                                "权限配置不可用，已批准的操作无法继续执行".to_string(),
+                            )
+                            .await;
                             return;
                         };
                         if let Err(error) = restore_permission_replay_authorization(
@@ -817,6 +1228,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                                 %error,
                                 "connect typed approval replay authorization recovery failed closed"
                             );
+                            refuse_resume(
+                                &mpsc_tx,
+                                format!("审批授权恢复失败，本轮已停止（{error}）"),
+                            )
+                            .await;
                             return;
                         }
                         let is_mutating = bamboo_tools::orchestrator::classify_tool(&tool_name)
@@ -911,6 +1327,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                                             %error,
                                             "connect additional permission replay could not be re-parked; refusing to resume"
                                         );
+                                        refuse_resume(
+                                            &mpsc_tx,
+                                            format!("后续权限审批写入失败，本轮已停止（{error}）"),
+                                        )
+                                        .await;
                                         return;
                                     }
                                 }
@@ -959,12 +1380,22 @@ impl ResumeExecutionPort for ConnectResumePort {
                         tool_call_id = %reexecute_tool_call_id,
                         "connect approved tool replay result target changed unexpectedly; refusing to resume"
                     );
+                    refuse_resume(
+                        &mpsc_tx,
+                        "会话状态与审批记录不一致，本轮已停止；重新发送消息即可继续".to_string(),
+                    )
+                    .await;
                     return;
                 }
                 if blocked_by_tool_authority {
                     if let Err(error) = ctx.session_repo.save_replay_resolution(&mut session).await
                     {
                         tracing::error!(%session_id, %error, "connect blocked approval replay result failed to persist; refusing to resume");
+                        refuse_resume(
+                            &mpsc_tx,
+                            format!("审批结果保存失败，本轮已停止（{error}）"),
+                        )
+                        .await;
                         return;
                     }
                 } else {
@@ -977,6 +1408,11 @@ impl ResumeExecutionPort for ConnectResumePort {
                     request_generation = ?reexecute_request_generation,
                     "connect permission replay target missing or generation-mismatched; markers retained and resume refused"
                 );
+                refuse_resume(
+                    &mpsc_tx,
+                    "找不到待重放的审批目标（可能已被新的提问取代），本轮已停止".to_string(),
+                )
+                .await;
                 return;
             }
 
@@ -1142,7 +1578,7 @@ mod tests {
         let fixture = Box::pin(Fixture::pending()).await;
         let responder = EngineResponder::new(supervisor_context(&fixture.state));
         let outcome = responder
-            .respond_and_resume(&fixture.original.session_id, Some(CALL), "Approve".into())
+            .respond_and_resume(&fixture.original.session_id, Some(CALL), "Approve".into(), false)
             .await
             .unwrap();
         assert!(matches!(outcome, RespondAndResumeOutcome::Resumed(_)));
@@ -1159,6 +1595,300 @@ mod tests {
             .as_ref()
             .unwrap()
             .get("permission_decision_receipt")
+            .is_none());
+    }
+
+    #[test]
+    fn typed_permission_receipt_synthesizes_generation_bound_receipt() {
+        use bamboo_agent_core::PendingQuestionSource;
+        use bamboo_tools::permission::{
+            ConfigPermissionChecker, PermissionConfig, PermissionDecisionKind,
+            PermissionReasonCode, PermissionRequest, PermissionType, RiskLevel,
+        };
+
+        // 普通用户会话（非 supervisor 会话）：文本 "Approve"/"允许"/"拒绝"
+        // 必须合成带 generation 绑定的 typed 回执并安装授权——这是聊天渠道
+        // 审批 "选了没反应、卡死" 死锁（missing generation marker）的回归
+        // 测试。权限请求是一次性的（决策即消费），每个用例全新注册。
+        let fresh_setup = || {
+            let config = Arc::new(PermissionConfig::new());
+            config.register_pending_request(PermissionRequest {
+                request_id: "call-1".to_string(),
+                request_generation: "generation-7".to_string(),
+                session_id: "session".to_string(),
+                workspace_path: None,
+                tool_name: "Bash".to_string(),
+                permission_type: PermissionType::ExecuteCommand,
+                resource: "current-command".to_string(),
+                operation_summary: "run a command".to_string(),
+                risk_level: RiskLevel::Medium,
+                reason_code: PermissionReasonCode::ConfiguredAlwaysAsk,
+                effective_mode: bamboo_domain::PermissionMode::Default,
+                bypass_requested: false,
+                auto_approve_requested: false,
+                policy_revision: 0,
+                matched_rule: None,
+                allowed_decisions: vec![
+                    PermissionDecisionKind::AllowOnce,
+                    PermissionDecisionKind::DenyOnce,
+                ],
+                suggested_matchers: Vec::new(),
+            });
+            let checker: Arc<dyn bamboo_tools::permission::PermissionChecker> =
+                Arc::new(ConfigPermissionChecker::new(config.clone()));
+            let pending = bamboo_agent_core::PendingQuestion {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "Bash".to_string(),
+                question: "Permission required".to_string(),
+                options: vec!["Approve".to_string(), "Deny".to_string()],
+                allow_custom: false,
+                source: PendingQuestionSource::PauseTool,
+            };
+            let session = Session::new("session", "model");
+            (config, checker, session, pending)
+        };
+
+        for (answer, expected_kind) in [
+            ("Approve", PermissionDecisionKind::AllowOnce),
+            ("允许", PermissionDecisionKind::AllowOnce),
+            ("拒绝", PermissionDecisionKind::DenyOnce),
+        ] {
+            let (_config, checker, session, pending) = fresh_setup();
+            let receipt =
+                typed_permission_receipt(&checker, "session", &session, &pending, answer, false)
+                    .expect("receipt synthesis succeeds")
+                    .expect("permission ask yields a typed receipt");
+            assert_eq!(receipt.session_id, "session");
+            assert_eq!(receipt.decision.request_id, "call-1");
+            assert_eq!(receipt.decision.request_generation, "generation-7");
+            assert_eq!(receipt.decision.decision, expected_kind);
+        }
+
+        // 非权限词表之外的答案不是权限决策，回落 legacy 路径。
+        let (_config, checker, session, pending) = fresh_setup();
+        assert!(
+            typed_permission_receipt(&checker, "session", &session, &pending, "Banana", false)
+                .expect("no error")
+                .is_none()
+        );
+
+        // 合成授权后，generation 绑定的 one-shot 授权对重放校验可见。
+        let (config, checker, session, pending) = fresh_setup();
+        let receipt =
+            typed_permission_receipt(&checker, "session", &session, &pending, "Approve", false)
+                .expect("receipt synthesis succeeds")
+                .expect("permission ask yields a typed receipt");
+        assert_eq!(receipt.decision.decision, PermissionDecisionKind::AllowOnce);
+        assert!(config.decision_receipt("session", "call-1", "generation-7").is_some());
+        // 单次批准不安装会话级授权。
+        assert!(!config.is_scoped_session_granted(
+            "session",
+            bamboo_tools::permission::PermissionType::ExecuteCommand,
+            "current-command"
+        ));
+    }
+
+    #[test]
+    fn typed_permission_receipt_session_scope_installs_session_grant() {
+        use bamboo_tools::permission::PermissionType;
+
+        // "接下来都允许"：本次仍是 AllowOnce 回执，同时安装会话级授权，
+        // 本会话后续同类资源（无建议 matcher 时精确匹配）不再询问。
+        let (config, checker, session, pending) = session_scope_setup();
+        let receipt =
+            typed_permission_receipt(&checker, "session", &session, &pending, "Approve", true)
+                .expect("receipt synthesis succeeds")
+                .expect("permission ask yields a typed receipt");
+        assert_eq!(receipt.decision.decision, PermissionDecisionKind::AllowOnce);
+        assert!(config.is_scoped_session_granted("session", PermissionType::ExecuteCommand, "current-command"));
+    }
+
+    #[test]
+    fn standalone_session_scope_command_detects_phrases() {
+        assert_eq!(standalone_session_scope_command("接下来都允许"), Some(true));
+        assert_eq!(standalone_session_scope_command("都允许"), Some(true));
+        assert_eq!(standalone_session_scope_command("恢复确认"), Some(false));
+        assert_eq!(standalone_session_scope_command("每次都问"), Some(false));
+        // 长消息里包含短语不算指令，正常进消息流。
+        assert_eq!(
+            standalone_session_scope_command("帮我看看这个问题：总是允许执行吗"),
+            None
+        );
+        assert_eq!(standalone_session_scope_command("普通消息"), None);
+    }
+
+    #[test]
+    fn wants_session_scope_matches_persistent_allow_phrases() {
+        for text in [
+            "接下来都允许",
+            "都允许",
+            "全部允许",
+            "以后都允许",
+            "总是允许",
+            "不再询问了",
+            "别问了",
+            "always allow",
+        ] {
+            assert!(wants_session_scope(text), "should match: {text}");
+        }
+        for text in [
+            "以后都不允许",
+            "全部拒绝",
+            "不允许",
+            "1",
+            "允许",
+            "拒绝",
+            "帮我写个脚本，总是允许执行的那种说明文字很长很长很长很长很长很长很长很长很长很长很长很长很长很长",
+        ] {
+            assert!(!wants_session_scope(text), "should not match: {text}");
+        }
+    }
+
+    #[test]
+    fn match_text_answer_maps_session_scope_phrase_to_affirmative() {
+        let pending = ask(vec!["Approve", "Deny"], false);
+        assert_eq!(
+            match_text_answer(&pending, "接下来都允许").as_deref(),
+            Some("Approve")
+        );
+        // OPEN 问题自由文本优先，不劫持为选项。
+        let open = ask(vec!["A", "B"], true);
+        assert_eq!(match_text_answer(&open, "接下来都允许").as_deref(), Some("接下来都允许"));
+    }
+
+    #[test]
+    fn apply_session_auto_approve_switches_session_mode() {
+        use bamboo_agent_core::tools::ToolExecutionSessionFlags;
+        use bamboo_domain::SessionPermissionMode;
+
+        // "都允许"应把本会话切到 Auto：后续工具调用的会话旗标解析为
+        // auto_approve（抑制审批提示），且幂等（重复调用不叠加）。
+        let mut session = Session::new("session", "model");
+        let before = session.metadata_version;
+        apply_session_auto_approve(&mut session);
+        let requested = session
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode());
+        assert_eq!(requested, Some(SessionPermissionMode::Auto));
+        assert!(session.metadata_version > before);
+        let flags =
+            ToolExecutionSessionFlags::from_session_and_configured_mode(&session, Default::default());
+        assert!(flags.auto_approve_permissions);
+        assert!(!flags.plan_read_only);
+
+        let version_after_first = session.metadata_version;
+        apply_session_auto_approve(&mut session);
+        assert_eq!(session.metadata_version, version_after_first);
+    }
+
+    /// 与 `typed_permission_receipt_synthesizes_generation_bound_receipt`
+    /// 的 fresh_setup 相同，仅隔离复用。
+    fn session_scope_setup(
+    ) -> (
+        Arc<bamboo_tools::permission::PermissionConfig>,
+        Arc<dyn bamboo_tools::permission::PermissionChecker>,
+        Session,
+        bamboo_agent_core::PendingQuestion,
+    ) {
+        use bamboo_agent_core::PendingQuestionSource;
+        use bamboo_tools::permission::{
+            ConfigPermissionChecker, PermissionConfig, PermissionDecisionKind,
+            PermissionReasonCode, PermissionRequest, PermissionType, RiskLevel,
+        };
+        let config = Arc::new(PermissionConfig::new());
+        config.register_pending_request(PermissionRequest {
+            request_id: "call-1".to_string(),
+            request_generation: "generation-7".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            tool_name: "Bash".to_string(),
+            permission_type: PermissionType::ExecuteCommand,
+            resource: "current-command".to_string(),
+            operation_summary: "run a command".to_string(),
+            risk_level: RiskLevel::Medium,
+            reason_code: PermissionReasonCode::ConfiguredAlwaysAsk,
+            effective_mode: bamboo_domain::PermissionMode::Default,
+            bypass_requested: false,
+            auto_approve_requested: false,
+            policy_revision: 0,
+            matched_rule: None,
+            allowed_decisions: vec![
+                PermissionDecisionKind::AllowOnce,
+                PermissionDecisionKind::DenyOnce,
+            ],
+            suggested_matchers: Vec::new(),
+        });
+        let checker: Arc<dyn bamboo_tools::permission::PermissionChecker> =
+            Arc::new(ConfigPermissionChecker::new(config.clone()));
+        let pending = bamboo_agent_core::PendingQuestion {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "Bash".to_string(),
+            question: "Permission required".to_string(),
+            options: vec!["Approve".to_string(), "Deny".to_string()],
+            allow_custom: false,
+            source: PendingQuestionSource::PauseTool,
+        };
+        let session = Session::new("session", "model");
+        (config, checker, session, pending)
+    }
+
+    #[test]
+    fn typed_permission_receipt_refuses_supervisor_bound_ask() {
+        use bamboo_agent_core::tools::ExecutingSupervisorObservation;
+        use bamboo_tools::permission::{
+            ConfigPermissionChecker, PermissionConfig, PermissionDecisionKind, PermissionReasonCode,
+            PermissionRequest, PermissionType, RiskLevel,
+        };
+
+        // 宿主 Supervisor 会话上的待答问题带 executing-supervisor 权威
+        // 记录：聊天文本应答不得代铸 typed 回执（须走正式决策端点）。
+        let config = Arc::new(PermissionConfig::new());
+        config.register_pending_request(PermissionRequest {
+            request_id: "call-1".to_string(),
+            request_generation: "generation-7".to_string(),
+            session_id: "session".to_string(),
+            workspace_path: None,
+            tool_name: "Bash".to_string(),
+            permission_type: PermissionType::ExecuteCommand,
+            resource: "current-command".to_string(),
+            operation_summary: "run a command".to_string(),
+            risk_level: RiskLevel::Medium,
+            reason_code: PermissionReasonCode::ConfiguredAlwaysAsk,
+            effective_mode: bamboo_domain::PermissionMode::Default,
+            bypass_requested: false,
+            auto_approve_requested: false,
+            policy_revision: 0,
+            matched_rule: None,
+            allowed_decisions: vec![
+                PermissionDecisionKind::AllowOnce,
+                PermissionDecisionKind::DenyOnce,
+            ],
+            suggested_matchers: Vec::new(),
+        });
+        let checker: Arc<dyn bamboo_tools::permission::PermissionChecker> =
+            Arc::new(ConfigPermissionChecker::new(config));
+
+        let pending = bamboo_agent_core::PendingQuestion {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "Bash".to_string(),
+            question: "Permission required".to_string(),
+            options: vec!["Approve".to_string(), "Deny".to_string()],
+            allow_custom: false,
+            source: bamboo_agent_core::PendingQuestionSource::PauseTool,
+        };
+        let mut session = Session::new("session", "model");
+        let mut result = Message::tool_result("call-1", "{}".to_string());
+        result.metadata = Some(serde_json::json!({
+            ExecutingSupervisorObservation::PERMISSION_REPLAY_METADATA_KEY: {
+                "session_id": "supervisor-default",
+                "version": 1
+            }
+        }));
+        session.add_message(result);
+
+        assert!(typed_permission_receipt(&checker, "session", &session, &pending, "Approve", false)
+            .expect("no error")
             .is_none());
     }
 
@@ -1350,11 +2080,68 @@ mod tests {
 
     #[test]
     fn format_ask_text_numbers_every_option() {
-        let pending = ask(vec!["Approve", "Deny"], false);
+        let mut pending = ask(vec!["Approve", "Deny"], false);
+        pending.question = "**Permission required**\n\nThe `Bash` tool needs approval to Execute shell commands on:\n\n`cargo build`".to_string();
         let text = format_ask_text(&pending);
-        assert!(text.contains("1. Approve"));
-        assert!(text.contains("2. Deny"));
+        // 权限提示（固定 Approve/Deny 两项）问题正文汉化，展示中文标签，
+        // 并提示 "都允许" 的会话级授权用法。
+        assert!(text.contains("需要权限确认：执行命令"));
+        assert!(text.contains("cargo build"));
+        assert!(text.contains("Bash"));
+        assert!(text.contains("1. 允许"));
+        assert!(text.contains("2. 拒绝"));
+        assert!(text.contains("都允许"));
         assert!(!text.contains("reply with your own answer"));
+        assert!(!text.contains("Permission required"));
+    }
+
+    #[test]
+    fn translate_permission_question_handles_unknown_shapes() {
+        // 非权限模板原样返回；未知动作退化为通用中文格式。
+        assert_eq!(translate_permission_question("随便一个问题"), "随便一个问题");
+        let unknown = translate_permission_question(
+            "**Permission required**\n\nThe `X` tool needs approval to Do something exotic on:\n\n`res`",
+        );
+        assert!(unknown.contains("需要权限确认"));
+        assert!(unknown.contains("Do something exotic"));
+    }
+
+    #[test]
+    fn match_text_answer_supports_skip_and_cancel_intents() {
+        // 中文回复命中英文选项，英文回复命中中文选项。
+        let english = ask(vec!["Proceed", "Skip this file", "Cancel"], false);
+        assert_eq!(
+            match_text_answer(&english, "跳过").as_deref(),
+            Some("Skip this file")
+        );
+        assert_eq!(
+            match_text_answer(&english, "cancel").as_deref(),
+            Some("Cancel")
+        );
+        let chinese = ask(vec!["继续执行", "跳过这个", "取消任务"], false);
+        assert_eq!(
+            match_text_answer(&chinese, "skip").as_deref(),
+            Some("跳过这个")
+        );
+        // 通用子串层：短回复唯一命中。
+        assert_eq!(
+            match_text_answer(&chinese, "继续").as_deref(),
+            Some("继续执行")
+        );
+        // 歧义（"取消" 命中 "取消任务" 唯一？——"取消任务" 含 "取消"，唯一命中 ✓）。
+        assert_eq!(
+            match_text_answer(&chinese, "取消").as_deref(),
+            Some("取消任务")
+        );
+    }
+
+    #[test]
+    fn format_ask_text_keeps_custom_options_verbatim() {
+        let pending = ask(vec!["OK", "Need changes"], false);
+        let text = format_ask_text(&pending);
+        assert!(text.contains("1. OK"));
+        assert!(text.contains("2. Need changes"));
+        assert!(text.contains("回复数字即可选择"));
     }
 
     #[test]

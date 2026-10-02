@@ -22,6 +22,15 @@ pub struct Capabilities {
     pub images: bool,
     /// Sending file attachments.
     pub files: bool,
+    /// 适配器支持出站附件投递：解析回复文本中的 `[SEND_FILE: 绝对路径]`
+    /// 标记行，把对应本地文件上传并发送给用户（标记行本身不展示）。
+    /// bridge 会在此能力开启时向新会话注入一次约定说明；不支持的平台
+    /// 原样忽略标记文本。目前仅微信（iLink）适配器开启。
+    pub attachments: bool,
+    /// 是否向聊天渠道逐条推送工具执行进度行（`⚙ 工具名: 参数摘要`）。
+    /// 关闭后用户只看到最终回复、待答问题和错误提示——适合 IM 场景
+    /// （微信）：中间过程的命令行噪音会淹没正文。其余平台保持开启。
+    pub tool_progress: bool,
 }
 
 /// Platform-opaque context handed back unmodified to `Platform::reply`/`edit`.

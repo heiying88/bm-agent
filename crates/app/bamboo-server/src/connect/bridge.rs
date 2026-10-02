@@ -158,6 +158,9 @@ enum AskResolution {
     Answer {
         answer: String,
         expected_tool_call_id: String,
+        /// 回复表达了"接下来都允许"类持续授权意图（权限问题专属），
+        /// 提交本次答案的同时安装会话级授权。
+        session_scope: bool,
     },
     /// `/new`, session rotation, or an explicit clear invalidated the ask
     /// before it was answered — the waiting render task must stop rendering
@@ -366,6 +369,40 @@ impl ConnectBridge {
             .is_some_and(|state| state.pending_ask.is_some())
     }
 
+    /// 切换本聊天当前会话的审批模式（"接下来都允许" → Auto；"恢复确认"
+    /// → Default）。镜像 PATCH 端点的写法：**直存磁盘**（`storage()
+    /// .save_session`），不能走 `save_and_cache`——那条路径的
+    /// merge-on-write 会把"与磁盘不同的模式"当作过期写入回退掉
+    /// （`adopt_fresher_disk_permission_posture`）。直存后：运行中的回合
+    /// 在下一工具边界从磁盘审计刷新拿到新模式，之后的运行从加载时就
+    /// 生效；磁盘 updated_at 更新保证 `load_merged` 优先读存储。
+    async fn set_session_approval_mode(&self, key: &str, auto: bool) -> Result<(), String> {
+        let session_id = self
+            .session_id_for_key(key)
+            .await
+            .ok_or_else(|| "当前聊天还没有会话，先发一条任务消息".to_string())?;
+        let mut session = self
+            .ctx
+            .session_repo
+            .load_merged(&session_id)
+            .await
+            .ok_or_else(|| "会话不存在或已失效，发送 /new 开始新会话".to_string())?;
+        let mode = if auto {
+            bamboo_domain::SessionPermissionMode::Auto
+        } else {
+            bamboo_domain::SessionPermissionMode::Default
+        };
+        approvals::apply_session_permission_mode(&mut session, mode);
+        session.updated_at = chrono::Utc::now();
+        self.ctx
+            .session_repo
+            .storage()
+            .save_session(&session)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     /// If `key` has a parked ask AND `resolve` matches it, atomically clears
     /// the parked ask + its resolver (so a concurrent duplicate resolution —
     /// e.g. a button press racing a text reply — finds nothing left to
@@ -515,17 +552,19 @@ impl ConnectBridge {
         // Ask-resolution fast path (issue #458): a parked ask takes priority
         // over normal busy/queue routing, even while `busy` is still true —
         // the run backing it is genuinely suspended waiting for exactly this
-        // reply, so it must never sit behind the FIFO queue. A non-matching
-        // reply on a CLOSED ask (no free text allowed) falls through to the
-        // normal busy/queue handling below, exactly like any other message.
+        // reply, so it must never sit behind the FIFO queue.
         if let Some((answer, expected_tool_call_id, sender)) = self
             .try_resolve_pending_ask(&key, |ask| approvals::match_text_answer(ask, &msg.text))
             .await
         {
+            // "接下来都允许"类短语：本次按匹配到的选项应答，并附带会话级
+            // 持续授权意图（由 EngineResponder 安装）。
+            let session_scope = approvals::wants_session_scope(&msg.text);
             let _ = sender
                 .send(AskResolution::Answer {
                     answer,
                     expected_tool_call_id,
+                    session_scope,
                 })
                 .await;
             return;
@@ -538,6 +577,44 @@ impl ConnectBridge {
         if command.eq_ignore_ascii_case("/new") && self.has_pending_ask(&key).await {
             self.rotate_session(&key).await;
             reply_text(&platform, &msg.reply_ctx, "Started a new session.").await;
+            return;
+        }
+
+        // 有 CLOSED 待答问题挂着时，识别不了的回复不能进普通队列——队列
+        // 要等当前问题被正确回答才会处理，用户侧就是"发什么都没反应、
+        // 卡住"。直接提示怎么答，保持会话可继续。（OPEN 问题不会走到这：
+        // 自由文本总能匹配上。）
+        if self.has_pending_ask(&key).await {
+            reply_text(
+                &platform,
+                &msg.reply_ctx,
+                "这条回复我没看懂，当前有一个问题在等你选择：回复数字（如 1）或选项文字；\
+                 想本次会话内不再逐条询问，回复\"都允许\"；发送 /new 放弃当前任务开新会话。",
+            )
+            .await;
+            return;
+        }
+
+        // 单独发送的"接下来都允许"/"恢复确认"是会话级权限指令，不进模型：
+        // 用户在没有审批弹窗时也会用这句话表达"别再问了"。切换本会话
+        // 审批模式并回执；运行中的回合会在下一工具边界从磁盘审计刷新
+        // 中拿到新模式。
+        if let Some(auto) = approvals::standalone_session_scope_command(&msg.text) {
+            match self.set_session_approval_mode(&key, auto).await {
+                Ok(()) => {
+                    let notice = if auto {
+                        "✅ 好的，本会话内后续操作不再逐条确认；发送 /new 开新会话，\
+                         或回复\"恢复确认\"可恢复逐条询问。"
+                    } else {
+                        "✅ 已恢复逐条确认。"
+                    };
+                    reply_text(&platform, &msg.reply_ctx, notice).await;
+                }
+                Err(error) => {
+                    reply_text(&platform, &msg.reply_ctx, format!("切换审批模式失败：{error}"))
+                        .await;
+                }
+            }
             return;
         }
 
@@ -643,6 +720,8 @@ impl ConnectBridge {
                     .send(AskResolution::Answer {
                         answer,
                         expected_tool_call_id,
+                        // 按钮点击表达的是单次选择，不带会话级授权意图。
+                        session_scope: false,
                     })
                     .await;
             }
@@ -892,6 +971,25 @@ impl ConnectBridge {
 
         // Only the exact shared runner/router owner may publish a new prompt or
         // mutate process-global permission workspace state.
+        //
+        // 支持附件投递的渠道（Capabilities::attachments，目前仅微信）：会话的
+        // 第一条消息前注入一次约定说明，让模型知道 [SEND_FILE: 路径] 标记——
+        // 纯网关侧约定，标记的解析与投递由各适配器自行实现，引擎无感知。
+        let preamble;
+        let text = if platform.capabilities().attachments && session.messages.is_empty() {
+            preamble = format!(
+                "[渠道能力提示：本会话经聊天渠道接入。所有面向用户的文字（回复正文、\
+                 向用户提出的问题、问题的候选项）一律使用简体中文。用户消息中的 \
+                 [图片]/[语音]/[文件]/[视频] 标记是已保存到本地的媒体文件路径，可直接读取。\
+                 每次回复都必须包含面向用户的正常文字说明（不要只发文件）。当你需要把文件\
+                 （图片、文档等任意格式）发送给用户时，在正常文字说明之外，为每个文件单独\
+                 一行附加 \"[SEND_FILE: 文件绝对路径]\"，网关会自动把该文件投递到用户的\
+                 聊天窗口，该标记行不会显示给用户。]\n\n{text}"
+            );
+            preamble.as_str()
+        } else {
+            text
+        };
         session.add_message(Message::user(text.to_string()));
         if let Some(config) = self.ctx.permission_checker.permission_config() {
             config.set_session_workspace(session_id.clone(), session.workspace.clone());
@@ -1088,12 +1186,14 @@ impl ConnectBridge {
                             Some(AskResolution::Answer {
                                 answer,
                                 expected_tool_call_id,
+                                session_scope,
                             }) => match self
                                 .responder
                                 .respond_and_resume(
                                     session_id,
                                     Some(expected_tool_call_id.as_str()),
                                     answer,
+                                    session_scope,
                                 )
                                 .await
                             {
@@ -1401,6 +1501,7 @@ mod tests {
             session_id: &str,
             expected_tool_call_id: Option<&str>,
             answer: String,
+            _session_scope: bool,
         ) -> Result<RespondAndResumeOutcome, super::super::approvals::ResponderError> {
             self.calls.lock().await.push((
                 session_id.to_string(),
@@ -2206,6 +2307,8 @@ mod tests {
             edit_message: true,
             images: false,
             files: false,
+            attachments: false,
+            tool_progress: true,
         }
     }
 
@@ -2708,6 +2811,60 @@ mod tests {
             .await
             .expect("render task must finish")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_session_scope_command_switches_session_mode() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx);
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx.clone(), None, responder));
+        let platform = FakePlatform::new("fake");
+        let key = key_for("chat1", "u1");
+
+        // 预置一个已存在的会话，并让聊天映射指向它。
+        let mut session = bamboo_agent_core::Session::new("sess-scope", "model");
+        ctx.session_repo.save_and_cache(&mut session).await;
+        bridge.set_session_id_for_key(&key, "sess-scope").await;
+
+        // 单独发送的"接下来都允许"（无挂起审批）应切到 Auto 并回执，
+        // 而不是作为提示词进模型。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "scope-1", "接下来都允许"),
+        )
+        .await;
+
+        let sent = platform.sent.lock().await.clone();
+        assert!(sent.iter().any(|text| text.contains("不再逐条确认")));
+
+        let reloaded = ctx.session_repo.load_merged("sess-scope").await.unwrap();
+        let mode = reloaded
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode());
+        assert_eq!(mode, Some(bamboo_domain::SessionPermissionMode::Auto));
+
+        // "恢复确认"切回 Default。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "scope-2", "恢复确认"),
+        )
+        .await;
+        {
+            let sent = platform.sent.lock().await.clone();
+            eprintln!("diag-bridge: all replies = {sent:?}");
+        }
+        let reloaded = ctx.session_repo.load_merged("sess-scope").await.unwrap();
+        let mode = reloaded
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode());
+        assert_eq!(mode, Some(bamboo_domain::SessionPermissionMode::Default));
     }
 
     #[tokio::test]

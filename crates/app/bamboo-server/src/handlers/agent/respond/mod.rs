@@ -3,7 +3,7 @@
 //! This module provides HTTP endpoints for submitting user responses
 //! when the agent asks questions via the `conclusion_with_options` tool.
 
-mod handlers;
+pub(crate) mod handlers;
 mod session;
 mod types;
 
