@@ -138,6 +138,8 @@ impl Platform for FeishuPlatform {
             edit_message: true,
             images: false,
             files: false,
+            attachments: false,
+            tool_progress: true,
         }
     }
 

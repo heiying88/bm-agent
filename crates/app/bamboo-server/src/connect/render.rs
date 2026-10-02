@@ -234,6 +234,9 @@ async fn stream_execution_legacy(
                 arguments,
                 ..
             }) => {
+                if !platform.capabilities().tool_progress {
+                    continue;
+                }
                 let line = format_tool_line(&tool_name, &arguments);
                 send_chunks(&platform, &reply_ctx, &line).await;
             }
@@ -485,6 +488,8 @@ async fn stream_execution_streaming(
     mut rx: broadcast::Receiver<AgentEvent>,
     prior: Option<Box<StreamState>>,
 ) -> RunOutcome {
+    // renderer 构造时会拿走 platform，先取出能力快照供事件循环使用。
+    let tool_progress = platform.capabilities().tool_progress;
     let mut renderer = match prior {
         Some(state) => StreamingRenderer::resume(platform, reply_ctx, *state),
         None => {
@@ -501,6 +506,9 @@ async fn stream_execution_streaming(
                 arguments,
                 ..
             }) => {
+                if !tool_progress {
+                    continue;
+                }
                 let line = format_tool_line(&tool_name, &arguments);
                 let added = line.chars().count();
                 renderer.tool_lines.push(line);
@@ -652,6 +660,8 @@ mod tests {
                 edit_message: self.edit_message,
                 images: false,
                 files: false,
+                attachments: false,
+                tool_progress: true,
             }
         }
         async fn start(

@@ -79,6 +79,19 @@ const ITEM_TYPE_TEXT: i64 = 1;
 const ITEM_TYPE_IMAGE: i64 = 2;
 /// `item_list[].type == 3`：语音条目（含微信 ASR 转写文本）。
 const ITEM_TYPE_VOICE: i64 = 3;
+/// `item_list[].type == 4`：文件条目（CDN 加密媒体）。
+const ITEM_TYPE_FILE: i64 = 4;
+/// `item_list[].type == 5`：视频条目（CDN 加密媒体）。
+const ITEM_TYPE_VIDEO: i64 = 5;
+/// `getuploadurl` 的 `media_type`：图片。
+const UPLOAD_MEDIA_IMAGE: i64 = 1;
+/// `getuploadurl` 的 `media_type`：视频。
+const UPLOAD_MEDIA_VIDEO: i64 = 2;
+/// `getuploadurl` 的 `media_type`：文件。
+const UPLOAD_MEDIA_FILE: i64 = 3;
+/// 出站附件标记：回复文本中单独一行的 `[SEND_FILE: <绝对路径>]` 由本适配器
+/// 解析并投递，标记行不展示给用户（bridge 在会话首条消息注入约定说明）。
+const SEND_FILE_MARKER: &str = "[SEND_FILE: ";
 
 /// 全仓库共享一个 `reqwest::Client`（对齐 telegram 适配器的 `http_client` 惯例，
 /// 复用 workspace 锁定的 native-tls 栈，绝不另建第二个连接池）。
@@ -165,6 +178,64 @@ fn pkcs7_unpad(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     Some(data[..data.len() - pad].to_vec())
+}
+
+/// PKCS#7 填充（块大小 16）——出站上传前的加密预处理。
+fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 16;
+    let pad = BLOCK - data.len() % BLOCK;
+    let mut out = data.to_vec();
+    out.extend(std::iter::repeat(pad as u8).take(pad));
+    out
+}
+
+/// AES-128-ECB 加密（无 IV）+ PKCS#7 填充——出站媒体上传用（对齐
+/// cc-connect 的 `encryptAESECB`）。
+fn encrypt_aes_128_ecb(key: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+    use aes_gcm::aes::cipher::common::Block;
+    use aes_gcm::aes::cipher::{BlockCipherEncrypt, KeyInit};
+
+    let cipher = aes_gcm::aes::Aes128::new(Block::<aes_gcm::aes::Aes128>::from_slice(key));
+    let mut out = pkcs7_pad(plaintext);
+    for chunk in out.chunks_exact_mut(16) {
+        cipher.encrypt_block(Block::<aes_gcm::aes::Aes128>::from_mut_slice(chunk));
+    }
+    out
+}
+
+/// 出站媒体密钥的 API 形态：`base64(hex_string)`（对齐 cc-connect 的
+/// `formatAesKeyForAPI`——sendmessage 里 `media.aes_key` 用这个格式）。
+fn format_media_key_for_api(key: &[u8; 16]) -> String {
+    let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+    base64::engine::general_purpose::STANDARD.encode(hex.as_bytes())
+}
+
+/// 随机 16 字节的十六进制串（出站 filekey / aeskey 字段用）。
+fn random_hex_16() -> String {
+    let bytes: [u8; 16] = rand::random();
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// 从回复文本中提取 `[SEND_FILE: <绝对路径>]` 标记行：返回剥掉标记后的
+/// 展示文本与待投递文件路径列表（保持出现顺序）。标记行必须是整行。
+fn extract_send_file_markers(text: &str) -> (String, Vec<PathBuf>) {
+    let mut files = Vec::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(SEND_FILE_MARKER) {
+            if let Some(path) = rest.strip_suffix(']') {
+                let path = path.trim();
+                if !path.is_empty() {
+                    files.push(PathBuf::from(path));
+                    continue;
+                }
+            }
+        }
+        kept.push(line);
+    }
+    let visible = kept.join("\n").trim().to_string();
+    (visible, files)
 }
 
 /// 魔数嗅探图片扩展名（对齐 cc-connect 的 detectImageMime）。
@@ -282,6 +353,10 @@ struct IlinkItem {
     voice_item: Option<IlinkVoiceItem>,
     #[serde(default)]
     image_item: Option<IlinkImageItem>,
+    #[serde(default)]
+    file_item: Option<IlinkFileItem>,
+    #[serde(default)]
+    video_item: Option<IlinkVideoItem>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -297,13 +372,28 @@ struct IlinkVoiceItem {
     text: Option<String>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct IlinkImageItem {
     #[serde(default)]
     media: Option<IlinkCdnMedia>,
     /// 图片特有的 32 位十六进制 AES 密钥（优先于 media.aes_key）。
     #[serde(default, rename = "aeskey")]
     aes_key_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct IlinkFileItem {
+    #[serde(default)]
+    media: Option<IlinkCdnMedia>,
+    /// 原始文件名（入站展示用）。
+    #[serde(default)]
+    file_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct IlinkVideoItem {
+    #[serde(default)]
+    media: Option<IlinkCdnMedia>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -327,6 +417,32 @@ struct SendResponse {
     errcode: i64,
     #[serde(default)]
     errmsg: Option<String>,
+}
+
+/// `getuploadurl` 响应：新版返回完整的 `upload_full_url`，旧版返回
+/// `upload_param`（拼进 `{cdn}/upload?encrypted_query_param=...&filekey=...`）。
+#[derive(Debug, serde::Deserialize)]
+struct GetUploadUrlResponse {
+    #[serde(default)]
+    ret: i64,
+    #[serde(default)]
+    errcode: i64,
+    #[serde(default)]
+    errmsg: Option<String>,
+    #[serde(default)]
+    upload_param: Option<String>,
+    #[serde(default)]
+    upload_full_url: Option<String>,
+}
+
+/// 是否为可内联展示的位图（出站时按 image_item 发送）。与
+/// [`sniff_image_ext`] 同一套魔数。
+fn is_raster_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+        || bytes.starts_with(b"GIF87a")
+        || bytes.starts_with(b"GIF89a")
+        || (bytes.starts_with(b"RIFF") && bytes.len() >= 12 && &bytes[8..12] == b"WEBP")
 }
 
 /// `get_bot_qrcode` 响应。
@@ -550,17 +666,26 @@ impl WechatPlatform {
             if msg.message_type != MSG_TYPE_INBOUND {
                 continue;
             }
-            // 内容行：文本 + 语音转写在映射时同步生成；图片需要异步下载，
-            // 先落盘再把路径追加为文本行（agent 的看图工具可以打开它）。
-            let (mut lines, images) = extract_content_lines(msg);
-            // 图片即使下载失败也保留占位行——纯图片消息不能因为 CDN
+            // 内容行：文本 + 语音转写在映射时同步生成；图片/文件/视频需要
+            // 异步下载，先落盘再把路径追加为文本行（Agent 可用工具打开）。
+            let (mut lines, media_items) = extract_content_lines(msg);
+            // 媒体即使下载失败也保留占位行——纯媒体消息不能因为 CDN
             // 抖动就整条消失。
-            for image in &images {
-                match self.fetch_and_save_image(image, index).await {
-                    Ok(path) => lines.push(format!("[图片] {}", path.display())),
+            for media in &media_items {
+                match self.fetch_and_save_media(media, index).await {
+                    Ok(path) => {
+                        let label = media.label();
+                        match media.file_name() {
+                            Some(name) => {
+                                lines.push(format!("{label} {}（{name}）", path.display()))
+                            }
+                            None => lines.push(format!("{label} {}", path.display())),
+                        }
+                    }
                     Err(error) => {
-                        tracing::warn!("connect: wechat inbound image failed: {error}");
-                        lines.push("[图片]（下载或解密失败，未能保存）".to_string());
+                        tracing::warn!("connect: wechat inbound media failed: {error}");
+                        lines
+                            .push(format!("{}（下载或解密失败，未能保存）", media.label()));
                     }
                 }
             }
@@ -620,15 +745,16 @@ impl WechatPlatform {
         })
     }
 
-    /// 下载并解密一张入站图片，保存到 `state_dir/media/` 下，返回落盘路径。
+    /// 下载并解密一个入站媒体（图片/文件/视频），保存到 `state_dir/media/`
+    /// 下，返回落盘路径。
     ///
     /// 流程对齐 cc-connect 的 cdn.go：
     /// `GET {cdn}/download?encrypted_query_param=...` → AES-128-ECB 解密
-    /// （密钥取 `aeskey` hex 字段或 base64 的 `media.aes_key`）→ 魔数嗅探
-    /// 扩展名 → 落盘。无密钥时走明文直下兜底（cc-connect 对图片同款）。
-    async fn fetch_and_save_image(
+    /// （图片密钥优先取 `aeskey` hex 字段，否则 base64 的 `media.aes_key`）
+    /// → 落盘。无密钥时走明文直下兜底（cc-connect 对图片同款）。
+    async fn fetch_and_save_media(
         &self,
-        image: &IlinkImageItem,
+        media: &InboundMedia,
         batch_index: usize,
     ) -> PlatformResult<PathBuf> {
         let dir = self
@@ -636,15 +762,15 @@ impl WechatPlatform {
             .as_deref()
             .ok_or_else(|| PlatformError::other("wechat media requires a state dir"))?
             .join("media");
-        let media = image.media.as_ref().ok_or_else(|| {
-            PlatformError::other("weixin image item is missing its media descriptor")
+        let descriptor = media.media().ok_or_else(|| {
+            PlatformError::other("weixin media item is missing its media descriptor")
         })?;
-        let enc_param = media
+        let enc_param = descriptor
             .encrypt_query_param
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| PlatformError::other("weixin image media is missing encrypt_query_param"))?;
+            .ok_or_else(|| PlatformError::other("weixin media is missing encrypt_query_param"))?;
 
         let url = format!(
             "{}/download?encrypted_query_param={}",
@@ -659,45 +785,46 @@ impl WechatPlatform {
             .map_err(|error| {
                 // CDN 参数不是秘密，但保持与网关错误同款的脱敏习惯。
                 PlatformError::other(format!(
-                    "image CDN request failed: {}",
+                    "media CDN request failed: {}",
                     error.without_url()
                 ))
             })?;
         if !response.status().is_success() {
             return Err(PlatformError::other(format!(
-                "image CDN returned HTTP {}",
+                "media CDN returned HTTP {}",
                 response.status()
             )));
         }
         let ciphertext = response
             .bytes()
             .await
-            .map_err(|error| PlatformError::other(format!("image CDN read failed: {error}")))?;
+            .map_err(|error| PlatformError::other(format!("media CDN read failed: {error}")))?;
         if ciphertext.len() > MAX_MEDIA_BYTES {
-            return Err(PlatformError::other("image exceeds the 100 MB media cap"));
+            return Err(PlatformError::other("media exceeds the 100 MB cap"));
         }
 
-        let plain = match normalize_media_key(
-            image.aes_key_hex.as_deref(),
-            media.aes_key.as_deref(),
-        ) {
+        let plain = match normalize_media_key(media.media_key(), descriptor.aes_key.as_deref()) {
             Some(key) => decrypt_aes_128_ecb(&key, &ciphertext).ok_or_else(|| {
-                PlatformError::other("image AES-128-ECB decrypt failed (bad key or padding)")
+                PlatformError::other("media AES-128-ECB decrypt failed (bad key or padding)")
             })?,
             // 无密钥：cc-connect 对图片走明文直下兜底。
             None => ciphertext.to_vec(),
         };
         if plain.is_empty() {
-            return Err(PlatformError::other("decrypted image is empty"));
+            return Err(PlatformError::other("decrypted media is empty"));
         }
 
         std::fs::create_dir_all(&dir).map_err(|error| {
             PlatformError::other(format!("media dir create failed: {error}"))
         })?;
+        // 图片按魔数嗅探扩展名，文件/视频按原始名/默认扩展名。
+        let ext = match media {
+            InboundMedia::Image(_) => sniff_image_ext(&plain).to_string(),
+            _ => media.default_ext(),
+        };
         let path = dir.join(format!(
-            "wechat_img_{}_{batch_index}.{}",
+            "wechat_media_{}_{batch_index}.{ext}",
             chrono::Utc::now().timestamp_millis(),
-            sniff_image_ext(&plain)
         ));
         std::fs::write(&path, &plain)
             .map_err(|error| PlatformError::other(format!("media write failed: {error}")))?;
@@ -709,6 +836,20 @@ impl WechatPlatform {
     /// （bot 发送时为空串）与 `client_id`（客户端生成的消息 id）——缺这些字段
     /// 时网关可能返回 ret=0 却不投递消息（静默失败）。
     async fn send_message(&self, to_user_id: &str, context_token: &str, text: &str) -> PlatformResult<()> {
+        let item = serde_json::json!({
+            "type": ITEM_TYPE_TEXT,
+            "text_item": { "text": text },
+        });
+        self.send_message_item(to_user_id, context_token, item).await
+    }
+
+    /// 发送一条携带任意 `item_list` 条目的消息（文本/图片/文件/视频共用）。
+    async fn send_message_item(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+        item: serde_json::Value,
+    ) -> PlatformResult<()> {
         let url = format!("{}/ilink/bot/sendmessage", self.base_url());
         let body = serde_json::json!({
             "msg": {
@@ -718,9 +859,7 @@ impl WechatPlatform {
                 "message_type": MSG_TYPE_OUTBOUND,
                 "message_state": MSG_STATE_FINISH,
                 "context_token": context_token,
-                "item_list": [
-                    { "type": ITEM_TYPE_TEXT, "text_item": { "text": text } }
-                ],
+                "item_list": [ item ],
             },
             "base_info": { "channel_version": CHANNEL_VERSION },
         });
@@ -744,6 +883,15 @@ impl WechatPlatform {
             ))
         })?;
 
+        // 观测点：微信网关存在 ret=0 却不投递的静默丢弃，出站问题排查必须
+        // 能看到每次发送的实际返回。
+        tracing::info!(
+            "connect: wechat sendmessage to={to_user_id} ret={} errcode={} errmsg={:?}",
+            parsed.ret,
+            parsed.errcode,
+            parsed.errmsg,
+        );
+
         if parsed.ret != 0 || parsed.errcode != 0 {
             return Err(ret_error_full(
                 "sendmessage",
@@ -753,6 +901,173 @@ impl WechatPlatform {
             ));
         }
         Ok(())
+    }
+
+    /// 把一个本地文件投递给微信用户（出站附件，对齐 cc-connect 的
+    /// media_outbound.go 流程）：
+    ///
+    /// 1. `POST /ilink/bot/getuploadurl`（filekey 随机、aeskey 为 hex、
+    ///    filesize 为填充后密文长度、rawfilemd5 为明文 MD5）；
+    /// 2. 密文 `POST` 到 CDN（优先响应里的 `upload_full_url`，否则
+    ///    `{cdn}/upload?encrypted_query_param=...&filekey=...`），下载凭据
+    ///    从响应头 `x-encrypted-param` 读取；
+    /// 3. `sendmessage` 按媒体类型携带 image_item / video_item / file_item
+    ///    （media.aes_key 用 `base64(hex)` 形态）。
+    async fn deliver_file(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+        path: &std::path::Path,
+    ) -> PlatformResult<()> {
+        let plain = tokio::fs::read(path)
+            .await
+            .map_err(|error| PlatformError::other(format!("read {}: {error}", path.display())))?;
+        if plain.len() > MAX_MEDIA_BYTES {
+            return Err(PlatformError::other(
+                "file exceeds the 100 MB delivery cap",
+            ));
+        }
+
+        // 媒体分类：图片按魔数，视频按 MP4 ftyp 盒，其余一律按文件。
+        let (media_type, item_type) = if is_raster_image(&plain) {
+            (UPLOAD_MEDIA_IMAGE, ITEM_TYPE_IMAGE)
+        } else if plain.len() >= 12 && &plain[4..8] == b"ftyp" {
+            (UPLOAD_MEDIA_VIDEO, ITEM_TYPE_VIDEO)
+        } else {
+            (UPLOAD_MEDIA_FILE, ITEM_TYPE_FILE)
+        };
+
+        let key: [u8; 16] = rand::random();
+        let ciphertext = encrypt_aes_128_ecb(&key, &plain);
+        let padded_size = ciphertext.len();
+        let filekey = random_hex_16();
+        let hex_key: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+        let md5_hex = {
+            use md5::Digest;
+            let digest = md5::Md5::digest(&plain);
+            digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+        };
+
+        // 1. getuploadurl
+        let url = format!("{}/ilink/bot/getuploadurl", self.base_url());
+        let body = serde_json::json!({
+            "filekey": filekey,
+            "media_type": media_type,
+            "to_user_id": to_user_id,
+            "rawsize": plain.len(),
+            "rawfilemd5": md5_hex,
+            "filesize": ciphertext.len(),
+            "no_need_thumb": true,
+            "aeskey": hex_key,
+            "base_info": { "channel_version": CHANNEL_VERSION },
+        });
+        let response = self
+            .ilink_request(reqwest::Method::POST, &url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                PlatformError::other(format!(
+                    "getuploadurl request failed: {}",
+                    self.sanitize_error(error)
+                ))
+            })?;
+        let parsed: GetUploadUrlResponse = response.json().await.map_err(|error| {
+            PlatformError::other(format!(
+                "getuploadurl response parse failed: {}",
+                self.sanitize_error(error)
+            ))
+        })?;
+        if parsed.ret != 0 || parsed.errcode != 0 {
+            return Err(ret_error_full(
+                "getuploadurl",
+                parsed.ret,
+                parsed.errcode,
+                parsed.errmsg,
+            ));
+        }
+
+        // 2. 上传密文；下载凭据在响应头 x-encrypted-param。
+        let upload_url = match parsed
+            .upload_full_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(full) => full.to_string(),
+            None => {
+                let param = parsed
+                    .upload_param
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        PlatformError::other(
+                            "getuploadurl returned neither upload_full_url nor upload_param",
+                        )
+                    })?;
+                format!(
+                    "{}/upload?encrypted_query_param={}&filekey={}",
+                    self.cdn_base_url.trim_end_matches('/'),
+                    percent_encode_query(param),
+                    percent_encode_query(&filekey)
+                )
+            }
+        };
+        let response = http_client()
+            .post(&upload_url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .timeout(MEDIA_DOWNLOAD_TIMEOUT)
+            .body(ciphertext)
+            .send()
+            .await
+            .map_err(|error| {
+                PlatformError::other(format!("media upload failed: {}", error.without_url()))
+            })?;
+        if !response.status().is_success() {
+            return Err(PlatformError::other(format!(
+                "media upload returned HTTP {}",
+                response.status()
+            )));
+        }
+        let download_param = response
+            .headers()
+            .get("x-encrypted-param")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                PlatformError::other("media upload response missing x-encrypted-param header")
+            })?
+            .to_string();
+
+        // 3. 发送携带媒体条目的消息。
+        let media = serde_json::json!({
+            "encrypt_type": 1,
+            "encrypt_query_param": download_param,
+            "aes_key": format_media_key_for_api(&key),
+        });
+        let item = match item_type {
+            ITEM_TYPE_IMAGE => serde_json::json!({
+                "type": ITEM_TYPE_IMAGE,
+                "image_item": { "media": media, "mid_size": padded_size }
+            }),
+            ITEM_TYPE_VIDEO => serde_json::json!({
+                "type": ITEM_TYPE_VIDEO,
+                "video_item": { "media": media, "video_size": padded_size }
+            }),
+            _ => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file.bin".to_string());
+                serde_json::json!({
+                    "type": ITEM_TYPE_FILE,
+                    "file_item": { "media": media, "file_name": name, "len": plain.len().to_string() }
+                })
+            }
+        };
+        self.send_message_item(to_user_id, context_token, item).await
     }
 
     /// 扫码登录/重登：拉取二维码 → PNG 落盘 + 日志输出链接 → 轮询扫码状态
@@ -899,10 +1214,65 @@ impl WechatPlatform {
 }
 
 /// 拆解一条消息的内容：文本条目与语音转写生成文本行（语音无转写时也保留
-/// 占位行），图片条目收集起来交给调用方异步下载（`poll_once`）。
-fn extract_content_lines(msg: &IlinkMessage) -> (Vec<String>, Vec<IlinkImageItem>) {
+/// 占位行），图片/文件/视频条目收集起来交给调用方异步下载（`poll_once`）。
+enum InboundMedia {
+    Image(IlinkImageItem),
+    File(IlinkFileItem),
+    Video(IlinkVideoItem),
+}
+
+impl InboundMedia {
+    /// CDN 媒体描述符与对应的 AES 密钥字段。
+    fn media(&self) -> Option<&IlinkCdnMedia> {
+        match self {
+            InboundMedia::Image(item) => item.media.as_ref(),
+            InboundMedia::File(item) => item.media.as_ref(),
+            InboundMedia::Video(item) => item.media.as_ref(),
+        }
+    }
+
+    fn media_key(&self) -> Option<&str> {
+        match self {
+            InboundMedia::Image(item) => item.aes_key_hex.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// 展示前缀与落盘默认扩展名。
+    fn label(&self) -> &'static str {
+        match self {
+            InboundMedia::Image(_) => "[图片]",
+            InboundMedia::File(_) => "[文件]",
+            InboundMedia::Video(_) => "[视频]",
+        }
+    }
+
+    fn default_ext(&self) -> String {
+        match self {
+            InboundMedia::Image(_) => "jpg".to_string(),
+            InboundMedia::Video(_) => "mp4".to_string(),
+            InboundMedia::File(item) => item
+                .file_name
+                .as_deref()
+                .and_then(|name| name.rsplit_once('.'))
+                .map(|(_, ext)| ext)
+                .filter(|ext| !ext.is_empty() && ext.chars().count() <= 10)
+                .unwrap_or("bin")
+                .to_string(),
+        }
+    }
+
+    fn file_name(&self) -> Option<&str> {
+        match self {
+            InboundMedia::File(item) => item.file_name.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+fn extract_content_lines(msg: &IlinkMessage) -> (Vec<String>, Vec<InboundMedia>) {
     let mut lines = Vec::new();
-    let mut images = Vec::new();
+    let mut media = Vec::new();
 
     for item in &msg.item_list {
         match item.kind {
@@ -932,17 +1302,32 @@ fn extract_content_lines(msg: &IlinkMessage) -> (Vec<String>, Vec<IlinkImageItem
             }
             Some(ITEM_TYPE_IMAGE) => {
                 if let Some(image) = item.image_item.as_ref() {
-                    images.push(IlinkImageItem {
+                    media.push(InboundMedia::Image(IlinkImageItem {
                         media: image.media.clone(),
                         aes_key_hex: image.aes_key_hex.clone(),
-                    });
+                    }));
+                }
+            }
+            Some(ITEM_TYPE_FILE) => {
+                if let Some(file) = item.file_item.as_ref() {
+                    media.push(InboundMedia::File(IlinkFileItem {
+                        media: file.media.clone(),
+                        file_name: file.file_name.clone(),
+                    }));
+                }
+            }
+            Some(ITEM_TYPE_VIDEO) => {
+                if let Some(video) = item.video_item.as_ref() {
+                    media.push(InboundMedia::Video(IlinkVideoItem {
+                        media: video.media.clone(),
+                    }));
                 }
             }
             _ => {}
         }
     }
 
-    (lines, images)
+    (lines, media)
 }
 
 /// 合成确定性 message_id（见 [`WechatPlatform::to_inbound_message`] 的说明）。
@@ -974,6 +1359,11 @@ impl Platform for WechatPlatform {
             edit_message: false,
             images: false,
             files: false,
+            // 出站附件投递：解析回复中的 [SEND_FILE: 路径] 标记并经
+            // iLink CDN 上传发送（bridge 据此在会话首条消息注入约定说明）。
+            attachments: true,
+            // 微信 IM 场景只看结果：不推送 ⚙ 工具命令行进度。
+            tool_progress: false,
         }
     }
 
@@ -1031,9 +1421,49 @@ impl Platform for WechatPlatform {
 
         // `msg.buttons` 被忽略：capabilities 未声明按钮，bridge/approvals 不会
         // 传入（编号文本列表才是微信侧的审批呈现方式）。
-        for chunk in chunk_message(&msg.text, WECHAT_MESSAGE_CHARS) {
+        //
+        // 出站附件：剥离 [SEND_FILE: 路径] 标记行，先发文本再逐个投递文件；
+        // 单个文件失败不中断整个回复，改为补发一条失败提示。
+        let (mut visible_text, files) = extract_send_file_markers(&msg.text);
+        // 剥离标记后可见文本为空但确有附件时，补一条兜底文案——否则用户
+        // 只看到 ⚙ 工具行，永远等不到正文（"只见命令不见回复"）。
+        if visible_text.trim().is_empty() && !files.is_empty() {
+            let names: Vec<String> = files
+                .iter()
+                .map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.display().to_string())
+                })
+                .collect();
+            visible_text = format!("📄 已为你发送 {} 个文件：{}", files.len(), names.join("、"));
+        }
+        tracing::info!(
+            "connect: wechat reply to={to_user_id} visible_chars={} attachments={}",
+            visible_text.chars().count(),
+            files.len()
+        );
+        for chunk in chunk_message(&visible_text, WECHAT_MESSAGE_CHARS) {
             self.rate_limiter.wait(&to_user_id).await;
             self.send_message(&to_user_id, &context_token, &chunk).await?;
+        }
+        for path in files {
+            self.rate_limiter.wait(&to_user_id).await;
+            if let Err(error) = self
+                .deliver_file(&to_user_id, &context_token, &path)
+                .await
+            {
+                tracing::warn!(
+                    "connect: wechat file delivery failed for {}: {error}",
+                    path.display()
+                );
+                let notice =
+                    format!("[文件发送失败：{}] {error}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+                self.rate_limiter.wait(&to_user_id).await;
+                let _ = self
+                    .send_message(&to_user_id, &context_token, &notice)
+                    .await;
+            }
         }
 
         Ok(MessageRef(serde_json::json!({ "to_user_id": to_user_id })))
@@ -1647,6 +2077,145 @@ mod tests {
             }
             Inbound::Callback(_) => panic!("expected a message event"),
         }
+
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // 出站附件：[SEND_FILE:] 标记 + iLink 上传投递
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn send_file_markers_are_extracted_and_stripped() {
+        let text = "这是报告：\n[SEND_FILE: C:\\reports\\季报.docx]\n[SEND_FILE: /tmp/a.png]\n请查收。";
+        let (visible, files) = extract_send_file_markers(text);
+        assert_eq!(visible, "这是报告：\n请查收。");
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("C:\\reports\\季报.docx"),
+                PathBuf::from("/tmp/a.png")
+            ]
+        );
+
+        // 没有标记时原样返回。
+        let (visible, files) = extract_send_file_markers("普通回复");
+        assert_eq!(visible, "普通回复");
+        assert!(files.is_empty());
+
+        // 半截标记（无右括号/空路径）不算标记，原样保留。
+        let (visible, files) = extract_send_file_markers("[SEND_FILE: 没闭合");
+        assert!(files.is_empty());
+        assert!(visible.contains("[SEND_FILE:"));
+    }
+
+    /// 完整出站投递链路：getuploadurl → CDN POST（响应头带
+    /// x-encrypted-param）→ sendmessage 携带 file_item（密钥为 base64(hex)、
+    /// len 为明文长度）。
+    #[tokio::test]
+    async fn reply_delivers_send_file_markers_via_cdn_upload() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "bamboo-wechat-outbound-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let docx = state_dir.join("报告.docx");
+        std::fs::write(&docx, b"PK\x03\x04 fake-docx-bytes").unwrap();
+
+        let api = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ilink/bot/getuploadurl"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ret": 0, "errcode": 0,
+                    "upload_param": "UP-PARAM-1"
+                })),
+            )
+            .mount(&api)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ilink/bot/sendmessage"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ret": 0, "errcode": 0 })),
+            )
+            .mount(&api)
+            .await;
+
+        let cdn = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/upload"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("x-encrypted-param", "DL-PARAM-9"),
+            )
+            .mount(&cdn)
+            .await;
+
+        let platform = WechatPlatform::with_options(
+            TEST_TOKEN.to_string(),
+            api.uri(),
+            Duration::from_millis(10),
+            Some(state_dir.clone()),
+        )
+        .with_cdn_base(cdn.uri());
+
+        let ctx = ReplyCtx(serde_json::json!({
+            "to_user_id": "wxid_user@im.wechat",
+            "context_token": "CTX-F"
+        }));
+        platform
+            .reply(
+                &ctx,
+                OutboundMessage::text(format!(
+                    "报告来了\n[SEND_FILE: {}]",
+                    docx.to_string_lossy()
+                )),
+            )
+            .await
+            .expect("reply succeeds");
+
+        // sendmessage 收到两条：文本 + file_item。
+        let requests = wait_for_requests(&api, 2).await;
+        let file_msg = requests
+            .iter()
+            .map(body_json)
+            .find(|body| body.pointer("/msg/item_list/0/file_item").is_some())
+            .expect("one sendmessage carries a file_item");
+        let file_item = file_msg.pointer("/msg/item_list/0/file_item").unwrap();
+        assert_eq!(
+            file_item.pointer("/file_name").and_then(|v| v.as_str()),
+            Some("报告.docx")
+        );
+        assert_eq!(
+            file_item.pointer("/len").and_then(|v| v.as_str()),
+            Some("20".to_string()).as_deref()
+        );
+        let media = file_item.pointer("/media").unwrap();
+        assert_eq!(
+            media.pointer("/encrypt_query_param").and_then(|v| v.as_str()),
+            Some("DL-PARAM-9")
+        );
+        assert_eq!(
+            media.pointer("/encrypt_type").and_then(|v| v.as_i64()),
+            Some(1)
+        );
+        // aes_key 形态：base64(32 字符 hex)。
+        let aes_key_b64 = media.pointer("/aes_key").and_then(|v| v.as_str()).unwrap();
+        let aes_key_hex = base64::engine::general_purpose::STANDARD
+            .decode(aes_key_b64)
+            .expect("base64");
+        let aes_key_hex = String::from_utf8(aes_key_hex).expect("hex ascii");
+        assert_eq!(aes_key_hex.len(), 32);
+        assert!(aes_key_hex.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        // 上传请求：URL 带 upload_param 与 filekey；请求体是 16 字节对齐的密文。
+        let upload_requests = wait_for_requests(&cdn, 1).await;
+        let query = upload_requests[0].url.query().unwrap_or_default();
+        assert!(query.contains("encrypted_query_param=UP-PARAM-1"));
+        assert!(query.contains("filekey="));
+        let body_len = upload_requests[0].body.len();
+        assert!(body_len % 16 == 0 && body_len >= 20);
 
         let _ = std::fs::remove_dir_all(state_dir);
     }

@@ -1,5 +1,5 @@
 mod decision;
-mod pending;
+pub(crate) mod pending;
 mod submit;
 
 #[cfg(test)]

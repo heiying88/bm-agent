@@ -363,6 +363,8 @@ impl Platform for TelegramPlatform {
             edit_message: true,
             images: false,
             files: false,
+            attachments: false,
+            tool_progress: true,
         }
     }
 
