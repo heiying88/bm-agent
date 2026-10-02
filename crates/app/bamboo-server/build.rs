@@ -106,12 +106,40 @@ fn write_frontend_package_embed(manifest_dir: &Path, out_dir: &Path) -> io::Resu
     }
 }
 
+/// 编译 vendor 的 SILK v3 SDK（微信语音条编码，仅编码方向被链接引用；
+/// BSD-3-Clause，见 vendor/silk/SILK_SDK_LICENSE）。cc 在 MSVC 与 gcc/clang
+/// 上都开箱即用，不需要 libclang/bindgen。
+fn compile_vendored_silk(manifest_dir: &Path) {
+    let vendor_root = manifest_dir.join("vendor").join("silk");
+    let src_dir = vendor_root.join("src");
+    let interface_dir = vendor_root.join("interface");
+    println!("cargo:rerun-if-changed={}", src_dir.display());
+    println!("cargo:rerun-if-changed={}", interface_dir.display());
+
+    let mut sources: Vec<PathBuf> = fs::read_dir(&src_dir)
+        .expect("vendored SILK src directory exists")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("c"))
+        .collect();
+    sources.sort();
+
+    cc::Build::new()
+        .files(&sources)
+        .include(&interface_dir)
+        .include(&src_dir)
+        .flag_if_supported("-w")
+        .flag_if_supported("/W0")
+        .compile("bamboo_silk_sdk");
+}
+
 fn main() -> io::Result<()> {
     configure_macos_test_unwinding();
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
 
+    compile_vendored_silk(&manifest_dir);
     write_frontend_package_embed(&manifest_dir, &out_dir)?;
 
     Ok(())

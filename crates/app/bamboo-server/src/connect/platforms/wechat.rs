@@ -34,6 +34,7 @@ use super::super::platform::{
     PlatformResult, ReplyCtx,
 };
 use super::super::render::chunk_message;
+use super::wechat_voice::{self, VoiceConfig};
 
 /// iLink 网关官方域名（登录响应可能返回按 bot 区分的 `baseurl`，届时覆盖）。
 const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
@@ -89,9 +90,16 @@ const UPLOAD_MEDIA_IMAGE: i64 = 1;
 const UPLOAD_MEDIA_VIDEO: i64 = 2;
 /// `getuploadurl` 的 `media_type`：文件。
 const UPLOAD_MEDIA_FILE: i64 = 3;
+/// `getuploadurl` 的 `media_type`：语音（微信语音条的 SILK 载荷）。
+const UPLOAD_MEDIA_VOICE: i64 = 4;
+/// `voice_item.encode_type` 的 SILK 标记（对齐社区逆向实现）。
+const VOICE_ENCODE_TYPE_SILK: i64 = 4;
 /// 出站附件标记：回复文本中单独一行的 `[SEND_FILE: <绝对路径>]` 由本适配器
 /// 解析并投递，标记行不展示给用户（bridge 在会话首条消息注入约定说明）。
 const SEND_FILE_MARKER: &str = "[SEND_FILE: ";
+/// 出站语音标记：单独一行的 `[SEND_VOICE: <要念的文本>]` 由本适配器解析并
+/// 合成语音条投递（用户明确要求朗读时模型才使用；标记行不展示）。
+const SEND_VOICE_MARKER: &str = "[SEND_VOICE: ";
 
 /// 全仓库共享一个 `reqwest::Client`（对齐 telegram 适配器的 `http_client` 惯例，
 /// 复用 workspace 锁定的 native-tls 栈，绝不另建第二个连接池）。
@@ -236,6 +244,28 @@ fn extract_send_file_markers(text: &str) -> (String, Vec<PathBuf>) {
     }
     let visible = kept.join("\n").trim().to_string();
     (visible, files)
+}
+
+/// 剥离 `[SEND_VOICE: <要念的文本>]` 标记行，返回（可见文本，语音文本
+/// 列表）。与 [`extract_send_file_markers`] 同一款解析，标记行不展示。
+fn extract_send_voice_markers(text: &str) -> (String, Vec<String>) {
+    let mut voices = Vec::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(SEND_VOICE_MARKER) {
+            if let Some(voice_text) = rest.strip_suffix(']') {
+                let voice_text = voice_text.trim();
+                if !voice_text.is_empty() {
+                    voices.push(voice_text.to_string());
+                    continue;
+                }
+            }
+        }
+        kept.push(line);
+    }
+    let visible = kept.join("\n").trim().to_string();
+    (visible, voices)
 }
 
 /// 魔数嗅探图片扩展名（对齐 cc-connect 的 detectImageMime）。
@@ -513,6 +543,9 @@ pub struct WechatPlatform {
     token: RwLock<String>,
     /// 游标与登录二维码的落盘目录（`{data_dir}/connect_wechat/`）。
     state_dir: Option<PathBuf>,
+    /// 语音能力配置（`voice` 段；无 `siliconflow_api_key` 时为 `None`，
+    /// 全部语音行为关闭，与未配置时完全一致）。
+    voice: Option<VoiceConfig>,
     /// `get_updates_buf` 游标（内存权威副本；每次成功拉取后落盘）。
     cursor: AsyncMutex<Option<String>>,
     rate_limiter: RateLimiter,
@@ -520,8 +553,13 @@ pub struct WechatPlatform {
 
 impl WechatPlatform {
     /// 生产构造：官方网关 + 默认限流。
-    pub fn new(token: String, base_url: String, state_dir: Option<PathBuf>) -> Self {
-        Self::with_options(token, base_url, DEFAULT_RATE_LIMIT_INTERVAL, state_dir)
+    pub fn new(
+        token: String,
+        base_url: String,
+        state_dir: Option<PathBuf>,
+        voice: Option<VoiceConfig>,
+    ) -> Self {
+        Self::with_options(token, base_url, DEFAULT_RATE_LIMIT_INTERVAL, state_dir, voice)
     }
 
     /// 测试/高级构造：可注入本地 HTTP 桩地址与极小的限流间隔。
@@ -530,12 +568,14 @@ impl WechatPlatform {
         base_url: String,
         rate_limit_interval: Duration,
         state_dir: Option<PathBuf>,
+        voice: Option<VoiceConfig>,
     ) -> Self {
         Self {
             base_url: RwLock::new(base_url),
             cdn_base_url: DEFAULT_CDN_BASE_URL.to_string(),
             token: RwLock::new(token),
             state_dir,
+            voice,
             cursor: AsyncMutex::new(None),
             rate_limiter: RateLimiter::new(rate_limit_interval),
         }
@@ -669,17 +709,30 @@ impl WechatPlatform {
             // 内容行：文本 + 语音转写在映射时同步生成；图片/文件/视频需要
             // 异步下载，先落盘再把路径追加为文本行（Agent 可用工具打开）。
             let (mut lines, media_items) = extract_content_lines(msg);
+            // 出站 mirror 决策需要知道本条入站是否含语音条。
+            let had_voice = msg
+                .item_list
+                .iter()
+                .any(|item| item.kind == Some(ITEM_TYPE_VOICE));
             // 媒体即使下载失败也保留占位行——纯媒体消息不能因为 CDN
             // 抖动就整条消失。
             for media in &media_items {
                 match self.fetch_and_save_media(media, index).await {
                     Ok(path) => {
                         let label = media.label();
-                        match media.file_name() {
+                        let file_name = media.file_name().map(str::to_string);
+                        match &file_name {
                             Some(name) => {
                                 lines.push(format!("{label} {}（{name}）", path.display()))
                             }
                             None => lines.push(format!("{label} {}", path.display())),
+                        }
+                        // 音频文件转写（file_asr 开启时）：已解密的原始文件
+                        // 直接上传识别，成功追加 [音频转写] 行；音乐/无语音/
+                        // 超限/接口失败一律静默跳过，文件标记不受影响。
+                        if let Some(name) = &file_name {
+                            self.maybe_transcribe_audio(&path, name, &mut lines)
+                                .await;
                         }
                     }
                     Err(error) => {
@@ -689,7 +742,7 @@ impl WechatPlatform {
                     }
                 }
             }
-            if let Some(message) = Self::build_inbound_message(msg, index, lines) {
+            if let Some(message) = Self::build_inbound_message(msg, index, lines, had_voice) {
                 events.push(Inbound::Message(message));
             }
         }
@@ -706,6 +759,7 @@ impl WechatPlatform {
         msg: &IlinkMessage,
         batch_index: usize,
         lines: Vec<String>,
+        had_voice: bool,
     ) -> Option<InboundMessage> {
         let from = msg
             .from_user_id
@@ -741,8 +795,52 @@ impl WechatPlatform {
             reply_ctx: ReplyCtx(serde_json::json!({
                 "to_user_id": from,
                 "context_token": context_token,
+                // 出站 mirror 语音决策用：本条入站消息是否含语音条。
+                "had_voice": had_voice,
             })),
         })
+    }
+
+    /// 入站音频文件转写（`voice.file_asr` 开启时）：把已解密落盘的音频
+    /// 上传硅基流动识别，成功则向 `lines` 追加 `[音频转写] <文本>` 行。
+    /// 音乐/无语音内容/超限/接口失败一律静默跳过（debug 日志）——不打扰
+    /// 主流程，文件路径行始终保留。微信**语音条**不走这里（永远用微信
+    /// 自带转写，见设计文档 §4）。
+    async fn maybe_transcribe_audio(
+        &self,
+        path: &std::path::Path,
+        file_name: &str,
+        lines: &mut Vec<String>,
+    ) {
+        let Some(voice) = self.voice.as_ref() else {
+            return;
+        };
+        if !voice.file_asr || !wechat_voice::is_audio_file_name(file_name) {
+            return;
+        }
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!("connect: wechat audio asr read failed: {error}");
+                return;
+            }
+        };
+        if bytes.len() > wechat_voice::MAX_ASR_FILE_BYTES {
+            tracing::debug!(
+                "connect: wechat audio asr skipped ({} bytes over cap)",
+                bytes.len()
+            );
+            return;
+        }
+        match wechat_voice::transcribe_file(http_client(), voice, &bytes, file_name).await {
+            Ok(text) if !text.is_empty() => {
+                lines.push(format!("[音频转写] {text}"));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("connect: wechat audio asr failed for {file_name}: {error}");
+            }
+        }
     }
 
     /// 下载并解密一个入站媒体（图片/文件/视频），保存到 `state_dir/media/`
@@ -937,14 +1035,49 @@ impl WechatPlatform {
             (UPLOAD_MEDIA_FILE, ITEM_TYPE_FILE)
         };
 
+        let (media, padded_size) = self.upload_media(to_user_id, &plain, media_type).await?;
+
+        // 3. 发送携带媒体条目的消息。
+        let item = match item_type {
+            ITEM_TYPE_IMAGE => serde_json::json!({
+                "type": ITEM_TYPE_IMAGE,
+                "image_item": { "media": media, "mid_size": padded_size }
+            }),
+            ITEM_TYPE_VIDEO => serde_json::json!({
+                "type": ITEM_TYPE_VIDEO,
+                "video_item": { "media": media, "video_size": padded_size }
+            }),
+            _ => {
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "file.bin".to_string());
+                serde_json::json!({
+                    "type": ITEM_TYPE_FILE,
+                    "file_item": { "media": media, "file_name": name, "len": plain.len().to_string() }
+                })
+            }
+        };
+        self.send_message_item(to_user_id, context_token, item).await
+    }
+
+    /// 出站媒体上传公共链路（deliver_file / deliver_voice 共用）：
+    /// 随机 AES key 加密 → `getuploadurl`（语音用 media_type=4）→ 密文
+    /// POST 到 CDN → 返回（`media` 引用 JSON，填充后密文长度）。
+    async fn upload_media(
+        &self,
+        to_user_id: &str,
+        plain: &[u8],
+        media_type: i64,
+    ) -> PlatformResult<(serde_json::Value, usize)> {
         let key: [u8; 16] = rand::random();
-        let ciphertext = encrypt_aes_128_ecb(&key, &plain);
+        let ciphertext = encrypt_aes_128_ecb(&key, plain);
         let padded_size = ciphertext.len();
         let filekey = random_hex_16();
         let hex_key: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
         let md5_hex = {
             use md5::Digest;
-            let digest = md5::Md5::digest(&plain);
+            let digest = md5::Md5::digest(plain);
             digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
         };
 
@@ -1041,33 +1174,74 @@ impl WechatPlatform {
             })?
             .to_string();
 
-        // 3. 发送携带媒体条目的消息。
         let media = serde_json::json!({
             "encrypt_type": 1,
             "encrypt_query_param": download_param,
             "aes_key": format_media_key_for_api(&key),
         });
-        let item = match item_type {
-            ITEM_TYPE_IMAGE => serde_json::json!({
-                "type": ITEM_TYPE_IMAGE,
-                "image_item": { "media": media, "mid_size": padded_size }
-            }),
-            ITEM_TYPE_VIDEO => serde_json::json!({
-                "type": ITEM_TYPE_VIDEO,
-                "video_item": { "media": media, "video_size": padded_size }
-            }),
-            _ => {
-                let name = path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "file.bin".to_string());
-                serde_json::json!({
-                    "type": ITEM_TYPE_FILE,
-                    "file_item": { "media": media, "file_name": name, "len": plain.len().to_string() }
-                })
-            }
-        };
-        self.send_message_item(to_user_id, context_token, item).await
+        Ok((media, padded_size))
+    }
+
+    /// 把一段文本合成为微信语音条发送（TTS → SILK 编码 → CDN 上传 →
+    /// sendmessage voice_item）。超长文本先按句读分段，每段一条语音，
+    /// 段数上限 [`wechat_voice::MAX_VOICE_SEGMENTS`]；单段超过 60 秒按
+    /// 字节截断。任何失败向上返回（调用方负责文字回退）。
+    async fn deliver_voice(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+        text: &str,
+    ) -> PlatformResult<()> {
+        let voice = self
+            .voice
+            .as_ref()
+            .ok_or_else(|| PlatformError::other("voice is not configured"))?;
+        let normalized = wechat_voice::normalize_for_tts(text);
+        let segments = wechat_voice::segment_for_tts(
+            &normalized,
+            wechat_voice::MAX_VOICE_SEGMENT_CHARS,
+        );
+        if segments.is_empty() {
+            return Err(PlatformError::other("语音文本规范化后为空"));
+        }
+        if segments.len() > wechat_voice::MAX_VOICE_SEGMENTS {
+            tracing::warn!(
+                "connect: wechat voice text split into {} segments, truncating to {}",
+                segments.len(),
+                wechat_voice::MAX_VOICE_SEGMENTS
+            );
+        }
+        for segment in segments.into_iter().take(wechat_voice::MAX_VOICE_SEGMENTS) {
+            let pcm = wechat_voice::synthesize_pcm(http_client(), voice, &segment)
+                .await
+                .map_err(PlatformError::other)?;
+            // 60 秒上限：按字节截断 PCM（对齐帧边界由编码器的补零逻辑兜底）。
+            let max_bytes =
+                (voice.sample_rate as usize * 2) * (wechat_voice::MAX_VOICE_DURATION_MS as usize / 1000);
+            let pcm = if pcm.len() > max_bytes { &pcm[..max_bytes] } else { &pcm[..] };
+            let playtime_ms = wechat_voice::pcm_duration_ms(pcm.len(), voice.sample_rate);
+            let silk = wechat_voice::encode_silk_tencent(pcm, voice.sample_rate, voice.bitrate)
+                .map_err(PlatformError::other)?;
+            let (media, _padded) = self
+                .upload_media(to_user_id, &silk, UPLOAD_MEDIA_VOICE)
+                .await?;
+            let item = serde_json::json!({
+                "type": ITEM_TYPE_VOICE,
+                "voice_item": {
+                    "media": media,
+                    "encode_type": VOICE_ENCODE_TYPE_SILK,
+                    "playtime": playtime_ms,
+                }
+            });
+            tracing::info!(
+                "connect: wechat voice to={to_user_id} chars={} silk_bytes={} playtime_ms={playtime_ms}",
+                segment.chars().count(),
+                silk.len(),
+            );
+            self.rate_limiter.wait(to_user_id).await;
+            self.send_message_item(to_user_id, context_token, item).await?;
+        }
+        Ok(())
     }
 
     /// 扫码登录/重登：拉取二维码 → PNG 落盘 + 日志输出链接 → 轮询扫码状态
@@ -1422,12 +1596,15 @@ impl Platform for WechatPlatform {
         // `msg.buttons` 被忽略：capabilities 未声明按钮，bridge/approvals 不会
         // 传入（编号文本列表才是微信侧的审批呈现方式）。
         //
-        // 出站附件：剥离 [SEND_FILE: 路径] 标记行，先发文本再逐个投递文件；
-        // 单个文件失败不中断整个回复，改为补发一条失败提示。
-        let (mut visible_text, files) = extract_send_file_markers(&msg.text);
+        // 出站附件与语音：先剥离 [SEND_FILE: 路径] 与 [SEND_VOICE: 文本]
+        // 标记行；再按 reply_mode 决定普通回复是否转语音（决策管线见
+        // 设计文档 §3a：off=总开关默认关 / mirror=语音回语音 / always）。
+        // 语音失败回退文字，绝不静默卡住。
+        let (visible_after_files, files) = extract_send_file_markers(&msg.text);
+        let (mut visible_text, voice_markers) = extract_send_voice_markers(&visible_after_files);
         // 剥离标记后可见文本为空但确有附件时，补一条兜底文案——否则用户
         // 只看到 ⚙ 工具行，永远等不到正文（"只见命令不见回复"）。
-        if visible_text.trim().is_empty() && !files.is_empty() {
+        if visible_text.trim().is_empty() && !files.is_empty() && voice_markers.is_empty() {
             let names: Vec<String> = files
                 .iter()
                 .map(|path| {
@@ -1438,10 +1615,50 @@ impl Platform for WechatPlatform {
                 .collect();
             visible_text = format!("📄 已为你发送 {} 个文件：{}", files.len(), names.join("、"));
         }
+
+        // 语音未配置时标记文本并入正文（模型误用 [SEND_VOICE] 也不丢内容，
+        // 而不是报"语音合成失败"）。
+        if self.voice.is_none() && !voice_markers.is_empty() {
+            let marker_text = voice_markers.join("\n");
+            visible_text = if visible_text.is_empty() {
+                marker_text
+            } else {
+                format!("{visible_text}\n{marker_text}")
+            };
+        }
+
+        // 自动（非显式标记）语音决策：网关确定性规则，不依赖模型自觉。
+        // mirror 需要入站消息含语音（reply_ctx.had_voice，poll_once 写入）。
+        let had_voice = ctx
+            .0
+            .get("had_voice")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let auto_voice_text = match self.voice.as_ref().map(|voice| voice.reply_mode) {
+            Some(wechat_voice::VoiceReplyMode::Mirror)
+                if had_voice && wechat_voice::is_voice_suitable(&visible_text) =>
+            {
+                Some(visible_text.clone())
+            }
+            Some(wechat_voice::VoiceReplyMode::Always)
+                if wechat_voice::is_voice_suitable(&visible_text) =>
+            {
+                Some(visible_text.clone())
+            }
+            _ => None,
+        };
+        // 自动语音命中时整条可见文本转为语音条，不再重复发文字（内容门槛
+        // 已保证适合念）；显式标记模式可见文本照常发送。
+        if auto_voice_text.is_some() {
+            visible_text = String::new();
+        }
+
         tracing::info!(
-            "connect: wechat reply to={to_user_id} visible_chars={} attachments={}",
+            "connect: wechat reply to={to_user_id} visible_chars={} attachments={} voice_markers={} auto_voice={}",
             visible_text.chars().count(),
-            files.len()
+            files.len(),
+            voice_markers.len(),
+            auto_voice_text.is_some()
         );
         for chunk in chunk_message(&visible_text, WECHAT_MESSAGE_CHARS) {
             self.rate_limiter.wait(&to_user_id).await;
@@ -1463,6 +1680,33 @@ impl Platform for WechatPlatform {
                 let _ = self
                     .send_message(&to_user_id, &context_token, &notice)
                     .await;
+            }
+        }
+
+        // 语音条：显式标记逐条念出；自动模式整条转换。失败回退文字
+        // （自动模式原文还没发过，回退时把原文带上）。
+        let auto_voice_active = auto_voice_text.is_some();
+        let mut voice_texts = voice_markers;
+        if let Some(text) = auto_voice_text {
+            voice_texts.push(text);
+        }
+        for text in voice_texts {
+            if let Err(error) = self
+                .deliver_voice(&to_user_id, &context_token, &text)
+                .await
+            {
+                tracing::warn!("connect: wechat voice delivery failed: {error}");
+                let fallback = if auto_voice_active {
+                    format!("（语音合成失败，已改用文字：{error}）\n{text}")
+                } else {
+                    format!("（语音合成失败：{error}）\n{text}")
+                };
+                for chunk in chunk_message(&fallback, WECHAT_MESSAGE_CHARS) {
+                    self.rate_limiter.wait(&to_user_id).await;
+                    let _ = self
+                        .send_message(&to_user_id, &context_token, &chunk)
+                        .await;
+                }
             }
         }
 
@@ -1493,6 +1737,7 @@ mod tests {
             TEST_TOKEN.to_string(),
             base_url,
             Duration::from_millis(50),
+            None,
             None,
         )
     }
@@ -1650,6 +1895,7 @@ mod tests {
             server.uri(),
             Duration::from_millis(50),
             Some(state_dir.clone()),
+            None,
         );
         first.poll_once().await.unwrap();
 
@@ -1657,7 +1903,8 @@ mod tests {
             TEST_TOKEN.to_string(),
             server.uri(),
             Duration::from_millis(50),
-            Some(state_dir),
+            Some(state_dir.clone()),
+            None,
         );
         restarted.load_cursor().await;
         restarted.poll_once().await.unwrap();
@@ -1841,6 +2088,7 @@ mod tests {
             server.uri(),
             Duration::from_millis(50),
             Some(state_dir.clone()),
+            None,
         );
 
         platform.qr_login().await.expect("qr_login succeeds");
@@ -1870,6 +2118,7 @@ mod tests {
             TEST_TOKEN.to_string(),
             server.uri(),
             Duration::from_millis(150),
+            None,
             None,
         );
         let ctx = ReplyCtx(serde_json::json!({
@@ -2056,6 +2305,7 @@ mod tests {
             api.uri(),
             Duration::from_millis(50),
             Some(state_dir.clone()),
+            None,
         )
         .with_cdn_base(cdn.uri());
 
@@ -2155,8 +2405,9 @@ mod tests {
         let platform = WechatPlatform::with_options(
             TEST_TOKEN.to_string(),
             api.uri(),
-            Duration::from_millis(10),
+            Duration::from_millis(50),
             Some(state_dir.clone()),
+            None,
         )
         .with_cdn_base(cdn.uri());
 
@@ -2218,5 +2469,529 @@ mod tests {
         assert!(body_len % 16 == 0 && body_len >= 20);
 
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // 出站语音：[SEND_VOICE:] 标记 + mirror/always 决策 + 失败回退
+    // ------------------------------------------------------------------
+
+    fn test_voice_config(
+        tts_base_url: String,
+        reply_mode: wechat_voice::VoiceReplyMode,
+        file_asr: bool,
+    ) -> VoiceConfig {
+        VoiceConfig {
+            api_key: "sk-test".to_string(),
+            base_url: tts_base_url,
+            tts_model: "FunAudioLLM/CosyVoice2-0.5B".to_string(),
+            tts_voice: "FunAudioLLM/CosyVoice2-0.5B:anna".to_string(),
+            sample_rate: 16_000,
+            speed: 1.0,
+            bitrate: 25_000,
+            reply_mode,
+            asr_model: "FunAudioLLM/SenseVoiceSmall".to_string(),
+            file_asr,
+        }
+    }
+
+    fn reply_ctx_with(had_voice: bool) -> ReplyCtx {
+        ReplyCtx(serde_json::json!({
+            "to_user_id": "wxid_user@im.wechat",
+            "context_token": "CTX-V",
+            "had_voice": had_voice,
+        }))
+    }
+
+    async fn mount_siliconflow_tts(server: &wiremock::MockServer, pcm_bytes: usize) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/audio/speech"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0u8; pcm_bytes]),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_ilink_send_stack(api: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ilink/bot/getuploadurl"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ret": 0, "errcode": 0, "upload_param": "UP-VOICE-1"
+                })),
+            )
+            .mount(api)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ilink/bot/sendmessage"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ret": 0, "errcode": 0 })),
+            )
+            .mount(api)
+            .await;
+    }
+
+    async fn mount_cdn_upload(cdn: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/upload"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("x-encrypted-param", "DL-VOICE-9"),
+            )
+            .mount(cdn)
+            .await;
+    }
+
+    #[test]
+    fn send_voice_markers_are_extracted_and_stripped() {
+        let text = "说明：\n[SEND_VOICE: 明天下午三点开会]\n以上。";
+        let (visible, voices) = extract_send_voice_markers(text);
+        assert_eq!(visible, "说明：\n以上。");
+        assert_eq!(voices, vec!["明天下午三点开会".to_string()]);
+
+        let (visible, voices) = extract_send_voice_markers("普通回复");
+        assert_eq!(visible, "普通回复");
+        assert!(voices.is_empty());
+
+        // 半截标记原样保留。
+        let (visible, voices) = extract_send_voice_markers("[SEND_VOICE: 没闭合");
+        assert!(voices.is_empty());
+        assert!(visible.contains("[SEND_VOICE:"));
+    }
+
+    /// 未配置语音时标记文本并入正文——模型误用标记也不丢内容、不报错。
+    #[tokio::test]
+    async fn reply_voice_marker_without_config_keeps_text() {
+        let api = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/ilink/bot/sendmessage"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ret": 0, "errcode": 0 })),
+            )
+            .mount(&api)
+            .await;
+
+        let platform = WechatPlatform::with_options(
+            TEST_TOKEN.to_string(),
+            api.uri(),
+            Duration::from_millis(10),
+            None,
+            None,
+        );
+        platform
+            .reply(
+                &reply_ctx_with(false),
+                OutboundMessage::text("结论如上\n[SEND_VOICE: 本应念出来的部分]"),
+            )
+            .await
+            .expect("reply succeeds");
+
+        let requests = wait_for_requests(&api, 1).await;
+        let sent = body_json(&requests[0]);
+        let text = sent
+            .pointer("/msg/item_list/0/text_item/text")
+            .and_then(|value| value.as_str())
+            .unwrap();
+        assert!(text.contains("结论如上"));
+        assert!(text.contains("本应念出来的部分"));
+    }
+
+    /// 完整语音投递链路：TTS(pcm) → SILK 编码 → CDN 上传(media_type=4) →
+    /// sendmessage voice_item（encode_type=4、playtime 按采样率换算）。
+    #[tokio::test]
+    async fn reply_delivers_voice_marker_as_voice_item() {
+        let tts = wiremock::MockServer::start().await;
+        mount_siliconflow_tts(&tts, 16_000 * 2).await; // 1 秒 16kHz 静音。
+        let api = wiremock::MockServer::start().await;
+        mount_ilink_send_stack(&api).await;
+        let cdn = wiremock::MockServer::start().await;
+        mount_cdn_upload(&cdn).await;
+
+        let platform = WechatPlatform::with_options(
+            TEST_TOKEN.to_string(),
+            api.uri(),
+            Duration::from_millis(10),
+            None,
+            Some(test_voice_config(
+                tts.uri(),
+                wechat_voice::VoiceReplyMode::Off,
+                false,
+            )),
+        )
+        .with_cdn_base(cdn.uri());
+
+        platform
+            .reply(
+                &reply_ctx_with(false),
+                OutboundMessage::text("补充说明\n[SEND_VOICE: 明天下午三点开会，记得带笔记本]"),
+            )
+            .await
+            .expect("reply succeeds");
+
+        // TTS 请求体：pcm@16000 + 目标文本。
+        let tts_requests = wait_for_requests(&tts, 1).await;
+        let tts_body = body_json(&tts_requests[0]);
+        assert_eq!(
+            tts_body.get("response_format").and_then(|v| v.as_str()),
+            Some("pcm")
+        );
+        assert_eq!(
+            tts_body.get("sample_rate").and_then(|v| v.as_i64()),
+            Some(16_000)
+        );
+        assert_eq!(
+            tts_body.get("input").and_then(|v| v.as_str()),
+            Some("明天下午三点开会，记得带笔记本")
+        );
+
+        // getuploadurl 用语音 media_type=4。
+        let api_requests = wait_for_requests(&api, 2).await;
+        let upload_req = api_requests
+            .iter()
+            .find(|request| request.url.path().contains("getuploadurl"))
+            .expect("getuploadurl called");
+        assert_eq!(
+            body_json(upload_req).get("media_type").and_then(|v| v.as_i64()),
+            Some(UPLOAD_MEDIA_VOICE)
+        );
+
+        // sendmessage：文本（不含标记）+ voice_item。
+        let voice_msg = api_requests
+            .iter()
+            .map(body_json)
+            .find(|body| body.pointer("/msg/item_list/0/voice_item").is_some())
+            .expect("one sendmessage carries a voice_item");
+        let voice_item = voice_msg.pointer("/msg/item_list/0/voice_item").unwrap();
+        assert_eq!(
+            voice_item.pointer("/encode_type").and_then(|v| v.as_i64()),
+            Some(VOICE_ENCODE_TYPE_SILK)
+        );
+        assert_eq!(
+            voice_item.pointer("/playtime").and_then(|v| v.as_i64()),
+            Some(1000)
+        );
+        assert_eq!(
+            voice_item
+                .pointer("/media/encrypt_query_param")
+                .and_then(|v| v.as_str()),
+            Some("DL-VOICE-9")
+        );
+        let text_msg = api_requests
+            .iter()
+            .map(body_json)
+            .find(|body| body.pointer("/msg/item_list/0/text_item").is_some())
+            .expect("visible text was sent");
+        assert_eq!(
+            text_msg
+                .pointer("/msg/item_list/0/text_item/text")
+                .and_then(|v| v.as_str()),
+            Some("补充说明")
+        );
+
+        // CDN 上传体解密后是 \x02#!SILK_V3 腾讯变体（上传的是 AES 密文，
+        // 密钥在 getuploadurl 请求的 aeskey hex 字段里）。
+        let cdn_requests = wait_for_requests(&cdn, 1).await;
+        let upload_req = api_requests
+            .iter()
+            .find(|request| request.url.path().contains("getuploadurl"))
+            .expect("getuploadurl called");
+        let aeskey_hex = body_json(upload_req)
+            .get("aeskey")
+            .and_then(|value| value.as_str())
+            .expect("aeskey present")
+            .to_string();
+        let key_bytes: [u8; 16] = (0..16)
+            .map(|index| u8::from_str_radix(&aeskey_hex[index * 2..index * 2 + 2], 16).unwrap())
+            .collect::<Vec<u8>>()
+            .try_into()
+            .unwrap();
+        let decrypted = decrypt_aes_128_ecb(&key_bytes, &cdn_requests[0].body)
+            .expect("uploaded ciphertext decrypts");
+        assert!(decrypted.starts_with(b"\x02#!SILK_V3"));
+    }
+
+    /// mirror 决策：语音入站 → 自动转语音（正文不再重复发文字）；
+    /// 文字入站或内容不适合（代码）→ 保持文字，不调用 TTS。
+    #[tokio::test]
+    async fn reply_mirror_mode_decision_rules() {
+        // 案例 A：mirror + 语音入站 + 适合内容 → 语音条、无文本条。
+        {
+            let tts = wiremock::MockServer::start().await;
+            mount_siliconflow_tts(&tts, 16_000 * 2).await;
+            let api = wiremock::MockServer::start().await;
+            mount_ilink_send_stack(&api).await;
+            let cdn = wiremock::MockServer::start().await;
+            mount_cdn_upload(&cdn).await;
+            let platform = WechatPlatform::with_options(
+                TEST_TOKEN.to_string(),
+                api.uri(),
+                Duration::from_millis(10),
+                None,
+                Some(test_voice_config(
+                    tts.uri(),
+                    wechat_voice::VoiceReplyMode::Mirror,
+                    false,
+                )),
+            )
+            .with_cdn_base(cdn.uri());
+            platform
+                .reply(&reply_ctx_with(true), OutboundMessage::text("好的，明天见"))
+                .await
+                .expect("reply succeeds");
+
+            let api_requests = wait_for_requests(&api, 2).await;
+            for request in &api_requests {
+                if !request.url.path().contains("sendmessage") {
+                    continue;
+                }
+                let body = body_json(request);
+                assert!(
+                    body.pointer("/msg/item_list/0/voice_item").is_some(),
+                    "mirror + voice inbound must send voice only, got: {body}"
+                );
+            }
+        }
+
+        // 案例 B：mirror + 文字入站 → 只发文本，不调 TTS。
+        {
+            let tts = wiremock::MockServer::start().await;
+            let api = wiremock::MockServer::start().await;
+            mount_ilink_send_stack(&api).await;
+            let cdn = wiremock::MockServer::start().await;
+            mount_cdn_upload(&cdn).await;
+            let platform = WechatPlatform::with_options(
+                TEST_TOKEN.to_string(),
+                api.uri(),
+                Duration::from_millis(10),
+                None,
+                Some(test_voice_config(
+                    tts.uri(),
+                    wechat_voice::VoiceReplyMode::Mirror,
+                    false,
+                )),
+            )
+            .with_cdn_base(cdn.uri());
+            platform
+                .reply(&reply_ctx_with(false), OutboundMessage::text("好的，明天见"))
+                .await
+                .expect("reply succeeds");
+
+            let api_requests = wait_for_requests(&api, 1).await;
+            let body = body_json(&api_requests[0]);
+            assert!(body.pointer("/msg/item_list/0/text_item").is_some());
+            assert!(tts.received_requests().await.unwrap_or_default().is_empty());
+        }
+
+        // 案例 C：mirror + 语音入站 + 代码内容 → 降级文本，不调 TTS。
+        {
+            let tts = wiremock::MockServer::start().await;
+            let api = wiremock::MockServer::start().await;
+            mount_ilink_send_stack(&api).await;
+            let cdn = wiremock::MockServer::start().await;
+            mount_cdn_upload(&cdn).await;
+            let platform = WechatPlatform::with_options(
+                TEST_TOKEN.to_string(),
+                api.uri(),
+                Duration::from_millis(10),
+                None,
+                Some(test_voice_config(
+                    tts.uri(),
+                    wechat_voice::VoiceReplyMode::Mirror,
+                    false,
+                )),
+            )
+            .with_cdn_base(cdn.uri());
+            platform
+                .reply(
+                    &reply_ctx_with(true),
+                    OutboundMessage::text("运行 `cargo build` 后告诉我结果"),
+                )
+                .await
+                .expect("reply succeeds");
+
+            let api_requests = wait_for_requests(&api, 1).await;
+            let body = body_json(&api_requests[0]);
+            assert!(body.pointer("/msg/item_list/0/text_item").is_some());
+            assert!(tts.received_requests().await.unwrap_or_default().is_empty());
+        }
+    }
+
+    /// TTS 失败回退文字：自动模式原文尚未发过，回退把原文带上。
+    #[tokio::test]
+    async fn voice_synthesis_failure_falls_back_to_text() {
+        let tts = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/audio/speech"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_json(
+                serde_json::json!({ "message": "额度不足" }),
+            ))
+            .mount(&tts)
+            .await;
+        let api = wiremock::MockServer::start().await;
+        mount_ilink_send_stack(&api).await;
+        let cdn = wiremock::MockServer::start().await;
+        mount_cdn_upload(&cdn).await;
+
+        let platform = WechatPlatform::with_options(
+            TEST_TOKEN.to_string(),
+            api.uri(),
+            Duration::from_millis(10),
+            None,
+            Some(test_voice_config(
+                tts.uri(),
+                wechat_voice::VoiceReplyMode::Always,
+                false,
+            )),
+        )
+        .with_cdn_base(cdn.uri());
+
+        platform
+            .reply(&reply_ctx_with(false), OutboundMessage::text("好的，明天见"))
+            .await
+            .expect("reply succeeds");
+
+        let api_requests = wait_for_requests(&api, 1).await;
+        let body = body_json(&api_requests[0]);
+        let text = body
+            .pointer("/msg/item_list/0/text_item/text")
+            .and_then(|value| value.as_str())
+            .unwrap();
+        assert!(text.contains("语音合成失败"), "got: {text}");
+        assert!(text.contains("额度不足"), "got: {text}");
+        assert!(text.contains("好的，明天见"), "got: {text}");
+    }
+
+    // ------------------------------------------------------------------
+    // 入站音频文件转写（file_asr 开关）
+    // ------------------------------------------------------------------
+
+    async fn mount_siliconflow_asr(server: &wiremock::MockServer, text: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/audio/transcriptions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "text": text })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn run_audio_file_asr_case(file_asr: bool) -> (Vec<Inbound>, wiremock::MockServer) {
+        let key: [u8; 16] = rand::random();
+        let plain = b"fake-mp3-bytes".to_vec();
+        let encrypted = encrypt_aes_128_ecb(&key, &plain);
+
+        let cdn = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/download"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_bytes(encrypted.clone()),
+            )
+            .mount(&cdn)
+            .await;
+
+        let api = wiremock::MockServer::start().await;
+        mount_getupdates(
+            &api,
+            serde_json::json!({
+                "ret": 0,
+                "msgs": [
+                    {
+                        "from_user_id": "wxid_user@im.wechat",
+                        "message_type": 1,
+                        "context_token": "CTX-AUDIO",
+                        "item_list": [
+                            {
+                                "type": 4,
+                                "file_item": {
+                                    "media": {
+                                        "encrypt_query_param": "audio-param",
+                                        "aes_key": base64::engine::general_purpose::STANDARD.encode(key)
+                                    },
+                                    "file_name": "meeting.mp3"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                "get_updates_buf": "CURSOR-AUDIO"
+            }),
+        )
+        .await;
+
+        let siliconflow = wiremock::MockServer::start().await;
+        mount_siliconflow_asr(&siliconflow, " 会议纪要内容 ").await;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "bamboo-wechat-asr-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let platform = WechatPlatform::with_options(
+            TEST_TOKEN.to_string(),
+            api.uri(),
+            Duration::from_millis(10),
+            Some(state_dir.clone()),
+            Some(test_voice_config(
+                siliconflow.uri(),
+                wechat_voice::VoiceReplyMode::Off,
+                file_asr,
+            )),
+        )
+        .with_cdn_base(cdn.uri());
+
+        let events = platform.poll_once().await.expect("poll_once succeeds");
+        let _ = std::fs::remove_dir_all(state_dir);
+        (events, siliconflow)
+    }
+
+    #[tokio::test]
+    async fn poll_once_transcribes_audio_files_when_enabled() {
+        let (events, siliconflow) = run_audio_file_asr_case(true).await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Inbound::Message(message) => {
+                assert!(message.text.contains("[文件] "), "got: {}", message.text);
+                assert!(message.text.contains("meeting.mp3"), "got: {}", message.text);
+                assert!(
+                    message.text.contains("[音频转写] 会议纪要内容"),
+                    "got: {}",
+                    message.text
+                );
+            }
+            Inbound::Callback(_) => panic!("expected a message event"),
+        }
+        // 转写确实上传了音频。
+        let requests = wait_for_requests(&siliconflow, 1).await;
+        let content_type = requests[0]
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(content_type.starts_with("multipart/form-data"), "got: {content_type}");
+        assert!(requests[0]
+            .body
+            .windows(b"meeting.mp3".len())
+            .any(|window| window == b"meeting.mp3"));
+    }
+
+    #[tokio::test]
+    async fn poll_once_skips_audio_transcription_when_disabled() {
+        let (events, siliconflow) = run_audio_file_asr_case(false).await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Inbound::Message(message) => {
+                assert!(message.text.contains("[文件] "));
+                assert!(!message.text.contains("[音频转写]"));
+            }
+            Inbound::Callback(_) => panic!("expected a message event"),
+        }
+        assert!(siliconflow
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty());
     }
 }

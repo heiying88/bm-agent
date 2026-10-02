@@ -15,6 +15,7 @@ include = [
     "frontend_build.rs",
     "frontend_package/frontend-manifest.json",
     "frontend_package/lotus-frontend.zip",
+    "vendor/silk/**/*",
 ]
 
 [build-dependencies]
@@ -24,6 +25,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# 编译 vendor 的 SILK v3 SDK（微信网关语音条编码），无需 libclang/bindgen。
+cc = "1"
 
 [dependencies]
 tempfile = "3"
