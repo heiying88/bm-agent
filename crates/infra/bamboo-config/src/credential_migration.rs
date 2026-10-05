@@ -11159,7 +11159,8 @@ fn ensure_connect_consumers_or_abort(
         &original_authority,
     )?;
     let mut owners = connect_refs_from_document(&original)?;
-    for (id, (token_ref, app_secret_ref, voice_api_key_ref)) in connect_refs_from_document(&staged)? {
+    for (id, (token_ref, app_secret_ref, voice_api_key_ref)) in connect_refs_from_document(&staged)?
+    {
         let owner = owners.entry(id).or_default();
         if token_ref.is_some() {
             owner.0 = token_ref;
@@ -11172,24 +11173,27 @@ fn ensure_connect_consumers_or_abort(
         }
     }
     for reference in &credential_file.touched_credential_refs {
-        let owner = owners.iter().find_map(|(id, (token_ref, app_secret_ref, voice_api_key_ref))| {
-            token_ref
-                .as_ref()
-                .is_some_and(|candidate| candidate.as_str() == reference)
-                .then_some((id.as_str(), "token"))
-                .or_else(|| {
-                    app_secret_ref
+        let owner =
+            owners
+                .iter()
+                .find_map(|(id, (token_ref, app_secret_ref, voice_api_key_ref))| {
+                    token_ref
                         .as_ref()
                         .is_some_and(|candidate| candidate.as_str() == reference)
-                        .then_some((id.as_str(), "app_secret"))
-                })
-                .or_else(|| {
-                    voice_api_key_ref
-                        .as_ref()
-                        .is_some_and(|candidate| candidate.as_str() == reference)
-                        .then_some((id.as_str(), "voice_api_key"))
-                })
-        });
+                        .then_some((id.as_str(), "token"))
+                        .or_else(|| {
+                            app_secret_ref
+                                .as_ref()
+                                .is_some_and(|candidate| candidate.as_str() == reference)
+                                .then_some((id.as_str(), "app_secret"))
+                        })
+                        .or_else(|| {
+                            voice_api_key_ref
+                                .as_ref()
+                                .is_some_and(|candidate| candidate.as_str() == reference)
+                                .then_some((id.as_str(), "voice_api_key"))
+                        })
+                });
         let Some((platform_id, field)) = owner else {
             abort_connect_exact_transaction(data_dir, manifest)?;
             return Err(ConfigStoreError::Validation(

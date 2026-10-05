@@ -192,7 +192,10 @@ fn pkcs7_unpad(data: &[u8]) -> Option<Vec<u8>> {
     if pad == 0 || pad > BLOCK {
         return None;
     }
-    if !data[data.len() - pad..].iter().all(|byte| *byte as usize == pad) {
+    if !data[data.len() - pad..]
+        .iter()
+        .all(|byte| *byte as usize == pad)
+    {
         return None;
     }
     Some(data[..data.len() - pad].to_vec())
@@ -600,15 +603,14 @@ pub(crate) async fn fetch_login_qrcode(base_url: &str) -> Result<WechatLoginQr, 
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "get_bot_qrcode returned no qrcode id".to_string())?;
     let image_content = parsed.qrcode_img_content.unwrap_or_default();
-    let image_kind = if image_content.starts_with("http://") || image_content.starts_with("https://")
-    {
-        "url"
-    } else if !image_content.is_empty()
-    {
-        "png_base64"
-    } else {
-        ""
-    };
+    let image_kind =
+        if image_content.starts_with("http://") || image_content.starts_with("https://") {
+            "url"
+        } else if !image_content.is_empty() {
+            "png_base64"
+        } else {
+            ""
+        };
     Ok(WechatLoginQr {
         qrcode_id,
         image_kind,
@@ -662,7 +664,12 @@ fn ret_error(operation: &str, ret: i64, errmsg: Option<String>) -> PlatformError
     ret_error_full(operation, ret, 0, errmsg)
 }
 
-fn ret_error_full(operation: &str, ret: i64, errcode: i64, errmsg: Option<String>) -> PlatformError {
+fn ret_error_full(
+    operation: &str,
+    ret: i64,
+    errcode: i64,
+    errmsg: Option<String>,
+) -> PlatformError {
     let detail = errmsg.unwrap_or_else(|| "no errmsg".to_string());
     PlatformError::other(format!(
         "wechat {operation} failed with ret={ret} errcode={errcode}: {detail}"
@@ -715,7 +722,13 @@ impl WechatPlatform {
         state_dir: Option<PathBuf>,
         voice: Option<VoiceConfig>,
     ) -> Self {
-        Self::with_options(token, base_url, DEFAULT_RATE_LIMIT_INTERVAL, state_dir, voice)
+        Self::with_options(
+            token,
+            base_url,
+            DEFAULT_RATE_LIMIT_INTERVAL,
+            state_dir,
+            voice,
+        )
     }
 
     /// 测试/高级构造：可注入本地 HTTP 桩地址与极小的限流间隔。
@@ -796,7 +809,9 @@ impl WechatPlatform {
     /// 把游标写入 `state_dir/cursor.json`。游标不是秘密；小文件、低频写，
     /// 直接整写即可（bridge 的原子写助手是它模块私有的）。
     fn persist_cursor(&self, cursor: &str) {
-        let Some(path) = self.cursor_path() else { return };
+        let Some(path) = self.cursor_path() else {
+            return;
+        };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -813,9 +828,15 @@ impl WechatPlatform {
     /// （第二道是 bridge 的 `platform:message_id` 去重；协议没有时间戳字段，
     /// `sent_at` 的过期丢弃因此弱化）。
     async fn load_cursor(&self) {
-        let Some(path) = self.cursor_path() else { return };
-        let Ok(text) = std::fs::read_to_string(&path) else { return };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+        let Some(path) = self.cursor_path() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return;
+        };
         if let Some(buf) = value.get("get_updates_buf").and_then(|v| v.as_str()) {
             *self.cursor.lock().await = Some(buf.to_string());
         }
@@ -833,7 +854,9 @@ impl WechatPlatform {
 
         let response = self
             .ilink_request(reqwest::Method::POST, &url)
-            .timeout(Duration::from_secs(LONG_POLL_TIMEOUT_SECS + CLIENT_POLL_MARGIN_SECS))
+            .timeout(Duration::from_secs(
+                LONG_POLL_TIMEOUT_SECS + CLIENT_POLL_MARGIN_SECS,
+            ))
             .json(&body)
             .send()
             .await
@@ -877,12 +900,12 @@ impl WechatPlatform {
             // 它带的值就是本线格式下 SILK 的真实取值（出站自动校准用）。
             if had_voice {
                 for item in &msg.item_list {
-                    if let Some(observed) = item
-                        .voice_item
-                        .as_ref()
-                        .and_then(|voice| voice.encode_type)
+                    if let Some(observed) =
+                        item.voice_item.as_ref().and_then(|voice| voice.encode_type)
                     {
-                        let previous = self.observed_voice_encode_type.swap(observed, Ordering::Relaxed);
+                        let previous = self
+                            .observed_voice_encode_type
+                            .swap(observed, Ordering::Relaxed);
                         if previous != observed {
                             tracing::info!(
                                 "connect: wechat observed inbound voice encode_type={observed} \
@@ -912,14 +935,12 @@ impl WechatPlatform {
                         // 直接上传识别，成功追加 [音频转写] 行；音乐/无语音/
                         // 超限/接口失败一律静默跳过，文件标记不受影响。
                         if let Some(name) = &file_name {
-                            self.maybe_transcribe_audio(&path, name, &mut lines)
-                                .await;
+                            self.maybe_transcribe_audio(&path, name, &mut lines).await;
                         }
                     }
                     Err(error) => {
                         tracing::warn!("connect: wechat inbound media failed: {error}");
-                        lines
-                            .push(format!("{}（下载或解密失败，未能保存）", media.label()));
+                        lines.push(format!("{}（下载或解密失败，未能保存）", media.label()));
                     }
                 }
             }
@@ -1072,15 +1093,23 @@ impl WechatPlatform {
             let mut media = serde_json::Map::new();
             media.insert(
                 "encrypt_query_param".to_string(),
-                serde_json::Value::String(descriptor.encrypt_query_param.clone().unwrap_or_default()),
+                serde_json::Value::String(
+                    descriptor.encrypt_query_param.clone().unwrap_or_default(),
+                ),
             );
             if let Some(key) = descriptor.aes_key.clone() {
                 media.insert("aes_key".to_string(), serde_json::Value::String(key));
             }
             if let Some(encrypt_type) = descriptor.encrypt_type {
-                media.insert("encrypt_type".to_string(), serde_json::Value::from(encrypt_type));
+                media.insert(
+                    "encrypt_type".to_string(),
+                    serde_json::Value::from(encrypt_type),
+                );
             }
-            *self.captured_inbound_voice.write().expect("voice capture lock") = Some(CapturedVoiceMedia {
+            *self
+                .captured_inbound_voice
+                .write()
+                .expect("voice capture lock") = Some(CapturedVoiceMedia {
                 media: serde_json::Value::Object(media),
                 encode_type: voice.encode_type,
                 playtime: voice.playtime,
@@ -1138,7 +1167,10 @@ impl WechatPlatform {
                 return;
             }
             Err(error) => {
-                tracing::warn!("connect: wechat inbound voice probe: CDN failed: {}", error.without_url());
+                tracing::warn!(
+                    "connect: wechat inbound voice probe: CDN failed: {}",
+                    error.without_url()
+                );
                 return;
             }
         };
@@ -1179,9 +1211,11 @@ impl WechatPlatform {
             tracing::warn!("connect: wechat inbound voice probe: write failed: {error}");
             return;
         }
-        tracing::info!("connect: wechat inbound voice probe saved: {}", path.display());
+        tracing::info!(
+            "connect: wechat inbound voice probe saved: {}",
+            path.display()
+        );
     }
-
 
     /// （图片密钥优先取 `aeskey` hex 字段，否则 base64 的 `media.aes_key`）
     /// → 落盘。无密钥时走明文直下兜底（cc-connect 对图片同款）。
@@ -1217,10 +1251,7 @@ impl WechatPlatform {
             .await
             .map_err(|error| {
                 // CDN 参数不是秘密，但保持与网关错误同款的脱敏习惯。
-                PlatformError::other(format!(
-                    "media CDN request failed: {}",
-                    error.without_url()
-                ))
+                PlatformError::other(format!("media CDN request failed: {}", error.without_url()))
             })?;
         if !response.status().is_success() {
             return Err(PlatformError::other(format!(
@@ -1247,9 +1278,8 @@ impl WechatPlatform {
             return Err(PlatformError::other("decrypted media is empty"));
         }
 
-        std::fs::create_dir_all(&dir).map_err(|error| {
-            PlatformError::other(format!("media dir create failed: {error}"))
-        })?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|error| PlatformError::other(format!("media dir create failed: {error}")))?;
         // 图片按魔数嗅探扩展名，文件/视频按原始名/默认扩展名。
         let ext = match media {
             InboundMedia::Image(_) => sniff_image_ext(&plain).to_string(),
@@ -1268,12 +1298,18 @@ impl WechatPlatform {
     /// 的 `sendMessageReq`：请求根级必须带 `base_info`，msg 必须带 `from_user_id`
     /// （bot 发送时为空串）与 `client_id`（客户端生成的消息 id）——缺这些字段
     /// 时网关可能返回 ret=0 却不投递消息（静默失败）。
-    async fn send_message(&self, to_user_id: &str, context_token: &str, text: &str) -> PlatformResult<()> {
+    async fn send_message(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+        text: &str,
+    ) -> PlatformResult<()> {
         let item = serde_json::json!({
             "type": ITEM_TYPE_TEXT,
             "text_item": { "text": text },
         });
-        self.send_message_item(to_user_id, context_token, item).await
+        self.send_message_item(to_user_id, context_token, item)
+            .await
     }
 
     /// 发送一条携带任意 `item_list` 条目的消息（文本/图片/文件/视频共用）。
@@ -1356,9 +1392,7 @@ impl WechatPlatform {
             .await
             .map_err(|error| PlatformError::other(format!("read {}: {error}", path.display())))?;
         if plain.len() > MAX_MEDIA_BYTES {
-            return Err(PlatformError::other(
-                "file exceeds the 100 MB delivery cap",
-            ));
+            return Err(PlatformError::other("file exceeds the 100 MB delivery cap"));
         }
 
         // 媒体分类：图片按魔数，视频按 MP4 ftyp 盒，其余一律按文件。
@@ -1393,7 +1427,8 @@ impl WechatPlatform {
                 })
             }
         };
-        self.send_message_item(to_user_id, context_token, item).await
+        self.send_message_item(to_user_id, context_token, item)
+            .await
     }
 
     /// 出站媒体上传公共链路（deliver_file / deliver_voice 共用）：
@@ -1413,7 +1448,10 @@ impl WechatPlatform {
         let md5_hex = {
             use md5::Digest;
             let digest = md5::Md5::digest(plain);
-            digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         };
 
         // 1. getuploadurl
@@ -1559,7 +1597,10 @@ impl WechatPlatform {
                 ),
             );
             if let Some(sample_rate) = captured.sample_rate {
-                voice_item.insert("sample_rate".to_string(), serde_json::Value::from(sample_rate));
+                voice_item.insert(
+                    "sample_rate".to_string(),
+                    serde_json::Value::from(sample_rate),
+                );
             }
             if let Some(bits) = captured.bits_per_sample {
                 voice_item.insert("bits_per_sample".to_string(), serde_json::Value::from(bits));
@@ -1575,7 +1616,9 @@ impl WechatPlatform {
                 "connect: wechat voice ECHO mode: sending captured inbound voice verbatim"
             );
             self.rate_limiter.wait(to_user_id).await;
-            return self.send_message_item(to_user_id, context_token, item).await;
+            return self
+                .send_message_item(to_user_id, context_token, item)
+                .await;
         }
         let normalized = wechat_voice::normalize_for_tts(text);
         // 默认 file 投递：TTS 直接合成 mp3 → FILE 通道上传 → file_item
@@ -1611,13 +1654,13 @@ impl WechatPlatform {
                 mp3.len(),
             );
             self.rate_limiter.wait(to_user_id).await;
-            return self.send_message_item(to_user_id, context_token, item).await;
+            return self
+                .send_message_item(to_user_id, context_token, item)
+                .await;
         }
         // bubble 投递（实验）：SILK 语音条路径。
-        let segments = wechat_voice::segment_for_tts(
-            &normalized,
-            wechat_voice::MAX_VOICE_SEGMENT_CHARS,
-        );
+        let segments =
+            wechat_voice::segment_for_tts(&normalized, wechat_voice::MAX_VOICE_SEGMENT_CHARS);
         if segments.is_empty() {
             return Err(PlatformError::other("语音文本规范化后为空"));
         }
@@ -1633,9 +1676,13 @@ impl WechatPlatform {
                 .await
                 .map_err(PlatformError::other)?;
             // 60 秒上限：按字节截断 PCM（对齐帧边界由编码器的补零逻辑兜底）。
-            let max_bytes =
-                (voice.sample_rate as usize * 2) * (wechat_voice::MAX_VOICE_DURATION_MS as usize / 1000);
-            let pcm = if pcm.len() > max_bytes { &pcm[..max_bytes] } else { &pcm[..] };
+            let max_bytes = (voice.sample_rate as usize * 2)
+                * (wechat_voice::MAX_VOICE_DURATION_MS as usize / 1000);
+            let pcm = if pcm.len() > max_bytes {
+                &pcm[..max_bytes]
+            } else {
+                &pcm[..]
+            };
             let playtime_ms = wechat_voice::pcm_duration_ms(pcm.len(), voice.sample_rate);
             let mut silk = wechat_voice::encode_silk_tencent(pcm, voice.sample_rate, voice.bitrate)
                 .map_err(PlatformError::other)?;
@@ -1675,7 +1722,8 @@ impl WechatPlatform {
                 silk.len(),
             );
             self.rate_limiter.wait(to_user_id).await;
-            self.send_message_item(to_user_id, context_token, item).await?;
+            self.send_message_item(to_user_id, context_token, item)
+                .await?;
         }
         Ok(())
     }
@@ -1693,9 +1741,7 @@ impl WechatPlatform {
                 return value;
             }
         }
-        let observed = self
-            .observed_voice_encode_type
-            .load(Ordering::Relaxed);
+        let observed = self.observed_voice_encode_type.load(Ordering::Relaxed);
         if observed != 0 {
             observed
         } else {
@@ -1768,9 +1814,10 @@ impl WechatPlatform {
             tracing::warn!("connect: wechat login link: {link}");
         }
 
-        let qrcode_id = parsed.qrcode.filter(|value| !value.is_empty()).ok_or_else(
-            || PlatformError::other("get_bot_qrcode response missing qrcode id"),
-        )?;
+        let qrcode_id = parsed
+            .qrcode
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlatformError::other("get_bot_qrcode response missing qrcode id"))?;
 
         let deadline = tokio::time::Instant::now() + QR_LOGIN_TIMEOUT;
         loop {
@@ -1831,7 +1878,10 @@ impl WechatPlatform {
                     .as_deref()
                     .filter(|value| value.starts_with("https://"))
                 {
-                    *self.base_url.write().expect("wechat base_url lock poisoned") =
+                    *self
+                        .base_url
+                        .write()
+                        .expect("wechat base_url lock poisoned") =
                         baseurl.trim_end_matches('/').to_string();
                 }
                 *self.token.write().expect("wechat token lock poisoned") = token;
@@ -2121,20 +2171,22 @@ impl Platform for WechatPlatform {
         );
         for chunk in chunk_message(&visible_text, WECHAT_MESSAGE_CHARS) {
             self.rate_limiter.wait(&to_user_id).await;
-            self.send_message(&to_user_id, &context_token, &chunk).await?;
+            self.send_message(&to_user_id, &context_token, &chunk)
+                .await?;
         }
         for path in files {
             self.rate_limiter.wait(&to_user_id).await;
-            if let Err(error) = self
-                .deliver_file(&to_user_id, &context_token, &path)
-                .await
-            {
+            if let Err(error) = self.deliver_file(&to_user_id, &context_token, &path).await {
                 tracing::warn!(
                     "connect: wechat file delivery failed for {}: {error}",
                     path.display()
                 );
-                let notice =
-                    format!("[文件发送失败：{}] {error}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+                let notice = format!(
+                    "[文件发送失败：{}] {error}",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                );
                 self.rate_limiter.wait(&to_user_id).await;
                 let _ = self
                     .send_message(&to_user_id, &context_token, &notice)
@@ -2150,10 +2202,7 @@ impl Platform for WechatPlatform {
             voice_texts.push(text);
         }
         for text in voice_texts {
-            if let Err(error) = self
-                .deliver_voice(&to_user_id, &context_token, &text)
-                .await
-            {
+            if let Err(error) = self.deliver_voice(&to_user_id, &context_token, &text).await {
                 tracing::warn!("connect: wechat voice delivery failed: {error}");
                 let fallback = if auto_voice_active {
                     format!("（语音合成失败，已改用文字：{error}）\n{text}")
@@ -2162,9 +2211,7 @@ impl Platform for WechatPlatform {
                 };
                 for chunk in chunk_message(&fallback, WECHAT_MESSAGE_CHARS) {
                     self.rate_limiter.wait(&to_user_id).await;
-                    let _ = self
-                        .send_message(&to_user_id, &context_token, &chunk)
-                        .await;
+                    let _ = self.send_message(&to_user_id, &context_token, &chunk).await;
                 }
             }
         }
@@ -2250,7 +2297,7 @@ mod tests {
                 "get_updates_buf": "CURSOR-1"
             }),
         )
-            .await;
+        .await;
 
         let platform = platform_with_stub(server.uri());
         let events = platform.poll_once().await.expect("poll_once succeeds");
@@ -2266,11 +2313,19 @@ mod tests {
                 // 回复路由依赖的不透明上下文：to_user_id + 原样回传的
                 // context_token。
                 assert_eq!(
-                    message.reply_ctx.0.get("to_user_id").and_then(|v| v.as_str()),
+                    message
+                        .reply_ctx
+                        .0
+                        .get("to_user_id")
+                        .and_then(|v| v.as_str()),
                     Some("wxid_user@im.wechat")
                 );
                 assert_eq!(
-                    message.reply_ctx.0.get("context_token").and_then(|v| v.as_str()),
+                    message
+                        .reply_ctx
+                        .0
+                        .get("context_token")
+                        .and_then(|v| v.as_str()),
                     Some("CTX-TOKEN-1")
                 );
             }
@@ -2278,10 +2333,7 @@ mod tests {
         }
 
         // 游标已推进。
-        assert_eq!(
-            platform.cursor.lock().await.as_deref(),
-            Some("CURSOR-1")
-        );
+        assert_eq!(platform.cursor.lock().await.as_deref(), Some("CURSOR-1"));
     }
 
     /// `message_type == 2` 是机器人出站回显——不过滤就会自回复死循环；
@@ -2318,7 +2370,7 @@ mod tests {
             &server,
             serde_json::json!({ "ret": 0, "msgs": [], "get_updates_buf": "CURSOR-A" }),
         )
-            .await;
+        .await;
 
         let platform = platform_with_stub(server.uri());
         platform.poll_once().await.unwrap();
@@ -2327,7 +2379,10 @@ mod tests {
         let requests = wait_for_requests(&server, 2).await;
         let first = body_json(&requests[0]);
         let second = body_json(&requests[1]);
-        assert_eq!(first.get("get_updates_buf").and_then(|v| v.as_str()), Some(""));
+        assert_eq!(
+            first.get("get_updates_buf").and_then(|v| v.as_str()),
+            Some("")
+        );
         assert_eq!(
             second.get("get_updates_buf").and_then(|v| v.as_str()),
             Some("CURSOR-A")
@@ -2343,7 +2398,7 @@ mod tests {
             &server,
             serde_json::json!({ "ret": 0, "msgs": [], "get_updates_buf": "CURSOR-PERSISTED" }),
         )
-            .await;
+        .await;
 
         let state_dir = std::env::temp_dir().join(format!(
             "bamboo-wechat-cursor-test-{}",
@@ -2420,11 +2475,10 @@ mod tests {
             );
             // bot 发送时 from_user_id 为空串、client_id 为客户端生成的 id。
             assert_eq!(msg.get("from_user_id").and_then(|v| v.as_str()), Some(""));
-            assert!(
-                msg.get("client_id")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|v| !v.is_empty())
-            );
+            assert!(msg
+                .get("client_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| !v.is_empty()));
             assert_eq!(
                 msg.get("context_token").and_then(|v| v.as_str()),
                 Some("CTX-REPLY-1")
@@ -2451,7 +2505,7 @@ mod tests {
             &server,
             serde_json::json!({ "ret": -14, "errmsg": "session expired" }),
         )
-            .await;
+        .await;
 
         let platform = platform_with_stub(server.uri());
         let error = platform.poll_once().await.expect_err("ret=-14 must fail");
@@ -2538,10 +2592,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let state_dir = std::env::temp_dir().join(format!(
-            "bamboo-wechat-qr-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let state_dir =
+            std::env::temp_dir().join(format!("bamboo-wechat-qr-test-{}", uuid::Uuid::new_v4()));
         let platform = WechatPlatform::with_options(
             String::new(),
             server.uri(),
@@ -2553,7 +2605,10 @@ mod tests {
         platform.qr_login().await.expect("qr_login succeeds");
 
         assert_eq!(platform.token(), "fresh-ilink-token");
-        assert_eq!(platform.base_url(), "https://ilink-bot-specific.example.com");
+        assert_eq!(
+            platform.base_url(),
+            "https://ilink-bot-specific.example.com"
+        );
 
         let _ = std::fs::remove_dir_all(state_dir);
     }
@@ -2630,7 +2685,7 @@ mod tests {
                 "get_updates_buf": "CURSOR-V"
             }),
         )
-            .await;
+        .await;
 
         let platform = platform_with_stub(server.uri());
         let events = platform.poll_once().await.expect("poll_once succeeds");
@@ -2683,16 +2738,19 @@ mod tests {
     fn normalize_media_key_accepts_hex_and_base64_forms() {
         // hex 字段：32 个 hex 字符。
         let hex_key = normalize_media_key(Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0"), None);
-        assert_eq!(hex_key, Some([0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2, 0xe1, 0xf0]));
+        assert_eq!(
+            hex_key,
+            Some([
+                0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2,
+                0xe1, 0xf0
+            ])
+        );
         // base64 字段：16 字节密钥。
         let b64 = base64::engine::general_purpose::STANDARD.encode([1u8; 16]);
-        assert_eq!(
-            normalize_media_key(None, Some(&b64)),
-            Some([1u8; 16])
-        );
+        assert_eq!(normalize_media_key(None, Some(&b64)), Some([1u8; 16]));
         // base64 字段装的是 32 字符 hex ASCII（cc-connect 兼容形态）。
-        let b64_hex = base64::engine::general_purpose::STANDARD
-            .encode(b"0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        let b64_hex =
+            base64::engine::general_purpose::STANDARD.encode(b"0f1e2d3c4b5a69788796a5b4c3d2e1f0");
         assert!(normalize_media_key(None, Some(&b64_hex)).is_some());
         assert_eq!(normalize_media_key(None, Some("!!!!")), None);
         assert_eq!(normalize_media_key(None, None), None);
@@ -2721,9 +2779,7 @@ mod tests {
         let cdn = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/download"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_bytes(encrypted.clone()),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(encrypted.clone()))
             .mount(&cdn)
             .await;
 
@@ -2755,10 +2811,8 @@ mod tests {
         )
             .await;
 
-        let state_dir = std::env::temp_dir().join(format!(
-            "bamboo-wechat-img-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let state_dir =
+            std::env::temp_dir().join(format!("bamboo-wechat-img-test-{}", uuid::Uuid::new_v4()));
         let platform = WechatPlatform::with_options(
             TEST_TOKEN.to_string(),
             api.uri(),
@@ -2772,7 +2826,11 @@ mod tests {
         assert_eq!(events.len(), 1, "a pure-image message must map");
         match &events[0] {
             Inbound::Message(message) => {
-                assert!(message.text.starts_with("[图片] "), "text was: {}", message.text);
+                assert!(
+                    message.text.starts_with("[图片] "),
+                    "text was: {}",
+                    message.text
+                );
                 let path = message.text.trim_start_matches("[图片] ").trim();
                 let saved = std::fs::read(path).expect("image file exists on disk");
                 assert_eq!(saved, plain, "decrypted bytes must match the plaintext");
@@ -2796,7 +2854,8 @@ mod tests {
 
     #[test]
     fn send_file_markers_are_extracted_and_stripped() {
-        let text = "这是报告：\n[SEND_FILE: C:\\reports\\季报.docx]\n[SEND_FILE: /tmp/a.png]\n请查收。";
+        let text =
+            "这是报告：\n[SEND_FILE: C:\\reports\\季报.docx]\n[SEND_FILE: /tmp/a.png]\n请查收。";
         let (visible, files) = extract_send_file_markers(text);
         assert_eq!(visible, "这是报告：\n请查收。");
         assert_eq!(
@@ -2823,10 +2882,8 @@ mod tests {
     /// len 为明文长度）。
     #[tokio::test]
     async fn reply_delivers_send_file_markers_via_cdn_upload() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "bamboo-wechat-outbound-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let state_dir =
+            std::env::temp_dir().join(format!("bamboo-wechat-outbound-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&state_dir).unwrap();
         let docx = state_dir.join("报告.docx");
         std::fs::write(&docx, b"PK\x03\x04 fake-docx-bytes").unwrap();
@@ -2877,10 +2934,7 @@ mod tests {
         platform
             .reply(
                 &ctx,
-                OutboundMessage::text(format!(
-                    "报告来了\n[SEND_FILE: {}]",
-                    docx.to_string_lossy()
-                )),
+                OutboundMessage::text(format!("报告来了\n[SEND_FILE: {}]", docx.to_string_lossy())),
             )
             .await
             .expect("reply succeeds");
@@ -2903,7 +2957,9 @@ mod tests {
         );
         let media = file_item.pointer("/media").unwrap();
         assert_eq!(
-            media.pointer("/encrypt_query_param").and_then(|v| v.as_str()),
+            media
+                .pointer("/encrypt_query_param")
+                .and_then(|v| v.as_str()),
             Some("DL-PARAM-9")
         );
         assert_eq!(
@@ -2965,9 +3021,7 @@ mod tests {
     async fn mount_siliconflow_tts(server: &wiremock::MockServer, pcm_bytes: usize) {
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/audio/speech"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0u8; pcm_bytes]),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(vec![0u8; pcm_bytes]))
             .mount(server)
             .await;
     }
@@ -3114,7 +3168,9 @@ mod tests {
             .find(|request| request.url.path().contains("getuploadurl"))
             .expect("getuploadurl called");
         assert_eq!(
-            body_json(upload_req).get("media_type").and_then(|v| v.as_i64()),
+            body_json(upload_req)
+                .get("media_type")
+                .and_then(|v| v.as_i64()),
             Some(UPLOAD_MEDIA_FILE)
         );
 
@@ -3136,7 +3192,9 @@ mod tests {
             Some(16_000)
         );
         assert_eq!(
-            voice_item.pointer("/bits_per_sample").and_then(|v| v.as_i64()),
+            voice_item
+                .pointer("/bits_per_sample")
+                .and_then(|v| v.as_i64()),
             Some(16)
         );
         assert_eq!(
@@ -3240,7 +3298,9 @@ mod tests {
             )),
         )
         .with_cdn_base(cdn.uri());
-        sender.observed_voice_encode_type.store(1, Ordering::Relaxed);
+        sender
+            .observed_voice_encode_type
+            .store(1, Ordering::Relaxed);
 
         sender
             .reply(
@@ -3276,11 +3336,7 @@ mod tests {
         let cdn = wiremock::MockServer::start().await;
         mount_cdn_upload(&cdn).await;
 
-        let mut voice = test_voice_config(
-            tts.uri(),
-            wechat_voice::VoiceReplyMode::Off,
-            false,
-        );
+        let mut voice = test_voice_config(tts.uri(), wechat_voice::VoiceReplyMode::Off, false);
         voice.delivery = wechat_voice::VoiceDelivery::File;
         let platform = WechatPlatform::with_options(
             TEST_TOKEN.to_string(),
@@ -3318,7 +3374,9 @@ mod tests {
             .find(|request| request.url.path().contains("getuploadurl"))
             .expect("getuploadurl called");
         assert_eq!(
-            body_json(upload_req).get("media_type").and_then(|v| v.as_i64()),
+            body_json(upload_req)
+                .get("media_type")
+                .and_then(|v| v.as_i64()),
             Some(UPLOAD_MEDIA_FILE)
         );
         // sendmessage 携带 file_item（mp3 文件名 + len 字符串）。
@@ -3332,15 +3390,16 @@ mod tests {
             .pointer("/file_name")
             .and_then(|v| v.as_str())
             .expect("file_name present");
-        assert!(name.starts_with("语音回复-") && name.ends_with(".mp3"), "{name}");
+        assert!(
+            name.starts_with("语音回复-") && name.ends_with(".mp3"),
+            "{name}"
+        );
         assert_eq!(
             file_item.pointer("/len").and_then(|v| v.as_str()),
             Some("4096")
         );
         assert!(
-            file_msg
-                .pointer("/msg/item_list/0/voice_item")
-                .is_none(),
+            file_msg.pointer("/msg/item_list/0/voice_item").is_none(),
             "file delivery must not construct a voice_item"
         );
     }
@@ -3407,7 +3466,10 @@ mod tests {
             )
             .with_cdn_base(cdn.uri());
             platform
-                .reply(&reply_ctx_with(false), OutboundMessage::text("好的，明天见"))
+                .reply(
+                    &reply_ctx_with(false),
+                    OutboundMessage::text("好的，明天见"),
+                )
                 .await
                 .expect("reply succeeds");
 
@@ -3457,9 +3519,10 @@ mod tests {
         let tts = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/audio/speech"))
-            .respond_with(wiremock::ResponseTemplate::new(500).set_body_json(
-                serde_json::json!({ "message": "额度不足" }),
-            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500)
+                    .set_body_json(serde_json::json!({ "message": "额度不足" })),
+            )
             .mount(&tts)
             .await;
         let api = wiremock::MockServer::start().await;
@@ -3481,7 +3544,10 @@ mod tests {
         .with_cdn_base(cdn.uri());
 
         platform
-            .reply(&reply_ctx_with(false), OutboundMessage::text("好的，明天见"))
+            .reply(
+                &reply_ctx_with(false),
+                OutboundMessage::text("好的，明天见"),
+            )
             .await
             .expect("reply succeeds");
 
@@ -3519,9 +3585,7 @@ mod tests {
         let cdn = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/download"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_bytes(encrypted.clone()),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_bytes(encrypted.clone()))
             .mount(&cdn)
             .await;
 
@@ -3557,10 +3621,8 @@ mod tests {
         let siliconflow = wiremock::MockServer::start().await;
         mount_siliconflow_asr(&siliconflow, " 会议纪要内容 ").await;
 
-        let state_dir = std::env::temp_dir().join(format!(
-            "bamboo-wechat-asr-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let state_dir =
+            std::env::temp_dir().join(format!("bamboo-wechat-asr-test-{}", uuid::Uuid::new_v4()));
         let platform = WechatPlatform::with_options(
             TEST_TOKEN.to_string(),
             api.uri(),
@@ -3586,7 +3648,11 @@ mod tests {
         match &events[0] {
             Inbound::Message(message) => {
                 assert!(message.text.contains("[文件] "), "got: {}", message.text);
-                assert!(message.text.contains("meeting.mp3"), "got: {}", message.text);
+                assert!(
+                    message.text.contains("meeting.mp3"),
+                    "got: {}",
+                    message.text
+                );
                 assert!(
                     message.text.contains("[音频转写] 会议纪要内容"),
                     "got: {}",
@@ -3603,7 +3669,10 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        assert!(content_type.starts_with("multipart/form-data"), "got: {content_type}");
+        assert!(
+            content_type.starts_with("multipart/form-data"),
+            "got: {content_type}"
+        );
         assert!(requests[0]
             .body
             .windows(b"meeting.mp3".len())

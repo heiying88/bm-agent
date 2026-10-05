@@ -81,7 +81,7 @@ impl VoiceConfig {
         let api_key = api_key
             .map(str::trim)
             .filter(|key| !key.is_empty())?
-        .to_string();
+            .to_string();
 
         let reply_mode = match config.reply_mode.as_deref().map(str::trim) {
             None | Some("") | Some("off") => VoiceReplyMode::Off,
@@ -171,10 +171,7 @@ struct SilkEncControl {
 
 extern "C" {
     fn SKP_Silk_SDK_Get_Encoder_Size(enc_size_bytes: *mut c_int) -> c_int;
-    fn SKP_Silk_SDK_InitEncoder(
-        enc_state: *mut c_void,
-        enc_status: *mut SilkEncControl,
-    ) -> c_int;
+    fn SKP_Silk_SDK_InitEncoder(enc_state: *mut c_void, enc_status: *mut SilkEncControl) -> c_int;
     fn SKP_Silk_SDK_Encode(
         enc_state: *const c_void,
         enc_control: *const SilkEncControl,
@@ -196,11 +193,7 @@ const SILK_MAX_BYTES_PER_FRAME: usize = 250;
 /// 把 s16le 单声道 PCM 编码为微信语音条字节流（腾讯变体：
 /// `\x02#!SILK_V3` + 每包 `u16le 长度 + 载荷`，无标准变体的结尾标记）。
 /// `sample_rate` 须为 8000/12000/16000/24000 之一。
-pub fn encode_silk_tencent(
-    pcm: &[u8],
-    sample_rate: u32,
-    bitrate: i32,
-) -> Result<Vec<u8>, String> {
+pub fn encode_silk_tencent(pcm: &[u8], sample_rate: u32, bitrate: i32) -> Result<Vec<u8>, String> {
     if !matches!(sample_rate, 8_000 | 12_000 | 16_000 | 24_000) {
         return Err(format!("不支持的 SILK 采样率：{sample_rate}"));
     }
@@ -295,13 +288,21 @@ pub fn pcm_duration_ms(pcm_len: usize, sample_rate: u32) -> u64 {
 
 /// TTS 合成：`POST {base}/v1/audio/speech`，直接返回 s16le 单声道 PCM
 /// （`response_format=pcm`），采样率与 SILK 编码档位一致（cfg.sample_rate）。
-pub async fn synthesize_pcm(http: &reqwest::Client, cfg: &VoiceConfig, text: &str) -> Result<Vec<u8>, String> {
+pub async fn synthesize_pcm(
+    http: &reqwest::Client,
+    cfg: &VoiceConfig,
+    text: &str,
+) -> Result<Vec<u8>, String> {
     synthesize_audio(http, cfg, text, "pcm", cfg.sample_rate).await
 }
 
 /// TTS 合成 mp3（`file` 投递形态）。硅基流动 mp3 只支持 32000/44100 采样率
 /// （与 pcm 档位不同），固定请求 44100。
-pub async fn synthesize_mp3(http: &reqwest::Client, cfg: &VoiceConfig, text: &str) -> Result<Vec<u8>, String> {
+pub async fn synthesize_mp3(
+    http: &reqwest::Client,
+    cfg: &VoiceConfig,
+    text: &str,
+) -> Result<Vec<u8>, String> {
     synthesize_audio(http, cfg, text, "mp3", 44_100).await
 }
 
@@ -331,7 +332,10 @@ async fn synthesize_audio(
     if !response.status().is_success() {
         let status = response.status();
         let detail = response.text().await.unwrap_or_default();
-        return Err(format!("TTS 返回 HTTP {status}：{}", truncate_error(&detail)));
+        return Err(format!(
+            "TTS 返回 HTTP {status}：{}",
+            truncate_error(&detail)
+        ));
     }
     // 错误时接口返回 JSON；成功返回音频二进制。
     let content_type = response
@@ -414,7 +418,10 @@ pub async fn transcribe_file(
     if !response.status().is_success() {
         let status = response.status();
         let detail = response.text().await.unwrap_or_default();
-        return Err(format!("转写返回 HTTP {status}：{}", truncate_error(&detail)));
+        return Err(format!(
+            "转写返回 HTTP {status}：{}",
+            truncate_error(&detail)
+        ));
     }
     let parsed: serde_json::Value = response
         .json()
@@ -698,8 +705,7 @@ mod tests {
         assert!(VoiceConfig::from_config(None, &none).is_none());
 
         let mut configured = bamboo_config::WechatVoiceConfig::default();
-        let parsed =
-            VoiceConfig::from_config(Some("sk-test"), &configured).expect("enabled");
+        let parsed = VoiceConfig::from_config(Some("sk-test"), &configured).expect("enabled");
         assert_eq!(parsed.reply_mode, VoiceReplyMode::Off);
         // 默认对齐微信自己的语音条画像（入站取证：16kHz）。
         assert_eq!(parsed.sample_rate, 16_000);
@@ -710,15 +716,13 @@ mod tests {
         assert_eq!(parsed.base_url, DEFAULT_SILICONFLOW_BASE_URL);
 
         configured.delivery = Some("bubble".to_string());
-        let parsed =
-            VoiceConfig::from_config(Some("sk-test"), &configured).expect("enabled");
+        let parsed = VoiceConfig::from_config(Some("sk-test"), &configured).expect("enabled");
         assert_eq!(parsed.delivery, VoiceDelivery::Bubble);
 
         configured.reply_mode = Some("mirror".to_string());
         configured.file_asr = Some("on".to_string());
         configured.tts_sample_rate = Some(16_000);
-        let parsed =
-            VoiceConfig::from_config(Some("  sk-test  "), &configured).expect("enabled");
+        let parsed = VoiceConfig::from_config(Some("  sk-test  "), &configured).expect("enabled");
         assert_eq!(parsed.reply_mode, VoiceReplyMode::Mirror);
         assert!(parsed.file_asr);
         assert_eq!(parsed.sample_rate, 16_000);
@@ -749,7 +753,10 @@ mod tests {
         let normalized = normalize_for_tts(
             "# 标题\n- **重点**是 `速度`\n详见 [文档](https://example.com/a) 或 https://b.cn/x\n好的😀",
         );
-        assert!(normalized.contains("重点") && normalized.contains("速度"), "got: {normalized}");
+        assert!(
+            normalized.contains("重点") && normalized.contains("速度"),
+            "got: {normalized}"
+        );
         assert!(!normalized.contains("**"));
         assert!(!normalized.contains('`'));
         assert!(!normalized.contains('#'));
@@ -766,7 +773,10 @@ mod tests {
         let segments = segment_for_tts("第一句话。第二句话！这是第三句；还有第四句呢。", 10);
         assert!(!segments.is_empty());
         assert!(segments.iter().all(|segment| segment.chars().count() <= 10));
-        assert_eq!(segments.join(""), "第一句话。第二句话！这是第三句；还有第四句呢。");
+        assert_eq!(
+            segments.join(""),
+            "第一句话。第二句话！这是第三句；还有第四句呢。"
+        );
 
         // 无句读超长文本硬切。
         let long = "长".repeat(60);

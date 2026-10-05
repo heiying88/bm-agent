@@ -139,8 +139,14 @@ pub(crate) struct PreparedProviderCredentialUpdate {
     pub required_refs: Vec<CredentialRef>,
 }
 
-pub(crate) type PersistedConnectCredentialRefs =
-    BTreeMap<String, (Option<CredentialRef>, Option<CredentialRef>, Option<CredentialRef>)>;
+pub(crate) type PersistedConnectCredentialRefs = BTreeMap<
+    String,
+    (
+        Option<CredentialRef>,
+        Option<CredentialRef>,
+        Option<CredentialRef>,
+    ),
+>;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PersistedAccessCredentialRefs {
@@ -1717,7 +1723,6 @@ impl CredentialStore {
                 }
             }
         }
-
 
         for (index, platform) in config.connect.platforms.iter_mut().enumerate() {
             let id = platform

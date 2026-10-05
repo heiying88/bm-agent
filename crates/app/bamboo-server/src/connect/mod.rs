@@ -212,21 +212,16 @@ impl ConnectManager {
                     }
 
                     // 轮询游标与扫码重登二维码的落盘目录（非秘密）。
-                    let state_dir = data_dir
-                        .as_ref()
-                        .map(|dir| dir.join("connect_wechat"));
+                    let state_dir = data_dir.as_ref().map(|dir| dir.join("connect_wechat"));
                     // 语音能力：`voice` 段（非秘密参数）+ 平台级 secret
                     // `voice_api_key`（token 同款加密管道水合）。密钥缺失
                     // 时为 None，全部语音行为关闭。
-                    let voice = platform_cfg
-                        .voice
-                        .as_ref()
-                        .and_then(|voice_cfg| {
-                            platforms::wechat_voice::VoiceConfig::from_config(
-                                platform_cfg.voice_api_key.as_deref(),
-                                voice_cfg,
-                            )
-                        });
+                    let voice = platform_cfg.voice.as_ref().and_then(|voice_cfg| {
+                        platforms::wechat_voice::VoiceConfig::from_config(
+                            platform_cfg.voice_api_key.as_deref(),
+                            voice_cfg,
+                        )
+                    });
                     if let Some(voice) = &voice {
                         tracing::info!(
                             "connect: wechat voice enabled reply_mode={:?} delivery={:?} file_asr={} \
@@ -238,12 +233,9 @@ impl ConnectManager {
                             voice.bitrate
                         );
                     }
-                    let platform: Arc<dyn Platform> = Arc::new(platforms::wechat::WechatPlatform::new(
-                        token,
-                        base_url,
-                        state_dir,
-                        voice,
-                    ));
+                    let platform: Arc<dyn Platform> = Arc::new(
+                        platforms::wechat::WechatPlatform::new(token, base_url, state_dir, voice),
+                    );
                     spawn_platform_tasks(
                         &mut tasks,
                         &bridge,
@@ -585,7 +577,10 @@ mod tests {
             resolve_wechat_base_url(Some("https://ilink-proxy.example.corp/")).as_deref(),
             Some("https://ilink-proxy.example.corp")
         );
-        assert_eq!(resolve_wechat_base_url(Some("http://insecure.example")), None);
+        assert_eq!(
+            resolve_wechat_base_url(Some("http://insecure.example")),
+            None
+        );
         assert_eq!(resolve_wechat_base_url(Some("telegram")), None);
     }
 

@@ -701,10 +701,12 @@ mod tests {
         );
         // 密钥绝不明文落盘（加密管道）；voice 非秘密参数正常持久化。
         let connect_file = std::fs::read_to_string(dir.path().join("connect.json")).unwrap();
-        assert!(!connect_file.contains("sk-voice-1"), "plaintext key must never hit disk");
+        assert!(
+            !connect_file.contains("sk-voice-1"),
+            "plaintext key must never hit disk"
+        );
         assert!(connect_file.contains("reply_mode")); // pretty-print 形态不定，只验字段存在
-        assert!(state.config.read().await.connect.platforms[0]
-            .voice_api_key_configured);
+        assert!(state.config.read().await.connect.platforms[0].voice_api_key_configured);
         assert_eq!(
             state.config.read().await.connect.platforms[0]
                 .voice_api_key
@@ -714,8 +716,7 @@ mod tests {
         assert!(state.config.read().await.connect.platforms[0]
             .voice
             .as_ref()
-            .is_some_and(|voice| voice.reply_mode.as_deref() == Some("mirror"))
-        );
+            .is_some_and(|voice| voice.reply_mode.as_deref() == Some("mirror")));
 
         // 2) 不含 voice 的整单保存（旧客户端形态）——voice 必须保留。
         let keep = test::call_service(

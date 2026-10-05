@@ -7417,11 +7417,11 @@ mod tests {
         token_encrypted: &str,
     ) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
-        voice: None,
-        voice_api_key: None,
-        voice_api_key_encrypted: None,
-        voice_api_key_credential_ref: None,
-        voice_api_key_configured: false,
+            voice: None,
+            voice_api_key: None,
+            voice_api_key_encrypted: None,
+            voice_api_key_credential_ref: None,
+            voice_api_key_configured: false,
             id: None,
             project_id: None,
             platform_type: platform_type.to_string(),

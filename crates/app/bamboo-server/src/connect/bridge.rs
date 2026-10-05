@@ -275,9 +275,7 @@ const SET_PERMISSION_MARKER: &str = "[SET_PERMISSION: ";
 /// 剥离回复文本中的 `[SET_MODEL: x]` / `[SET_THINK: x]` /
 /// `[SET_PERMISSION: x]` 标记行，返回（可见文本, 模型/智能度/审批标记
 /// 列表）。与 SEND_FILE/SEND_VOICE 同款行级解析。
-fn extract_set_markers(
-    text: &str,
-) -> (String, Vec<String>, Vec<String>, Vec<String>) {
+fn extract_set_markers(text: &str) -> (String, Vec<String>, Vec<String>, Vec<String>) {
     let mut models = Vec::new();
     let mut thinks = Vec::new();
     let mut permissions = Vec::new();
@@ -333,7 +331,10 @@ impl Platform for MarkerPlatform {
         self.inner.capabilities()
     }
 
-    async fn start(&self, _inbound: mpsc::Sender<super::platform::Inbound>) -> super::platform::PlatformResult<()> {
+    async fn start(
+        &self,
+        _inbound: mpsc::Sender<super::platform::Inbound>,
+    ) -> super::platform::PlatformResult<()> {
         // 装饰器只挂在回复路径上，不会被 spawn；防御性转发。
         self.inner.start(_inbound).await
     }
@@ -343,13 +344,9 @@ impl Platform for MarkerPlatform {
         ctx: &ReplyCtx,
         msg: OutboundMessage,
     ) -> super::platform::PlatformResult<super::platform::MessageRef> {
-        if ![
-            SET_MODEL_MARKER,
-            SET_THINK_MARKER,
-            SET_PERMISSION_MARKER,
-        ]
-        .iter()
-        .any(|marker| msg.text.contains(marker))
+        if ![SET_MODEL_MARKER, SET_THINK_MARKER, SET_PERMISSION_MARKER]
+            .iter()
+            .any(|marker| msg.text.contains(marker))
         {
             return self.inner.reply(ctx, msg).await;
         }
@@ -539,7 +536,10 @@ fn configured_model_choices(config: &Config) -> Vec<ModelChoice> {
 
 /// 按名称匹配模型：先精确，再唯一子串（大小写不敏感，如 "flash" 命中
 /// glm-5.3-flash）；歧义或未命中返回带清单的错误文案。
-fn match_model_choice<'a>(choices: &'a [ModelChoice], query: &str) -> Result<&'a ModelChoice, String> {
+fn match_model_choice<'a>(
+    choices: &'a [ModelChoice],
+    query: &str,
+) -> Result<&'a ModelChoice, String> {
     if let Some(exact) = choices.iter().find(|choice| choice.name == query.trim()) {
         return Ok(exact);
     }
@@ -556,8 +556,7 @@ fn match_model_choice<'a>(choices: &'a [ModelChoice], query: &str) -> Result<&'a
         )),
         many => Err(format!(
             "「{query}」匹配到多个模型，请用完整名称：\n{}",
-            many
-                .iter()
+            many.iter()
                 .map(|choice| format!("· {}（{}）", choice.name, choice.label))
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -958,8 +957,12 @@ impl ConnectBridge {
                     reply_text(&platform, &msg.reply_ctx, notice).await;
                 }
                 Err(error) => {
-                    reply_text(&platform, &msg.reply_ctx, format!("切换审批模式失败：{error}"))
-                        .await;
+                    reply_text(
+                        &platform,
+                        &msg.reply_ctx,
+                        format!("切换审批模式失败：{error}"),
+                    )
+                    .await;
                 }
             }
             return;
@@ -1106,7 +1109,9 @@ impl ConnectBridge {
             return;
         }
 
-        self.clone().run_prompt(key, platform, &msg.reply_ctx, text).await;
+        self.clone()
+            .run_prompt(key, platform, &msg.reply_ctx, text)
+            .await;
     }
 
     async fn handle_stop(&self, key: &str, platform: &Arc<dyn Platform>, reply_ctx: &ReplyCtx) {
@@ -1183,19 +1188,28 @@ impl ConnectBridge {
             let text = format!(
                 "当前智能度：{}（{}）\n{VALID}\n/think <值> 切换；/think reset 恢复配置默认",
                 effective.map(|effort| effort.as_str()).unwrap_or("未设置"),
-                if override_effort.is_some() { "会话手动档" } else { "配置默认" },
+                if override_effort.is_some() {
+                    "会话手动档"
+                } else {
+                    "配置默认"
+                },
             );
             reply_text(platform, reply_ctx, text).await;
             return;
         };
         if matches!(arg, "reset" | "重置" | "默认") {
-            match self.clear_session_meta_override(key, META_THINK_OVERRIDE).await {
-                Ok(()) => reply_text(
-                    platform,
-                    reply_ctx,
-                    "✅ 智能度已恢复配置默认（下一条消息生效）",
-                )
-                .await,
+            match self
+                .clear_session_meta_override(key, META_THINK_OVERRIDE)
+                .await
+            {
+                Ok(()) => {
+                    reply_text(
+                        platform,
+                        reply_ctx,
+                        "✅ 智能度已恢复配置默认（下一条消息生效）",
+                    )
+                    .await
+                }
                 Err(error) => reply_text(platform, reply_ctx, format!("切换失败：{error}")).await,
             }
             return;
@@ -1213,12 +1227,17 @@ impl ConnectBridge {
             .set_session_meta_override(key, META_THINK_OVERRIDE, effort.as_str())
             .await
         {
-            Ok(()) => reply_text(
-                platform,
-                reply_ctx,
-                format!("✅ 智能度已切换为 {}（下一条消息生效；/new 回默认）", effort.as_str()),
-            )
-            .await,
+            Ok(()) => {
+                reply_text(
+                    platform,
+                    reply_ctx,
+                    format!(
+                        "✅ 智能度已切换为 {}（下一条消息生效；/new 回默认）",
+                        effort.as_str()
+                    ),
+                )
+                .await
+            }
             Err(error) => reply_text(platform, reply_ctx, format!("切换失败：{error}")).await,
         }
     }
@@ -1255,13 +1274,18 @@ impl ConnectBridge {
         }
         let arg = arg.map(str::trim).unwrap_or_default();
         if matches!(arg, "reset" | "重置" | "默认") {
-            match self.clear_session_meta_override(key, META_MODEL_OVERRIDE).await {
-                Ok(()) => reply_text(
-                    platform,
-                    reply_ctx,
-                    "✅ 模型已恢复配置默认（下一条消息生效）",
-                )
-                .await,
+            match self
+                .clear_session_meta_override(key, META_MODEL_OVERRIDE)
+                .await
+            {
+                Ok(()) => {
+                    reply_text(
+                        platform,
+                        reply_ctx,
+                        "✅ 模型已恢复配置默认（下一条消息生效）",
+                    )
+                    .await
+                }
                 Err(error) => reply_text(platform, reply_ctx, format!("切换失败：{error}")).await,
             }
             return;
@@ -1283,15 +1307,17 @@ impl ConnectBridge {
             .set_session_meta_override(key, META_MODEL_OVERRIDE, &override_json)
             .await
         {
-            Ok(()) => reply_text(
-                platform,
-                reply_ctx,
-                format!(
-                    "✅ 模型已切换为 {}（{}·{}，下一条消息生效；/new 回默认）",
-                    matched.name, matched.label, matched.role
-                ),
-            )
-            .await,
+            Ok(()) => {
+                reply_text(
+                    platform,
+                    reply_ctx,
+                    format!(
+                        "✅ 模型已切换为 {}（{}·{}，下一条消息生效；/new 回默认）",
+                        matched.name, matched.label, matched.role
+                    ),
+                )
+                .await
+            }
             Err(error) => reply_text(platform, reply_ctx, format!("切换失败：{error}")).await,
         }
     }
@@ -1471,7 +1497,8 @@ impl ConnectBridge {
         text: &str,
     ) {
         let config_snapshot = self.ctx.config.read().await.clone();
-        let mut resolved = resolve_connect_run_config(&config_snapshot, &self.ctx.provider_registry);
+        let mut resolved =
+            resolve_connect_run_config(&config_snapshot, &self.ctx.provider_registry);
 
         if resolved
             .model_roster
@@ -1513,17 +1540,19 @@ impl ConnectBridge {
         // 不存在的 provider 实例）。
         let (model_override, think_override) = self.load_session_override(&key).await;
         if let Some(model_override) = &model_override {
-            let still_configured = configured_model_choices(&config_snapshot).iter().any(
-                |choice| {
-                    choice.name == model_override.model
-                        && choice.provider_name == model_override.provider_name
-                },
-            );
+            let still_configured =
+                configured_model_choices(&config_snapshot)
+                    .iter()
+                    .any(|choice| {
+                        choice.name == model_override.model
+                            && choice.provider_name == model_override.provider_name
+                    });
             if still_configured {
                 resolved.model_roster.model = Some(model_override.model.clone());
                 resolved.model_roster.provider_name = Some(model_override.provider_name.clone());
                 if !model_override.provider_type.is_empty() {
-                    resolved.model_roster.provider_type = Some(model_override.provider_type.clone());
+                    resolved.model_roster.provider_type =
+                        Some(model_override.provider_type.clone());
                 }
             } else {
                 tracing::warn!(
@@ -3149,9 +3178,13 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            bridge
-                .clone()
-                .render_until_settled(&key, platform.clone(), reply_ctx, "sess-external", rx),
+            bridge.clone().render_until_settled(
+                &key,
+                platform.clone(),
+                reply_ctx,
+                "sess-external",
+                rx,
+            ),
         )
         .await
         .expect("read-only legacy ask must not wait for an answer");
@@ -3430,7 +3463,10 @@ mod tests {
     // 会话级运行覆盖：/think 智能度、/model 模型切换、/models 查询
     // ------------------------------------------------------------------
 
-    fn provider_instance_config(model: &str, vision: Option<&str>) -> bamboo_config::ProviderInstanceConfig {
+    fn provider_instance_config(
+        model: &str,
+        vision: Option<&str>,
+    ) -> bamboo_config::ProviderInstanceConfig {
         bamboo_config::ProviderInstanceConfig {
             provider_type: "openai".to_string(),
             label: Some("智谱".to_string()),
@@ -3492,9 +3528,7 @@ mod tests {
         )
         .await;
         let sent = platform.sent.lock().await.clone();
-        assert!(sent
-            .iter()
-            .any(|text| text.contains("high（会话手动档）")));
+        assert!(sent.iter().any(|text| text.contains("high（会话手动档）")));
 
         // /think reset 清除。
         ConnectBridge::handle_inbound(
@@ -3540,9 +3574,9 @@ mod tests {
         )
         .await;
         let sent = platform.sent.lock().await.clone();
-        assert!(sent
-            .iter()
-            .any(|text| text.contains("glm-5.3") && text.contains("glm-5.3-flash") && text.contains("视觉")));
+        assert!(sent.iter().any(|text| text.contains("glm-5.3")
+            && text.contains("glm-5.3-flash")
+            && text.contains("视觉")));
 
         // 未匹配模型给出清单提示，不卡会话。
         ConnectBridge::handle_inbound(
@@ -3562,7 +3596,10 @@ mod tests {
             parse_effort_arg("超高"),
             Some(bamboo_domain::reasoning::ReasoningEffort::Xhigh)
         );
-        assert_eq!(parse_effort_arg("HIGH"), Some(bamboo_domain::reasoning::ReasoningEffort::High));
+        assert_eq!(
+            parse_effort_arg("HIGH"),
+            Some(bamboo_domain::reasoning::ReasoningEffort::High)
+        );
         assert_eq!(parse_effort_arg("banana"), None);
 
         let mut config = Config::default();
@@ -3577,9 +3614,14 @@ mod tests {
         assert_eq!(matched.name, "glm-5.3-flash");
         assert_eq!(matched.provider_type, "openai");
         // 精确匹配。
-        assert_eq!(match_model_choice(&choices, "glm-5.3").unwrap().name, "glm-5.3");
+        assert_eq!(
+            match_model_choice(&choices, "glm-5.3").unwrap().name,
+            "glm-5.3"
+        );
         // 未命中带清单。
-        assert!(match_model_choice(&choices, "nope").unwrap_err().contains("没有匹配到模型"));
+        assert!(match_model_choice(&choices, "nope")
+            .unwrap_err()
+            .contains("没有匹配到模型"));
     }
 
     #[tokio::test]
@@ -3635,8 +3677,13 @@ mod tests {
         sent.clear();
         drop(sent);
         wrapped
-            .reply(&ctx0, OutboundMessage::text("切好了
-[SET_MODEL: nope]"))
+            .reply(
+                &ctx0,
+                OutboundMessage::text(
+                    "切好了
+[SET_MODEL: nope]",
+                ),
+            )
             .await
             .unwrap();
         let sent = inner.sent.lock().await.clone();
