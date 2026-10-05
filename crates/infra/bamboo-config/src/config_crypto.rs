@@ -1076,6 +1076,25 @@ impl Config {
                     }
                 }
             }
+
+            let has_voice_api_key_plaintext = platform
+                .voice_api_key
+                .as_deref()
+                .map(str::trim)
+                .map(|value| !value.is_empty())
+                .unwrap_or(false);
+            if !has_voice_api_key_plaintext {
+                if let Some(encrypted) = platform.voice_api_key_encrypted.as_deref() {
+                    match crate::encryption::decrypt(encrypted) {
+                        Ok(value) => platform.voice_api_key = Some(value),
+                        Err(e) => tracing::warn!(
+                            "Failed to decrypt connect platform '{}' voice_api_key: {}",
+                            platform.platform_type,
+                            e
+                        ),
+                    }
+                }
+            }
         }
     }
 
@@ -1119,8 +1138,16 @@ impl Config {
                 &mut platform.app_secret,
                 allow_legacy_runtime_value,
             )?;
+            hydrate_optional_connect_secret(
+                resolver,
+                platform.voice_api_key_credential_ref.as_ref(),
+                platform.voice_api_key_configured,
+                &mut platform.voice_api_key,
+                allow_legacy_runtime_value,
+            )?;
             platform.token_encrypted = None;
             platform.app_secret_encrypted = None;
+            platform.voice_api_key_encrypted = None;
         }
         Ok(())
     }
@@ -1251,6 +1278,20 @@ impl Config {
                         )
                     })?);
             }
+
+            if platform.voice_api_key_credential_ref.is_some() {
+                platform.voice_api_key_encrypted = None;
+            }
+            let voice_api_key = platform.voice_api_key.as_deref().unwrap_or("").trim();
+            if platform.voice_api_key_credential_ref.is_none() && !voice_api_key.is_empty() {
+                platform.voice_api_key_encrypted =
+                    Some(crate::encryption::encrypt(voice_api_key).with_context(|| {
+                        format!(
+                            "Failed to encrypt connect platform '{}' voice_api_key",
+                            platform.platform_type
+                        )
+                    })?);
+            }
         }
         Ok(())
     }
@@ -1263,6 +1304,8 @@ impl Config {
             platform.token_encrypted = None;
             platform.app_secret = None;
             platform.app_secret_encrypted = None;
+            platform.voice_api_key = None;
+            platform.voice_api_key_encrypted = None;
         }
     }
 

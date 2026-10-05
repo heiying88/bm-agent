@@ -254,6 +254,330 @@ fn strip_command_suffix(text: &str) -> &str {
     text.split('@').next().unwrap_or(text)
 }
 
+// ---------------------------------------------------------------------------
+// 会话级运行覆盖（/think 智能度、/model 模型切换；网关聊天命令写入，
+// run_prompt 每次发消息前读取并覆盖配置解析结果——"下一条消息生效"）
+// ---------------------------------------------------------------------------
+
+/// 会话元数据键：模型覆盖（JSON：模型名 + 所属 provider 实例 + 类型）。
+const META_MODEL_OVERRIDE: &str = "connect.model_override";
+/// 会话元数据键：智能度覆盖（ReasoningEffort::as_str 形态，如 "high"）。
+const META_THINK_OVERRIDE: &str = "connect.think_override";
+/// 模型回复里的自然语言切换标记（前言教会模型使用；标记行不展示）：
+/// 用户以任何说法要求切换模型/智能度/审批模式时，模型在文字说明外附
+/// 一行标记，网关在回复出口解析并应用到会话覆盖（下一条消息生效）。
+const SET_MODEL_MARKER: &str = "[SET_MODEL: ";
+const SET_THINK_MARKER: &str = "[SET_THINK: ";
+/// 审批模式标记：`[SET_PERMISSION: auto]`（本会话不再逐条确认）/
+/// `[SET_PERMISSION: default]`（恢复逐条确认）。
+const SET_PERMISSION_MARKER: &str = "[SET_PERMISSION: ";
+
+/// 剥离回复文本中的 `[SET_MODEL: x]` / `[SET_THINK: x]` /
+/// `[SET_PERMISSION: x]` 标记行，返回（可见文本, 模型/智能度/审批标记
+/// 列表）。与 SEND_FILE/SEND_VOICE 同款行级解析。
+fn extract_set_markers(
+    text: &str,
+) -> (String, Vec<String>, Vec<String>, Vec<String>) {
+    let mut models = Vec::new();
+    let mut thinks = Vec::new();
+    let mut permissions = Vec::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let mut captured = false;
+        for (marker, sink) in [
+            (SET_MODEL_MARKER, &mut models),
+            (SET_THINK_MARKER, &mut thinks),
+            (SET_PERMISSION_MARKER, &mut permissions),
+        ] {
+            if let Some(rest) = trimmed.strip_prefix(marker) {
+                if let Some(value) = rest.strip_suffix(']') {
+                    let value = value.trim();
+                    if !value.is_empty() {
+                        sink.push(value.to_string());
+                        captured = true;
+                    }
+                }
+            }
+        }
+        if !captured {
+            kept.push(line);
+        }
+    }
+    (
+        kept.join("\n").trim().to_string(),
+        models,
+        thinks,
+        permissions,
+    )
+}
+
+/// 模型回复出口的切换标记装饰器：仅包裹 [`ConnectBridge::
+/// render_until_settled`] 里的平台——只有模型生成的文本流经这里
+/// （命令回执/审批提示不经过）。解析并剥离 `[SET_MODEL: …]` /
+/// `[SET_THINK: …]` 标记，应用到会话覆盖，再把清理后的文本（按钮
+/// 原样保留）转发给内层平台；非法值附纠正提示，不静默吞掉。
+struct MarkerPlatform {
+    bridge: Arc<ConnectBridge>,
+    key: String,
+    inner: Arc<dyn Platform>,
+}
+
+#[async_trait::async_trait]
+impl Platform for MarkerPlatform {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn capabilities(&self) -> super::platform::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn start(&self, _inbound: mpsc::Sender<super::platform::Inbound>) -> super::platform::PlatformResult<()> {
+        // 装饰器只挂在回复路径上，不会被 spawn；防御性转发。
+        self.inner.start(_inbound).await
+    }
+
+    async fn reply(
+        &self,
+        ctx: &ReplyCtx,
+        msg: OutboundMessage,
+    ) -> super::platform::PlatformResult<super::platform::MessageRef> {
+        if ![
+            SET_MODEL_MARKER,
+            SET_THINK_MARKER,
+            SET_PERMISSION_MARKER,
+        ]
+        .iter()
+        .any(|marker| msg.text.contains(marker))
+        {
+            return self.inner.reply(ctx, msg).await;
+        }
+        let (mut visible, models, thinks, permissions) = extract_set_markers(&msg.text);
+        let mut notices = Vec::new();
+        for model_query in &models {
+            let config = self.bridge.ctx.config.read().await.clone();
+            let choices = configured_model_choices(&config);
+            match match_model_choice(&choices, model_query) {
+                Ok(matched) => {
+                    let override_json = serde_json::to_string(&SessionModelOverride {
+                        model: matched.name.clone(),
+                        provider_name: matched.provider_name.clone(),
+                        provider_type: matched.provider_type.clone(),
+                    })
+                    .unwrap_or_default();
+                    if let Err(error) = self
+                        .bridge
+                        .set_session_meta_override(&self.key, META_MODEL_OVERRIDE, &override_json)
+                        .await
+                    {
+                        notices.push(format!("（模型切换失败：{error}）"));
+                    }
+                }
+                Err(error) => notices.push(format!("（模型切换未生效：{error}）")),
+            }
+        }
+        for permission_query in &permissions {
+            // auto = 本会话不再逐条确认；default/ask = 恢复逐条确认。
+            // 复用审批模式切换（直存 + 运行中回合边界生效）。
+            let auto = match permission_query.trim().to_ascii_lowercase().as_str() {
+                "auto" | "always" | "自动" => Some(true),
+                "default" | "ask" | "confirm" | "默认" => Some(false),
+                _ => None,
+            };
+            match auto {
+                Some(auto) => {
+                    if let Err(error) = self.bridge.set_session_approval_mode(&self.key, auto).await
+                    {
+                        notices.push(format!("（审批模式切换失败：{error}）"));
+                    }
+                }
+                None => notices.push(format!(
+                    "（审批模式切换未生效：不认识的值「{permission_query}」，可选 auto/default）"
+                )),
+            }
+        }
+        for think_query in &thinks {
+            match parse_effort_arg(think_query) {
+                Some(effort) => {
+                    if let Err(error) = self
+                        .bridge
+                        .set_session_meta_override(&self.key, META_THINK_OVERRIDE, effort.as_str())
+                        .await
+                    {
+                        notices.push(format!("（智能度切换失败：{error}）"));
+                    }
+                }
+                None => notices.push(format!(
+                    "（智能度切换未生效：不认识的档位「{think_query}」，可选 none~max）"
+                )),
+            }
+        }
+        if !notices.is_empty() {
+            visible = format!("{visible}\n{}", notices.join("\n"));
+        }
+        // 剥离后没有可见文本（模型只回了标记）→ 兜底确认文案。
+        if visible.trim().is_empty() {
+            visible = "✅ 已切换（下一条消息生效）".to_string();
+        }
+        let cleaned = OutboundMessage {
+            text: visible,
+            buttons: msg.buttons,
+        };
+        self.inner.reply(ctx, cleaned).await
+    }
+
+    async fn edit(
+        &self,
+        msg_ref: &super::platform::MessageRef,
+        new: OutboundMessage,
+    ) -> super::platform::PlatformResult<()> {
+        self.inner.edit(msg_ref, new).await
+    }
+
+    async fn answer_callback(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> super::platform::PlatformResult<()> {
+        self.inner.answer_callback(callback_query_id, text).await
+    }
+
+    async fn stop(&self) -> super::platform::PlatformResult<()> {
+        self.inner.stop().await
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SessionModelOverride {
+    model: String,
+    provider_name: String,
+    provider_type: String,
+}
+
+/// 解析 /think 参数为档位；中文别名同样认（关/低/中/高/超高/最大）。
+/// `reset`/`重置`/`默认` 由调用方先行处理。
+fn parse_effort_arg(arg: &str) -> Option<ReasoningEffort> {
+    let normalized = arg.trim().to_ascii_lowercase();
+    let english = match normalized.as_str() {
+        "关" | "关闭" | "无" => "none",
+        "低" => "low",
+        "中" => "medium",
+        "高" => "high",
+        "超高" => "xhigh",
+        "最大" => "max",
+        other => other,
+    };
+    ReasoningEffort::parse(english)
+}
+
+/// 一个可切换的模型选项（来自 provider_instances 的配置清单）。
+#[derive(Debug)]
+struct ModelChoice {
+    name: String,
+    provider_name: String,
+    provider_type: String,
+    role: &'static str,
+    label: String,
+}
+
+/// 汇总配置里"已配好的模型"：优先遍历 `provider_instances`（每个实例的
+/// 主/快速/视觉模型），无实例配置时回退 legacy 顶层字段。
+fn configured_model_choices(config: &Config) -> Vec<ModelChoice> {
+    let mut choices = Vec::new();
+    for (instance_id, instance) in &config.provider_instances {
+        let label = instance
+            .label
+            .clone()
+            .unwrap_or_else(|| instance_id.clone());
+        for (model, role) in [
+            (instance.model.as_deref(), "主模型"),
+            (instance.fast_model.as_deref(), "快速"),
+            (instance.vision_model.as_deref(), "视觉"),
+        ] {
+            if let Some(name) = model.map(str::trim).filter(|name| !name.is_empty()) {
+                // 同实例同模型名去重（同一模型兼任多角色只列一次）。
+                if choices.iter().any(|choice: &ModelChoice| {
+                    choice.name == name && choice.provider_name == *instance_id
+                }) {
+                    continue;
+                }
+                choices.push(ModelChoice {
+                    name: name.to_string(),
+                    provider_name: instance_id.clone(),
+                    provider_type: instance.provider_type.clone(),
+                    role,
+                    label: label.clone(),
+                });
+            }
+        }
+    }
+    if choices.is_empty() {
+        let provider_name = config.effective_default_provider().to_string();
+        let provider_type = String::new();
+        for (model, role) in [
+            (config.get_model(), "主模型"),
+            (config.get_fast_model(), "快速"),
+            (config.get_vision_model(), "视觉"),
+        ] {
+            if let Some(name) = model
+                .map(|name: String| name.trim().to_string())
+                .filter(|name: &String| !name.is_empty())
+            {
+                choices.push(ModelChoice {
+                    name,
+                    provider_name: provider_name.clone(),
+                    provider_type: provider_type.clone(),
+                    role,
+                    label: provider_name.clone(),
+                });
+            }
+        }
+    }
+    choices
+}
+
+/// 按名称匹配模型：先精确，再唯一子串（大小写不敏感，如 "flash" 命中
+/// glm-5.3-flash）；歧义或未命中返回带清单的错误文案。
+fn match_model_choice<'a>(choices: &'a [ModelChoice], query: &str) -> Result<&'a ModelChoice, String> {
+    if let Some(exact) = choices.iter().find(|choice| choice.name == query.trim()) {
+        return Ok(exact);
+    }
+    let lowered = query.trim().to_ascii_lowercase();
+    let hits: Vec<&ModelChoice> = choices
+        .iter()
+        .filter(|choice| choice.name.to_ascii_lowercase().contains(&lowered))
+        .collect();
+    match hits.as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!(
+            "没有匹配到模型「{query}」。已配置的模型：\n{}",
+            format_model_choices(choices)
+        )),
+        many => Err(format!(
+            "「{query}」匹配到多个模型，请用完整名称：\n{}",
+            many
+                .iter()
+                .map(|choice| format!("· {}（{}）", choice.name, choice.label))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )),
+    }
+}
+
+fn format_model_choices(choices: &[ModelChoice]) -> String {
+    choices
+        .iter()
+        .map(|choice| {
+            format!(
+                "· {}（{} · {} · {}）",
+                choice.name, choice.label, choice.provider_name, choice.role
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn reply_text(platform: &Arc<dyn Platform>, ctx: &ReplyCtx, text: impl Into<String>) {
     if let Err(error) = platform.reply(ctx, OutboundMessage::text(text)).await {
         tracing::warn!("connect: failed to send reply: {error}");
@@ -548,6 +872,29 @@ impl ConnectBridge {
             self.handle_status(&key, &platform, &msg.reply_ctx).await;
             return;
         }
+        // 会话级运行覆盖命令：/think（智能度）、/model（模型切换）、
+        // /models（查询已配置模型）。控制路径：busy/挂起审批时不阻塞，
+        // 对"正在跑的当前轮"不生效，下一条消息起生效。命令头大小写
+        // 不敏感（/THINK 高 也认）；参数保留原大小写（模型名敏感）。
+        let (command_head, command_arg) = match command.split_once(' ') {
+            Some((head, rest)) => (head, Some(rest.trim())),
+            None => (command, None),
+        };
+        if command_head.eq_ignore_ascii_case("/models") {
+            self.handle_model_command(&key, &platform, &msg.reply_ctx, None, true)
+                .await;
+            return;
+        }
+        if command_head.eq_ignore_ascii_case("/model") {
+            self.handle_model_command(&key, &platform, &msg.reply_ctx, command_arg, false)
+                .await;
+            return;
+        }
+        if command_head.eq_ignore_ascii_case("/think") {
+            self.handle_think_command(&key, &platform, &msg.reply_ctx, command_arg)
+                .await;
+            return;
+        }
 
         // Ask-resolution fast path (issue #458): a parked ask takes priority
         // over normal busy/queue routing, even while `busy` is still true —
@@ -643,7 +990,7 @@ impl ConnectBridge {
         mut msg: InboundMessage,
     ) {
         loop {
-            self.process_one(&key, platform.clone(), msg).await;
+            self.clone().process_one(&key, platform.clone(), msg).await;
 
             let next = {
                 let mut guard = self.chat_state.lock().await;
@@ -741,7 +1088,12 @@ impl ConnectBridge {
         }
     }
 
-    async fn process_one(&self, key: &str, platform: Arc<dyn Platform>, msg: InboundMessage) {
+    async fn process_one(
+        self: Arc<Self>,
+        key: &str,
+        platform: Arc<dyn Platform>,
+        msg: InboundMessage,
+    ) {
         let command = strip_command_suffix(msg.text.trim());
         if command.eq_ignore_ascii_case("/new") {
             self.rotate_session(key).await;
@@ -754,7 +1106,7 @@ impl ConnectBridge {
             return;
         }
 
-        self.run_prompt(key, platform, &msg.reply_ctx, text).await;
+        self.clone().run_prompt(key, platform, &msg.reply_ctx, text).await;
     }
 
     async fn handle_stop(&self, key: &str, platform: &Arc<dyn Platform>, reply_ctx: &ReplyCtx) {
@@ -810,6 +1162,216 @@ impl ConnectBridge {
             None => "No session yet. Send a message to start one.".to_string(),
         };
         reply_text(platform, reply_ctx, text).await;
+    }
+
+    /// `/think [档位|reset]`：查看/切换本会话的智能度（reasoning effort）。
+    /// 覆盖值存会话元数据，run_prompt 下一条消息生效；`/new` 回配置默认。
+    async fn handle_think_command(
+        &self,
+        key: &str,
+        platform: &Arc<dyn Platform>,
+        reply_ctx: &ReplyCtx,
+        arg: Option<&str>,
+    ) {
+        const VALID: &str = "可选值：none/low/medium/high/xhigh/max（关/低/中/高/超高/最大）";
+        let arg = arg.map(str::trim).filter(|value| !value.is_empty());
+        let Some(arg) = arg else {
+            // 查询：会话覆盖 ?? 配置默认。
+            let config = self.ctx.config.read().await.clone();
+            let override_effort = self.load_session_override(key).await.1;
+            let effective = override_effort.or(config.get_reasoning_effort());
+            let text = format!(
+                "当前智能度：{}（{}）\n{VALID}\n/think <值> 切换；/think reset 恢复配置默认",
+                effective.map(|effort| effort.as_str()).unwrap_or("未设置"),
+                if override_effort.is_some() { "会话手动档" } else { "配置默认" },
+            );
+            reply_text(platform, reply_ctx, text).await;
+            return;
+        };
+        if matches!(arg, "reset" | "重置" | "默认") {
+            match self.clear_session_meta_override(key, META_THINK_OVERRIDE).await {
+                Ok(()) => reply_text(
+                    platform,
+                    reply_ctx,
+                    "✅ 智能度已恢复配置默认（下一条消息生效）",
+                )
+                .await,
+                Err(error) => reply_text(platform, reply_ctx, format!("切换失败：{error}")).await,
+            }
+            return;
+        }
+        let Some(effort) = parse_effort_arg(arg) else {
+            reply_text(
+                platform,
+                reply_ctx,
+                format!("不认识的档位「{arg}」。{VALID}"),
+            )
+            .await;
+            return;
+        };
+        match self
+            .set_session_meta_override(key, META_THINK_OVERRIDE, effort.as_str())
+            .await
+        {
+            Ok(()) => reply_text(
+                platform,
+                reply_ctx,
+                format!("✅ 智能度已切换为 {}（下一条消息生效；/new 回默认）", effort.as_str()),
+            )
+            .await,
+            Err(error) => reply_text(platform, reply_ctx, format!("切换失败：{error}")).await,
+        }
+    }
+
+    /// `/model [名称|reset]` 与 `/models`：查询/切换本会话模型。
+    /// 候选清单来自配置的 provider_instances（主/快速/视觉），切换记录
+    /// 模型 + 所属实例路由，run_prompt 下一条消息生效。
+    async fn handle_model_command(
+        &self,
+        key: &str,
+        platform: &Arc<dyn Platform>,
+        reply_ctx: &ReplyCtx,
+        arg: Option<&str>,
+        list_only: bool,
+    ) {
+        let config = self.ctx.config.read().await.clone();
+        let choices = configured_model_choices(&config);
+        if list_only || arg.map(str::trim).unwrap_or("").is_empty() {
+            let (model_override, _) = self.load_session_override(key).await;
+            let current = model_override
+                .map(|override_model| override_model.model)
+                .or_else(|| config.get_model())
+                .unwrap_or_else(|| "（未配置）".to_string());
+            let text = format!(
+                "当前模型：{current}\n已配置的模型：\n{}\n/model <名称> 切换（支持部分匹配）；/model reset 恢复默认",
+                if choices.is_empty() {
+                    "（配置里没有找到模型）".to_string()
+                } else {
+                    format_model_choices(&choices)
+                }
+            );
+            reply_text(platform, reply_ctx, text).await;
+            return;
+        }
+        let arg = arg.map(str::trim).unwrap_or_default();
+        if matches!(arg, "reset" | "重置" | "默认") {
+            match self.clear_session_meta_override(key, META_MODEL_OVERRIDE).await {
+                Ok(()) => reply_text(
+                    platform,
+                    reply_ctx,
+                    "✅ 模型已恢复配置默认（下一条消息生效）",
+                )
+                .await,
+                Err(error) => reply_text(platform, reply_ctx, format!("切换失败：{error}")).await,
+            }
+            return;
+        }
+        let matched = match match_model_choice(&choices, arg) {
+            Ok(matched) => matched,
+            Err(error) => {
+                reply_text(platform, reply_ctx, error).await;
+                return;
+            }
+        };
+        let override_json = serde_json::to_string(&SessionModelOverride {
+            model: matched.name.clone(),
+            provider_name: matched.provider_name.clone(),
+            provider_type: matched.provider_type.clone(),
+        })
+        .unwrap_or_default();
+        match self
+            .set_session_meta_override(key, META_MODEL_OVERRIDE, &override_json)
+            .await
+        {
+            Ok(()) => reply_text(
+                platform,
+                reply_ctx,
+                format!(
+                    "✅ 模型已切换为 {}（{}·{}，下一条消息生效；/new 回默认）",
+                    matched.name, matched.label, matched.role
+                ),
+            )
+            .await,
+            Err(error) => reply_text(platform, reply_ctx, format!("切换失败：{error}")).await,
+        }
+    }
+
+    /// 读取会话的运行覆盖（模型 / 智能度）。无会话或无覆盖返回 (None, None)。
+    async fn load_session_override(
+        &self,
+        key: &str,
+    ) -> (Option<SessionModelOverride>, Option<ReasoningEffort>) {
+        let Some(session_id) = self.session_id_for_key(key).await else {
+            return (None, None);
+        };
+        let Some(session) = self.ctx.session_repo.load_merged(&session_id).await else {
+            return (None, None);
+        };
+        let model = session
+            .metadata
+            .get(META_MODEL_OVERRIDE)
+            .and_then(|raw| serde_json::from_str::<SessionModelOverride>(raw).ok());
+        let think = session
+            .metadata
+            .get(META_THINK_OVERRIDE)
+            .and_then(|raw| ReasoningEffort::parse(raw));
+        (model, think)
+    }
+
+    /// 写入一个会话覆盖元数据（直存磁盘 + bump metadata_version，镜像
+    /// PATCH 端点语义；运行中的回合不受影响，下一次 run_prompt 读取）。
+    async fn set_session_meta_override(
+        &self,
+        key: &str,
+        meta_key: &str,
+        value: &str,
+    ) -> Result<(), String> {
+        let session_id = self
+            .session_id_for_key(key)
+            .await
+            .ok_or_else(|| "当前聊天还没有会话，先发一条消息".to_string())?;
+        let mut session = self
+            .ctx
+            .session_repo
+            .load_merged(&session_id)
+            .await
+            .ok_or_else(|| "会话不存在或已失效，发送 /new 开始新会话".to_string())?;
+        session
+            .metadata
+            .insert(meta_key.to_string(), value.to_string());
+        session.metadata_version = session.metadata_version.saturating_add(1);
+        session.updated_at = chrono::Utc::now();
+        self.ctx
+            .session_repo
+            .storage()
+            .save_session(&session)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// 清除一个会话覆盖元数据（键不存在也算成功）。
+    async fn clear_session_meta_override(&self, key: &str, meta_key: &str) -> Result<(), String> {
+        let session_id = self
+            .session_id_for_key(key)
+            .await
+            .ok_or_else(|| "当前聊天还没有会话，先发一条消息".to_string())?;
+        let mut session = self
+            .ctx
+            .session_repo
+            .load_merged(&session_id)
+            .await
+            .ok_or_else(|| "会话不存在或已失效，发送 /new 开始新会话".to_string())?;
+        if session.metadata.remove(meta_key).is_none() {
+            return Ok(());
+        }
+        session.metadata_version = session.metadata_version.saturating_add(1);
+        session.updated_at = chrono::Utc::now();
+        self.ctx
+            .session_repo
+            .storage()
+            .save_session(&session)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn create_and_register_session(
@@ -902,14 +1464,14 @@ impl ConnectBridge {
     /// detached) so the run's completion IS this call's completion — that is
     /// what lets [`Self::drain_chat`] serialize one run at a time per chat.
     async fn run_prompt(
-        &self,
+        self: Arc<Self>,
         key: &str,
         platform: Arc<dyn Platform>,
         reply_ctx: &ReplyCtx,
         text: &str,
     ) {
         let config_snapshot = self.ctx.config.read().await.clone();
-        let resolved = resolve_connect_run_config(&config_snapshot, &self.ctx.provider_registry);
+        let mut resolved = resolve_connect_run_config(&config_snapshot, &self.ctx.provider_registry);
 
         if resolved
             .model_roster
@@ -945,6 +1507,35 @@ impl ConnectBridge {
         };
 
         let session_id = session.id.clone();
+        // 应用会话级运行覆盖（/think、/model 写入的元数据）：会话手动档
+        // 优先于配置解析值——每轮解析，"下一条消息生效"。覆盖的模型必须
+        // 还在已配置清单里（配置后来删掉了就静默回默认，避免路由到
+        // 不存在的 provider 实例）。
+        let (model_override, think_override) = self.load_session_override(&key).await;
+        if let Some(model_override) = &model_override {
+            let still_configured = configured_model_choices(&config_snapshot).iter().any(
+                |choice| {
+                    choice.name == model_override.model
+                        && choice.provider_name == model_override.provider_name
+                },
+            );
+            if still_configured {
+                resolved.model_roster.model = Some(model_override.model.clone());
+                resolved.model_roster.provider_name = Some(model_override.provider_name.clone());
+                if !model_override.provider_type.is_empty() {
+                    resolved.model_roster.provider_type = Some(model_override.provider_type.clone());
+                }
+            } else {
+                tracing::warn!(
+                    %session_id,
+                    model = %model_override.model,
+                    "connect: session model override no longer matches a configured model; using config default"
+                );
+            }
+        }
+        if let Some(think_override) = think_override {
+            resolved.reasoning_effort = Some(think_override);
+        }
         let session_tx =
             get_or_create_event_sender(&self.ctx.session_event_senders, &session_id).await;
         let execution_reservation = match reserve_session_execution(
@@ -995,7 +1586,8 @@ impl ConnectBridge {
                  之外，为每个文件单独一行附加 \"[SEND_FILE: 文件绝对路径]\"，网关会自动把该\
                  文件投递到用户的聊天窗口，该标记行不会显示给用户。仅当用户明确要求语音回复\
                  或朗读时，才为对应文本单独一行附加 \"[SEND_VOICE: 要念的文本]\"，网关会合成\
-                 语音条发送；日常语音/文字的形态选择由网关按渠道规则自动处理，无需你决定。]\n\n{text}"
+                 语音条发送；日常语音/文字的形态选择由网关按渠道规则自动处理，无需你决定。\n                 当用户以任何说法要求切换模型或智能度时，先正常文字确认（下一条消息生效），\n                 再单独一行附标记：\"[SET_MODEL: 模型名]\" 或 \"[SET_THINK: 档位]\"\n                 （档位 none~max）；用户要求不再逐条确认或恢复每次确认时附\
+                 \"[SET_PERMISSION: auto]\" 或 \"[SET_PERMISSION: default]\"；只使用配置过的模型名，标记行不会显示给用户。]\n\n{text}"
             );
             preamble.as_str()
         } else {
@@ -1083,7 +1675,8 @@ impl ConnectBridge {
             child_completion_handler: None,
         });
 
-        self.render_until_settled(key, platform, reply_ctx.clone(), &session_id, rx)
+        self.clone()
+            .render_until_settled(key, platform, reply_ctx.clone(), &session_id, rx)
             .await;
 
         self.clear_cancel_token(key).await;
@@ -1105,13 +1698,20 @@ impl ConnectBridge {
     /// message (one "⏳ Working…" bubble per run, no matter how many times it
     /// pauses).
     async fn render_until_settled(
-        &self,
+        self: Arc<Self>,
         key: &str,
         platform: Arc<dyn Platform>,
         reply_ctx: ReplyCtx,
         session_id: &str,
         mut rx: broadcast::Receiver<AgentEvent>,
     ) {
+        // 回复出口包一层切换标记装饰器：模型生成的文本经它解析
+        // [SET_MODEL]/[SET_THINK] 并应用到会话覆盖（下一条消息生效）。
+        let platform: Arc<dyn Platform> = Arc::new(MarkerPlatform {
+            bridge: self.clone(),
+            key: key.to_string(),
+            inner: platform,
+        });
         let mut stream_state: Option<Box<render::StreamState>> = None;
         'stream: loop {
             match render::stream_execution(
@@ -2549,7 +3149,9 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(5),
-            bridge.render_until_settled(&key, platform.clone(), reply_ctx, "sess-external", rx),
+            bridge
+                .clone()
+                .render_until_settled(&key, platform.clone(), reply_ctx, "sess-external", rx),
         )
         .await
         .expect("read-only legacy ask must not wait for an answer");
@@ -2822,6 +3424,270 @@ mod tests {
             .await
             .expect("render task must finish")
             .unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // 会话级运行覆盖：/think 智能度、/model 模型切换、/models 查询
+    // ------------------------------------------------------------------
+
+    fn provider_instance_config(model: &str, vision: Option<&str>) -> bamboo_config::ProviderInstanceConfig {
+        bamboo_config::ProviderInstanceConfig {
+            provider_type: "openai".to_string(),
+            label: Some("智谱".to_string()),
+            api_key: String::new(),
+            api_key_encrypted: None,
+            credential_ref: None,
+            base_url: None,
+            model: Some(model.to_string()),
+            fast_model: None,
+            vision_model: vision.map(str::to_string),
+            reasoning_effort: None,
+            responses_only_models: Vec::new(),
+            request_overrides: None,
+            enabled: true,
+            extra: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn think_and_model_commands_persist_session_overrides() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx);
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx.clone(), None, responder));
+        let platform = FakePlatform::new("fake");
+        let key = key_for("chat1", "u1");
+
+        let mut session = bamboo_agent_core::Session::new("sess-override", "model");
+        ctx.session_repo.save_and_cache(&mut session).await;
+        bridge.set_session_id_for_key(&key, "sess-override").await;
+
+        // /THINK 高 → 命令头大小写不敏感（回归：曾只有裸命令不敏感）。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-0", "/THINK 高"),
+        )
+        .await;
+        // /think 高 → 中文别名解析为 high 并持久化。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-1", "/think 高"),
+        )
+        .await;
+        let (_, think) = bridge.load_session_override(&key).await;
+        assert_eq!(think, Some(bamboo_domain::reasoning::ReasoningEffort::High));
+        let sent = platform.sent.lock().await.clone();
+        assert!(sent.iter().any(|text| text.contains("智能度已切换为 high")));
+
+        // /think 查询显示会话手动档。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-2", "/think"),
+        )
+        .await;
+        let sent = platform.sent.lock().await.clone();
+        assert!(sent
+            .iter()
+            .any(|text| text.contains("high（会话手动档）")));
+
+        // /think reset 清除。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-3", "/think reset"),
+        )
+        .await;
+        let (_, think) = bridge.load_session_override(&key).await;
+        assert!(think.is_none());
+
+        // /model 切换（配置实例清单里唯一匹配）。
+        {
+            let mut config = ctx.config.write().await;
+            config.provider_instances.insert(
+                "zhipu".to_string(),
+                provider_instance_config("glm-5.3", Some("glm-5.3-flash")),
+            );
+        }
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-4", "/model glm-5.3-flash"),
+        )
+        .await;
+        let (model, _) = bridge.load_session_override(&key).await;
+        let model = model.expect("model override persisted");
+        assert_eq!(model.model, "glm-5.3-flash");
+        assert_eq!(model.provider_name, "zhipu");
+        let sent = platform.sent.lock().await.clone();
+        assert!(sent
+            .iter()
+            .any(|text| text.contains("模型已切换为 glm-5.3-flash")));
+
+        // /models 查询列出清单与当前模型。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-5", "/models"),
+        )
+        .await;
+        let sent = platform.sent.lock().await.clone();
+        assert!(sent
+            .iter()
+            .any(|text| text.contains("glm-5.3") && text.contains("glm-5.3-flash") && text.contains("视觉")));
+
+        // 未匹配模型给出清单提示，不卡会话。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-6", "/model nope"),
+        )
+        .await;
+        let sent = platform.sent.lock().await.clone();
+        assert!(sent.iter().any(|text| text.contains("没有匹配到模型")));
+    }
+
+    #[test]
+    fn effort_and_model_matching_helpers() {
+        assert_eq!(
+            parse_effort_arg("超高"),
+            Some(bamboo_domain::reasoning::ReasoningEffort::Xhigh)
+        );
+        assert_eq!(parse_effort_arg("HIGH"), Some(bamboo_domain::reasoning::ReasoningEffort::High));
+        assert_eq!(parse_effort_arg("banana"), None);
+
+        let mut config = Config::default();
+        config.provider_instances.insert(
+            "zhipu".to_string(),
+            provider_instance_config("glm-5.3", Some("glm-5.3-flash")),
+        );
+        let choices = configured_model_choices(&config);
+        assert_eq!(choices.len(), 2);
+        // 唯一子串匹配。
+        let matched = match_model_choice(&choices, "flash").expect("unique substring");
+        assert_eq!(matched.name, "glm-5.3-flash");
+        assert_eq!(matched.provider_type, "openai");
+        // 精确匹配。
+        assert_eq!(match_model_choice(&choices, "glm-5.3").unwrap().name, "glm-5.3");
+        // 未命中带清单。
+        assert!(match_model_choice(&choices, "nope").unwrap_err().contains("没有匹配到模型"));
+    }
+
+    #[tokio::test]
+    async fn marker_platform_applies_set_markers_from_model_replies() {
+        let (ctx, _dir) = test_context().await;
+        let resume_tx = broadcast::channel::<AgentEvent>(16).0;
+        let responder = FakeResponder::new(resume_tx);
+        let bridge = Arc::new(ConnectBridge::with_responder(ctx.clone(), None, responder));
+        let inner = FakePlatform::new("fake");
+        let key = key_for("chat1", "u1");
+
+        let mut session = bamboo_agent_core::Session::new("sess-marker", "model");
+        ctx.session_repo.save_and_cache(&mut session).await;
+        bridge.set_session_id_for_key(&key, "sess-marker").await;
+        {
+            let mut config = ctx.config.write().await;
+            config.provider_instances.insert(
+                "zhipu".to_string(),
+                provider_instance_config("glm-5.3", Some("glm-5.3-flash")),
+            );
+        }
+
+        let wrapped: Arc<dyn Platform> = Arc::new(MarkerPlatform {
+            bridge: bridge.clone(),
+            key: key.clone(),
+            inner: inner.clone(),
+        });
+        let ctx0 = ReplyCtx(serde_json::json!({ "chat_id": "chat1" }));
+
+        // 模型回复带两个标记：剥离后可见文本转发，覆盖持久化。
+        wrapped
+            .reply(
+                &ctx0,
+                OutboundMessage::text(
+                    "好的，已为你切换到 flash 并调高思考档位，下一条消息生效。
+[SET_MODEL: flash]
+[SET_THINK: 高]",
+                ),
+            )
+            .await
+            .unwrap();
+        let sent = inner.sent.lock().await.clone();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("已为你切换到 flash"));
+        assert!(!sent[0].contains("[SET_MODEL"));
+        assert!(!sent[0].contains("[SET_THINK"));
+        let (model, think) = bridge.load_session_override(&key).await;
+        assert_eq!(model.expect("model override").model, "glm-5.3-flash");
+        assert_eq!(think, Some(bamboo_domain::reasoning::ReasoningEffort::High));
+
+        // 非法模型名：不切换，附纠正提示。
+        let mut sent = inner.sent.lock().await;
+        sent.clear();
+        drop(sent);
+        wrapped
+            .reply(&ctx0, OutboundMessage::text("切好了
+[SET_MODEL: nope]"))
+            .await
+            .unwrap();
+        let sent = inner.sent.lock().await.clone();
+        assert!(sent[0].contains("模型切换未生效"));
+        assert!(sent[0].contains("没有匹配到模型"));
+
+        // 无标记原样直通。
+        let mut sent = inner.sent.lock().await;
+        sent.clear();
+        drop(sent);
+        wrapped
+            .reply(&ctx0, OutboundMessage::text("普通回复"))
+            .await
+            .unwrap();
+        let sent = inner.sent.lock().await.clone();
+        assert_eq!(sent, vec!["普通回复".to_string()]);
+
+        // 权限标记：切 auto → 会话审批模式生效；非法值 → 纠正提示。
+        let mut sent = inner.sent.lock().await;
+        sent.clear();
+        drop(sent);
+        wrapped
+            .reply(
+                &ctx0,
+                OutboundMessage::text("好的，本会话不再逐条确认。\n[SET_PERMISSION: auto]"),
+            )
+            .await
+            .unwrap();
+        let sent = inner.sent.lock().await.clone();
+        assert!(sent[0].contains("不再逐条确认"));
+        assert!(!sent[0].contains("[SET_PERMISSION"));
+        let reloaded = ctx.session_repo.load_merged("sess-marker").await.unwrap();
+        let mode = reloaded
+            .agent_runtime_state
+            .as_ref()
+            .map(|state| state.effective_permission_mode());
+        assert_eq!(
+            mode,
+            Some(bamboo_domain::SessionPermissionMode::Auto),
+            "permission marker must switch the session approval mode"
+        );
+
+        let mut sent = inner.sent.lock().await;
+        sent.clear();
+        drop(sent);
+        wrapped
+            .reply(&ctx0, OutboundMessage::text("切\n[SET_PERMISSION: bogus]"))
+            .await
+            .unwrap();
+        let sent = inner.sent.lock().await.clone();
+        assert!(sent[0].contains("审批模式切换未生效"));
     }
 
     #[tokio::test]

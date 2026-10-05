@@ -215,17 +215,27 @@ impl ConnectManager {
                     let state_dir = data_dir
                         .as_ref()
                         .map(|dir| dir.join("connect_wechat"));
-                    // 语音能力（voice 段）：无 siliconflow_api_key 时为 None，
-                    // 全部语音行为关闭。
+                    // 语音能力：`voice` 段（非秘密参数）+ 平台级 secret
+                    // `voice_api_key`（token 同款加密管道水合）。密钥缺失
+                    // 时为 None，全部语音行为关闭。
                     let voice = platform_cfg
                         .voice
                         .as_ref()
-                        .and_then(platforms::wechat_voice::VoiceConfig::from_config);
+                        .and_then(|voice_cfg| {
+                            platforms::wechat_voice::VoiceConfig::from_config(
+                                platform_cfg.voice_api_key.as_deref(),
+                                voice_cfg,
+                            )
+                        });
                     if let Some(voice) = &voice {
                         tracing::info!(
-                            "connect: wechat voice enabled reply_mode={:?} file_asr={}",
+                            "connect: wechat voice enabled reply_mode={:?} delivery={:?} file_asr={} \
+                             sample_rate={} bitrate={}",
                             voice.reply_mode,
-                            voice.file_asr
+                            voice.delivery,
+                            voice.file_asr,
+                            voice.sample_rate,
+                            voice.bitrate
                         );
                     }
                     let platform: Arc<dyn Platform> = Arc::new(platforms::wechat::WechatPlatform::new(
@@ -440,6 +450,10 @@ mod tests {
     fn platform(platform_type: &str, token: Option<&str>) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
             voice: None,
+            voice_api_key: None,
+            voice_api_key_encrypted: None,
+            voice_api_key_credential_ref: None,
+            voice_api_key_configured: false,
             id: None,
             project_id: None,
             platform_type: platform_type.to_string(),

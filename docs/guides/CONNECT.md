@@ -103,28 +103,38 @@ iLink 的 token 通过**扫码授权**取得，Bamboo v1 本身不提供独立�
 ### 4.3 语音能力（connect.json 的 `voice` 段）
 
 ```jsonc
+// 设置 API（PUT /v1/bamboo/config/connect）的提交形态：
+// API 密钥走平台级凭据管道（voice_api_key_change），
+// 与 bot token 同款加密落盘；voice 段只放非秘密参数。
 {
   "type": "wechat",
-  "token": "...",
+  "token_change": {"action": "keep"},
   "allow_from": ["wxid_xxx@im.wechat"],
+  "voice_api_key_change": {"action": "replace", "value": "sk-…"},
   "voice": {
-    "siliconflow_api_key": "sk-…",
     "siliconflow_base_url": "https://api.siliconflow.cn",   // 可选
     "tts_model": "FunAudioLLM/CosyVoice2-0.5B",             // 可选
     "tts_voice": "FunAudioLLM/CosyVoice2-0.5B:anna",        // 可选，音色：alex/benjamin/charles/david/anna/bella/claire/diana
-    "tts_sample_rate": 16000,                                // 可选 16000/24000
-    "reply_mode": "off",                                     // TTS 总开关：off(默认)/mirror/always
+    "tts_sample_rate": 16000,                                // 可选 16000/24000（仅 bubble 形态）
+    "reply_mode": "off",                                     // 自动语音：off(默认，仅显式[SEND_VOICE]才语音)/mirror/always
+    "delivery": "file",                                      // 投递形态：file(默认，mp3 文件)/bubble(语音条，实验)
     "asr_model": "FunAudioLLM/SenseVoiceSmall",              // 可选，免费档
     "file_asr": "off"                                        // 音频文件转写：off(默认)/on
   }
 }
 ```
 
-- **两个开关都默认关**：配好 `siliconflow_api_key` 也不会发语音/转写，
-  必须显式设 `reply_mode`/`file_asr`；整段不配则行为与无语音版完全一致；
+- **默认状态**：配好密钥（`voice_api_key_change`）后 `reply_mode: "off"`
+  表示不自动转语音（显式 `[SEND_VOICE]` 标记仍会合成）、`file_asr: "off"`
+  不转写音频文件；整段不配则行为与无语音版完全一致；
+- **语音默认以 mp3 文件投递**（`delivery: "file"`）：iLink 机器人通道经
+  2026-10-05 回显终审实验确认**不渲染 bot 发送的 voice_item**（微信自己的
+  语音条原样回显也不显示，sendmessage ret=0 但客户端丢弃），因此默认
+  TTS 直出 mp3 走文件通道（真机可用，点开即播）；`delivery: "bubble"`
+  保留原生气泡路径（SILK 编码），供 iLink 未来支持时切换；
 - **写入必须走正规路径**（`bamboo config set` / 设置 API 的 connect 分区
   PUT），connect.json 受分区哈希账本保护，**手改文件会导致 serve 拒绝启动**；
-- `siliconflow_api_key` 是明文存储（与 token 的加密管道不同）；TTS 按
+- **密钥走与 bot token 同一套加密管道**（落盘为凭据库引用，绝不明文出现在 connect.json——存储层有凭据材料守卫强制这一点，明文字段会被 400 拒绝）；TTS 按
   UTF-8 字节计费，`mirror/always` 模式受内容门槛约束（代码/链接/超长
   降级文字），显式 `[SEND_VOICE]` 每条回复最多 3 段、每段 ≤250 字。
 
@@ -152,11 +162,13 @@ iLink 的 token 有效期未公开，实测错误码 `ret=-14` 表示会话过�
     Agent 需要给你发文件时，会在回复中写 `[SEND_FILE: 文件绝对路径]` 标记行，
     网关自动经 iLink CDN（getuploadurl → AES 加密 → 上传 → sendmessage）投递，
     标记行不会显示。图片按魔数自动识别为图片消息，视频按 MP4 识别，其余按文件。
-  - **语音条回复（TTS，硅基流动）**：`voice.reply_mode` 决定出站形态——
-    `off`（**默认**，完全关闭）/ `mirror`（语音回语音、文字回文字）/
-    `always`（普通回复总是语音）。代码/表格/链接/文件/超长内容自动降级文字；
-    模型仅在用户明确要求朗读时写 `[SEND_VOICE: 要念的文本]` 标记。
-    链路：TTS(PCM 16k) → 纯 Rust SILK 编码 → CDN 上传 → voice_item；
+  - **语音回复（TTS，硅基流动）**：`voice.reply_mode` 决定**自动**语音——
+    `off`（**默认**：不自动转语音，只有模型显式 `[SEND_VOICE]` 标记才合成，
+    即"仅指定才回语音"档）/ `mirror`（语音回语音、文字回文字）/
+    `always`（普通回复总是语音）。代码/表格/链接/文件/超长内容自动降级文字。
+    默认链路（`delivery: "file"`）：TTS 直出 mp3 → 文件通道投递
+    （iLink 不渲染 bot 的语音条气泡）；`delivery: "bubble"` 走
+    TTS(PCM 16k) → 纯 Rust SILK 编码 → CDN 上传 → voice_item（实验）。
     合成失败回退文字，绝不卡住。配置见下方"语音能力"。
   - **音频文件转写（ASR，硅基流动 SenseVoiceSmall，免费）**：
     `voice.file_asr = "on"` 时，发给机器人的音频**文件**（mp3/wav/m4a 等）
@@ -184,6 +196,20 @@ iLink 的 token 有效期未公开，实测错误码 `ret=-14` 表示会话过�
   上限，保守值）。
 - 首条消息关联：启动后需要先由允许的微信账号给机器人发一条消息，会话路由
   建立后 `/new`、`/stop`、`/status` 等通道命令才可用。
+- **会话级运行覆盖命令**（所有平台通用，对正在运行的当前轮不生效，
+  下一条消息起生效；`/new` 开新会话后回到配置默认）：
+  - `/think` 查询当前智能度；`/think high` 切换（none/low/medium/high/
+    xhigh/max，中文别名 关/低/中/高/超高/最大 也认）；`/think reset` 恢复默认；
+  - `/models` 列出配置里已配好的模型（各 provider 实例的主/快速/视觉模型）；
+  - `/model` 查询当前模型；`/model glm-5.3-flash` 切换（支持唯一部分匹配，
+    如 flash）；`/model reset` 恢复默认。切换会同时路由到该模型所属的
+    provider 实例；若该模型后来从配置中移除，自动回配置默认并告警。
+  - **自然语言切换**：直接说"换个便宜点的模型""用心想想"等任何说法，
+    模型会在回复里附 [SET_MODEL: /] [SET_THINK: ] 标记（不显示），网关解析后
+    下一条消息生效；非法模型名会在回复里收到纠正提示，不会静默失败。
+  - **审批模式自然语言切换**：说"别再逐条确认了""以后自动同意"等，模型附
+    [SET_PERMISSION: auto/default] 标记（不显示）实现同等切换，语义与
+    回复"都允许/恢复确认"相同。
 
 ## 5. 多平台 / 多 bot
 

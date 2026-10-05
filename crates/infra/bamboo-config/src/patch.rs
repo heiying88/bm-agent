@@ -647,6 +647,7 @@ pub fn preserve_unpatched_notification_secrets(
 pub struct ConnectSecretIntents {
     pub token: std::collections::BTreeSet<usize>,
     pub app_secret: std::collections::BTreeSet<usize>,
+    pub voice_api_key: std::collections::BTreeSet<usize>,
 }
 
 pub fn connect_secret_intents(patch_obj: &Map<String, Value>) -> ConnectSecretIntents {
@@ -671,6 +672,10 @@ pub fn connect_secret_intents(patch_obj: &Map<String, Value>) -> ConnectSecretIn
 
         if is_secret_field_intent(obj, "app_secret") {
             intents.app_secret.insert(index);
+        }
+
+        if is_secret_field_intent(obj, "voice_api_key") {
+            intents.voice_api_key.insert(index);
         }
     }
 
@@ -707,6 +712,20 @@ pub fn clear_connect_ciphertext_for_explicit_clears(
                 .is_empty()
             {
                 platform.app_secret_encrypted = None;
+            }
+        }
+    }
+
+    for &index in intents.voice_api_key.iter() {
+        if let Some(platform) = merged.connect.platforms.get_mut(index) {
+            if platform
+                .voice_api_key
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                platform.voice_api_key_encrypted = None;
             }
         }
     }
@@ -858,6 +877,11 @@ pub fn preserve_masked_connect_secrets(patch_obj: &mut Map<String, Value>, curre
             obj,
             "app_secret",
             guarded.and_then(|p| p.app_secret.as_deref()),
+        );
+        preserve_masked_secret_field(
+            obj,
+            "voice_api_key",
+            guarded.and_then(|p| p.voice_api_key.as_deref()),
         );
     }
 }
@@ -1570,6 +1594,11 @@ mod tests {
 
     fn connect_platform(platform_type: &str, token: &str) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
+            voice: None,
+            voice_api_key: None,
+            voice_api_key_encrypted: None,
+            voice_api_key_credential_ref: None,
+            voice_api_key_configured: false,
             id: None,
             project_id: None,
             platform_type: platform_type.to_string(),
@@ -1594,6 +1623,11 @@ mod tests {
         token: &str,
     ) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
+            voice: None,
+            voice_api_key: None,
+            voice_api_key_encrypted: None,
+            voice_api_key_credential_ref: None,
+            voice_api_key_configured: false,
             id: Some(id.to_string()),
             ..connect_platform(platform_type, token)
         }
@@ -1984,6 +2018,11 @@ mod tests {
 
     fn feishu_platform(app_secret: &str) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
+            voice: None,
+            voice_api_key: None,
+            voice_api_key_encrypted: None,
+            voice_api_key_credential_ref: None,
+            voice_api_key_configured: false,
             id: None,
             project_id: None,
             platform_type: "feishu".to_string(),

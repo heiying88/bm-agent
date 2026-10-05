@@ -27,6 +27,19 @@ pub enum VoiceReplyMode {
     Always,
 }
 
+/// 语音投递形态。iLink 机器人通道经 2026-10-05 回显终审实验确认**不渲染
+/// bot 发出的 voice_item**（微信自己的语音条凭据全新原样回显，sendmessage
+/// ret=0 仍不显示；官方包也从未实现出站语音），因此默认以 mp3 音频
+/// **文件**投递（文件通道真机可用）。`bubble` 保留原生气泡路径，供 iLink
+/// 未来支持时重新启用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceDelivery {
+    /// mp3 音频文件（默认，真机可用）。
+    File,
+    /// 原生语音条（iLink 当前不渲染，实验用）。
+    Bubble,
+}
+
 /// `voice` 段解析后的运行时配置（默认值已应用）。无 `siliconflow_api_key`
 /// 时整段视为未启用（`VoiceConfig::from_config` 返回 `None`）。
 #[derive(Debug, Clone)]
@@ -35,12 +48,14 @@ pub struct VoiceConfig {
     pub base_url: String,
     pub tts_model: String,
     pub tts_voice: String,
-    /// SILK 支持档位（16000/24000）；也是 TTS 请求的 pcm 采样率。
+    /// SILK 支持档位（16000/24000）；也是 bubble 形态 TTS 的 pcm 采样率。
     pub sample_rate: u32,
     pub speed: f64,
-    /// SILK 目标比特率（bps）。
+    /// SILK 目标比特率（bps，仅 bubble 形态使用）。
     pub bitrate: i32,
     pub reply_mode: VoiceReplyMode,
+    /// 投递形态（默认文件）。
+    pub delivery: VoiceDelivery,
     pub asr_model: String,
     pub file_asr: bool,
 }
@@ -50,16 +65,20 @@ const DEFAULT_SILICONFLOW_BASE_URL: &str = "https://api.siliconflow.cn";
 const DEFAULT_TTS_MODEL: &str = "FunAudioLLM/CosyVoice2-0.5B";
 const DEFAULT_TTS_VOICE: &str = "FunAudioLLM/CosyVoice2-0.5B:anna";
 const DEFAULT_ASR_MODEL: &str = "FunAudioLLM/SenseVoiceSmall";
-/// SILK 编码默认比特率（对齐 rust-silk CLI 默认值，微信语音条常规档）。
-const DEFAULT_SILK_BITRATE: i32 = 25_000;
+/// SILK 编码默认比特率。入站取证实测微信自己的语音条 ≈14kbps；取相邻
+/// 标准档 16kbps（25kbps 在 16kHz 采样下质量过剩且偏离真机画像）。
+const DEFAULT_SILK_BITRATE: i32 = 16_000;
 
 impl VoiceConfig {
-    /// 从 connect 配置解析；`api_key` 缺失/为空 → `None`（语音功能整体
-    /// 禁用，行为与未配置时完全一致）。非法枚举值回退默认并告警。
-    pub fn from_config(config: &bamboo_config::WechatVoiceConfig) -> Option<Self> {
-        let api_key = config
-            .siliconflow_api_key
-            .as_deref()
+    /// 从 connect 配置解析；`api_key` 来自**平台级** secret 字段
+    /// `voice_api_key`（`token` 同款加密管道水合出的明文），`voice` 段只
+    /// 携带非秘密参数。密钥缺失/为空 → `None`（语音功能整体禁用，行为
+    /// 与未配置时完全一致）。非法枚举值回退默认并告警。
+    pub fn from_config(
+        api_key: Option<&str>,
+        config: &bamboo_config::WechatVoiceConfig,
+    ) -> Option<Self> {
+        let api_key = api_key
             .map(str::trim)
             .filter(|key| !key.is_empty())?
         .to_string();
@@ -75,12 +94,23 @@ impl VoiceConfig {
                 VoiceReplyMode::Off
             }
         };
+        let delivery = match config.delivery.as_deref().map(str::trim) {
+            None | Some("") | Some("file") => VoiceDelivery::File,
+            Some("bubble") => VoiceDelivery::Bubble,
+            Some(other) => {
+                tracing::warn!(
+                    "connect: wechat voice.delivery={other:?} 不认识，回退 file（合法值：file/bubble）"
+                );
+                VoiceDelivery::File
+            }
+        };
         let sample_rate = config
             .tts_sample_rate
             .filter(|rate| matches!(rate, 16_000 | 24_000))
-            // 默认对齐官方 openclaw-weixin 包的微信语音采样率（24kHz，
-            // 见其 silk-transcode 的 SILK_SAMPLE_RATE）；16000 同样合法。
-            .unwrap_or(24_000);
+            // 默认 16kHz：微信自己的语音条就是 16kHz SILK（2026-10-05 入站
+            // 取证探针实测：voice_item sample_rate=16000 bits=16 playtime=ms，
+            // 载荷 \x02#!SILK_V3 ≈14kbps）。出站曾用 24kHz 被真机静默丢弃。
+            .unwrap_or(16_000);
 
         Some(Self {
             api_key,
@@ -108,6 +138,7 @@ impl VoiceConfig {
             speed: config.tts_speed.unwrap_or(1.0).clamp(0.25, 4.0),
             bitrate: config.tts_bitrate.unwrap_or(DEFAULT_SILK_BITRATE),
             reply_mode,
+            delivery,
             asr_model: config
                 .asr_model
                 .as_deref()
@@ -263,15 +294,31 @@ pub fn pcm_duration_ms(pcm_len: usize, sample_rate: u32) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// TTS 合成：`POST {base}/v1/audio/speech`，直接返回 s16le 单声道 PCM
-/// （`response_format=pcm`），与 SILK 编码输入完全一致——全程无 ffmpeg。
+/// （`response_format=pcm`），采样率与 SILK 编码档位一致（cfg.sample_rate）。
 pub async fn synthesize_pcm(http: &reqwest::Client, cfg: &VoiceConfig, text: &str) -> Result<Vec<u8>, String> {
+    synthesize_audio(http, cfg, text, "pcm", cfg.sample_rate).await
+}
+
+/// TTS 合成 mp3（`file` 投递形态）。硅基流动 mp3 只支持 32000/44100 采样率
+/// （与 pcm 档位不同），固定请求 44100。
+pub async fn synthesize_mp3(http: &reqwest::Client, cfg: &VoiceConfig, text: &str) -> Result<Vec<u8>, String> {
+    synthesize_audio(http, cfg, text, "mp3", 44_100).await
+}
+
+async fn synthesize_audio(
+    http: &reqwest::Client,
+    cfg: &VoiceConfig,
+    text: &str,
+    response_format: &str,
+    sample_rate: u32,
+) -> Result<Vec<u8>, String> {
     let url = format!("{}/v1/audio/speech", cfg.base_url);
     let body = serde_json::json!({
         "model": cfg.tts_model,
         "input": text,
         "voice": cfg.tts_voice,
-        "response_format": "pcm",
-        "sample_rate": cfg.sample_rate,
+        "response_format": response_format,
+        "sample_rate": sample_rate,
         "speed": cfg.speed,
     });
     let response = http
@@ -648,27 +695,39 @@ mod tests {
     #[test]
     fn voice_config_defaults_and_gating() {
         let none = bamboo_config::WechatVoiceConfig::default();
-        assert!(VoiceConfig::from_config(&none).is_none());
+        assert!(VoiceConfig::from_config(None, &none).is_none());
 
         let mut configured = bamboo_config::WechatVoiceConfig::default();
-        configured.siliconflow_api_key = Some("sk-test".to_string());
-        let parsed = VoiceConfig::from_config(&configured).expect("enabled");
+        let parsed =
+            VoiceConfig::from_config(Some("sk-test"), &configured).expect("enabled");
         assert_eq!(parsed.reply_mode, VoiceReplyMode::Off);
-        assert_eq!(parsed.sample_rate, 24_000);
+        // 默认对齐微信自己的语音条画像（入站取证：16kHz）。
+        assert_eq!(parsed.sample_rate, 16_000);
+        assert_eq!(parsed.bitrate, DEFAULT_SILK_BITRATE);
+        // 默认 file 投递（iLink 不渲染 bot 的 voice_item）。
+        assert_eq!(parsed.delivery, VoiceDelivery::File);
         assert!(!parsed.file_asr);
         assert_eq!(parsed.base_url, DEFAULT_SILICONFLOW_BASE_URL);
+
+        configured.delivery = Some("bubble".to_string());
+        let parsed =
+            VoiceConfig::from_config(Some("sk-test"), &configured).expect("enabled");
+        assert_eq!(parsed.delivery, VoiceDelivery::Bubble);
 
         configured.reply_mode = Some("mirror".to_string());
         configured.file_asr = Some("on".to_string());
         configured.tts_sample_rate = Some(16_000);
-        let parsed = VoiceConfig::from_config(&configured).expect("enabled");
+        let parsed =
+            VoiceConfig::from_config(Some("  sk-test  "), &configured).expect("enabled");
         assert_eq!(parsed.reply_mode, VoiceReplyMode::Mirror);
         assert!(parsed.file_asr);
         assert_eq!(parsed.sample_rate, 16_000);
 
         configured.reply_mode = Some("bogus".to_string());
         assert_eq!(
-            VoiceConfig::from_config(&configured).unwrap().reply_mode,
+            VoiceConfig::from_config(Some("sk-test"), &configured)
+                .unwrap()
+                .reply_mode,
             VoiceReplyMode::Off
         );
     }

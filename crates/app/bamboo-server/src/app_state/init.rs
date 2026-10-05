@@ -651,6 +651,10 @@ mod connect_project_mapping_tests {
     ) -> bamboo_config::ConnectPlatformConfig {
         bamboo_config::ConnectPlatformConfig {
             voice: None,
+            voice_api_key: None,
+            voice_api_key_encrypted: None,
+            voice_api_key_credential_ref: None,
+            voice_api_key_configured: false,
             id: None,
             project_id: Some(project_id),
             platform_type: "telegram".to_string(),

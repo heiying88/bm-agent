@@ -4365,8 +4365,14 @@ fn persist_exact_credential_transaction_inner(
                 references.extend(persisted_notification_refs.values().cloned());
             }
             ExactTransactionScope::Connect => {
-                for (token, app_secret) in persisted_connect_refs.values() {
-                    references.extend(token.iter().chain(app_secret.iter()).cloned());
+                for (token, app_secret, voice_api_key) in persisted_connect_refs.values() {
+                    references.extend(
+                        token
+                            .iter()
+                            .chain(app_secret.iter())
+                            .chain(voice_api_key.iter())
+                            .cloned(),
+                    );
                 }
             }
             ExactTransactionScope::AccessControl => {
@@ -4436,12 +4442,15 @@ fn persist_exact_credential_transaction_inner(
         ensure_cluster_refs_are_safe(data_dir, &refs, &[])?;
     }
     if connect_only {
-        for (id, (token_ref, app_secret_ref)) in &persisted_connect_refs {
+        for (id, (token_ref, app_secret_ref, voice_api_key_ref)) in &persisted_connect_refs {
             if let Some(reference) = token_ref {
                 ensure_connect_ref_exclusive(data_dir, reference.as_str(), id, "token")?;
             }
             if let Some(reference) = app_secret_ref {
                 ensure_connect_ref_exclusive(data_dir, reference.as_str(), id, "app_secret")?;
+            }
+            if let Some(reference) = voice_api_key_ref {
+                ensure_connect_ref_exclusive(data_dir, reference.as_str(), id, "voice_api_key")?;
             }
         }
     }
@@ -8537,6 +8546,13 @@ fn migrate_connect_credentials(
                 "app_secret_configured",
                 "app_secret",
             ),
+            (
+                "voice_api_key",
+                "voice_api_key_encrypted",
+                "voice_api_key_credential_ref",
+                "voice_api_key_configured",
+                "voice_api_key",
+            ),
         ] {
             let had_plaintext = platform.contains_key(plaintext_key);
             let had_ciphertext = platform.contains_key(ciphertext_key);
@@ -9619,6 +9635,7 @@ fn connect_refs_from_document(
             (
                 parse("token_credential_ref")?,
                 parse("app_secret_credential_ref")?,
+                parse("voice_api_key_credential_ref")?,
             ),
         );
     }
@@ -11142,7 +11159,7 @@ fn ensure_connect_consumers_or_abort(
         &original_authority,
     )?;
     let mut owners = connect_refs_from_document(&original)?;
-    for (id, (token_ref, app_secret_ref)) in connect_refs_from_document(&staged)? {
+    for (id, (token_ref, app_secret_ref, voice_api_key_ref)) in connect_refs_from_document(&staged)? {
         let owner = owners.entry(id).or_default();
         if token_ref.is_some() {
             owner.0 = token_ref;
@@ -11150,9 +11167,12 @@ fn ensure_connect_consumers_or_abort(
         if app_secret_ref.is_some() {
             owner.1 = app_secret_ref;
         }
+        if voice_api_key_ref.is_some() {
+            owner.2 = voice_api_key_ref;
+        }
     }
     for reference in &credential_file.touched_credential_refs {
-        let owner = owners.iter().find_map(|(id, (token_ref, app_secret_ref))| {
+        let owner = owners.iter().find_map(|(id, (token_ref, app_secret_ref, voice_api_key_ref))| {
             token_ref
                 .as_ref()
                 .is_some_and(|candidate| candidate.as_str() == reference)
@@ -11162,6 +11182,12 @@ fn ensure_connect_consumers_or_abort(
                         .as_ref()
                         .is_some_and(|candidate| candidate.as_str() == reference)
                         .then_some((id.as_str(), "app_secret"))
+                })
+                .or_else(|| {
+                    voice_api_key_ref
+                        .as_ref()
+                        .is_some_and(|candidate| candidate.as_str() == reference)
+                        .then_some((id.as_str(), "voice_api_key"))
                 })
         });
         let Some((platform_id, field)) = owner else {

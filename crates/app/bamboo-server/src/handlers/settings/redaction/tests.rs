@@ -541,6 +541,10 @@ fn redact_config_masks_configured_connect_platform_token() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
         voice: None,
+        voice_api_key: None,
+        voice_api_key_encrypted: None,
+        voice_api_key_credential_ref: None,
+        voice_api_key_configured: false,
         id: None,
         project_id: None,
         platform_type: "telegram".to_string(),
@@ -579,6 +583,10 @@ fn redact_config_omits_unconfigured_connect_platform_token() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
         voice: None,
+        voice_api_key: None,
+        voice_api_key_encrypted: None,
+        voice_api_key_credential_ref: None,
+        voice_api_key_configured: false,
         id: None,
         project_id: None,
         platform_type: "telegram".to_string(),
@@ -632,6 +640,10 @@ fn redact_config_masks_configured_connect_platform_app_secret_but_not_app_id_or_
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
         voice: None,
+        voice_api_key: None,
+        voice_api_key_encrypted: None,
+        voice_api_key_credential_ref: None,
+        voice_api_key_configured: false,
         id: None,
         project_id: None,
         platform_type: "feishu".to_string(),
@@ -676,6 +688,10 @@ fn redact_config_omits_unconfigured_connect_platform_app_secret() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
         voice: None,
+        voice_api_key: None,
+        voice_api_key_encrypted: None,
+        voice_api_key_credential_ref: None,
+        voice_api_key_configured: false,
         id: None,
         project_id: None,
         platform_type: "feishu".to_string(),

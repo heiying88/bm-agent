@@ -1156,15 +1156,12 @@ pub struct NotificationsConfig {
 /// 微信（iLink）适配器的语音能力配置（`[[connect.platforms]]` 里
 /// type=wechat 条目的 `voice` 段）：硅基流动 TTS 语音条回复 + 音频文件
 /// ASR。整段可选，缺省时行为与无语音版完全一致。
-/// `siliconflow_api_key` 为**明文**存储（与 `token` 的加密管道不同——
-/// 按部署方的明文配置偏好；写入仍须走 `config set` / 设置 API，
-/// connect.json 受分区哈希账本保护，手改会拒绝启动）。
-/// 行为规范见 docs/design/wechat-voice-tts-asr-plan.md。
+/// **API 密钥不在本结构里**（`siliconflow_api_key` 会被普通分区的凭据
+/// 材料守卫拒绝）——密钥是平台级 secret 字段 `voice_api_key`，与
+/// `token` 走同一套加密管道（落盘 `voice_api_key_encrypted`/凭据库引用，
+/// 内存中水合为明文）。行为规范见 docs/design/wechat-voice-tts-asr-plan.md。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct WechatVoiceConfig {
-    /// 硅基流动 API key（`sk-…`，Bearer）。缺省 = 语音功能整体禁用。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub siliconflow_api_key: Option<String>,
     /// 自定义 API 地址（默认 `https://api.siliconflow.cn`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub siliconflow_base_url: Option<String>,
@@ -1174,19 +1171,28 @@ pub struct WechatVoiceConfig {
     /// TTS 音色（默认 `FunAudioLLM/CosyVoice2-0.5B:anna`，格式 `模型名:音色名`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_voice: Option<String>,
-    /// TTS 采样率（默认 16000；可选 16000/24000，须为 SILK 支持档位）。
+    /// TTS 采样率（默认 16000，对齐微信语音条画像；可选 16000/24000，
+    /// 须为 SILK 支持档位；`file` 投递形态下 mp3 输出不受此值影响）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_sample_rate: Option<u32>,
     /// TTS 语速 0.25–4.0（默认 1.0）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_speed: Option<f64>,
-    /// SILK 目标比特率 bps（默认 25000）。
+    /// SILK 目标比特率 bps（默认 16000，仅 `bubble` 投递形态使用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tts_bitrate: Option<i32>,
-    /// 出站语音/文字决策（`off` | `mirror` | `always`，**默认 `off`**——
-    /// TTS 总开关，配好密钥也不会发语音，须显式开启）。
+    /// 出站语音/文字决策（`off` | `mirror` | `always`，默认 `off`）。
+    /// `off` = 关闭**自动**语音（语音回语音等），模型显式 `[SEND_VOICE]`
+    /// 标记仍然合成投递（"仅指定才回语音"档）；`mirror` = 语音回语音；
+    /// `always` = 普通回复总是语音（内容硬门槛仍生效）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_mode: Option<String>,
+    /// 投递形态（`file` | `bubble`，默认 `file`）。iLink 机器人通道经
+    /// 2026-10-05 回显终审实验确认**不渲染 bot 发出的 voice_item**（微信
+    /// 自己的语音条原样回显也不显示），因此默认以 mp3 音频文件投递；
+    /// `bubble` 为原生气泡实验开关（iLink 未来支持时切换）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
     /// ASR 模型（默认 `FunAudioLLM/SenseVoiceSmall`，免费档）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asr_model: Option<String>,
@@ -1201,9 +1207,22 @@ pub struct WechatVoiceConfig {
 /// external chat platform (Telegram first).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConnectPlatformConfig {
-    /// 微信适配器语音能力（见 [`WechatVoiceConfig`]）。
+    /// 微信适配器语音能力（非秘密部分，见 [`WechatVoiceConfig`]）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<WechatVoiceConfig>,
+    /// 微信语音能力的硅基流动 API key（`token` 同款加密管道：落盘为
+    /// `voice_api_key_encrypted` / 凭据库引用，本明文字段仅在内存中）。
+    #[serde(default, skip_serializing)]
+    pub voice_api_key: Option<String>,
+    /// Encrypted ciphertext of `voice_api_key` (the at-rest representation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_api_key_encrypted: Option<String>,
+    /// Stable reference to the isolated voice API-key credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_api_key_credential_ref: Option<crate::CredentialRef>,
+    /// Durable metadata used by redacted clients without exposing a value.
+    #[serde(default)]
+    pub voice_api_key_configured: bool,
     /// Stable per-entry identifier (#496). Not part of the original schema —
     /// absent on legacy/hand-written entries and on a freshly-echoed new
     /// entry from a client. [`Config::save_to_dir`] assigns one (a random
@@ -7398,6 +7417,11 @@ mod tests {
         token_encrypted: &str,
     ) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
+        voice: None,
+        voice_api_key: None,
+        voice_api_key_encrypted: None,
+        voice_api_key_credential_ref: None,
+        voice_api_key_configured: false,
             id: None,
             project_id: None,
             platform_type: platform_type.to_string(),
@@ -8138,6 +8162,11 @@ mod tests {
 
         let mut config = Config::create_default();
         config.connect.platforms = vec![ConnectPlatformConfig {
+            voice: None,
+            voice_api_key: None,
+            voice_api_key_encrypted: None,
+            voice_api_key_credential_ref: None,
+            voice_api_key_configured: false,
             id: None,
             project_id: None,
             platform_type: "feishu".to_string(),
@@ -8184,6 +8213,11 @@ mod tests {
 
         let mut config = Config::create_default();
         config.connect.platforms = vec![ConnectPlatformConfig {
+            voice: None,
+            voice_api_key: None,
+            voice_api_key_encrypted: None,
+            voice_api_key_credential_ref: None,
+            voice_api_key_configured: false,
             id: None,
             project_id: None,
             platform_type: "feishu".to_string(),

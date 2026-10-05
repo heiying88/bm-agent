@@ -140,7 +140,7 @@ pub(crate) struct PreparedProviderCredentialUpdate {
 }
 
 pub(crate) type PersistedConnectCredentialRefs =
-    BTreeMap<String, (Option<CredentialRef>, Option<CredentialRef>)>;
+    BTreeMap<String, (Option<CredentialRef>, Option<CredentialRef>, Option<CredentialRef>)>;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PersistedAccessCredentialRefs {
@@ -1680,6 +1680,7 @@ impl CredentialStore {
             .token
             .iter()
             .chain(secret_intents.app_secret.iter())
+            .chain(secret_intents.voice_api_key.iter())
             .any(|index| *index >= config.connect.platforms.len())
         {
             return Err(ConfigStoreError::Validation(
@@ -1701,17 +1702,22 @@ impl CredentialStore {
         // A full-array connect replacement deletes any platform id absent from
         // the candidate. Clear its credentials unless another durable consumer
         // still references the same (legacy/shared) ref.
-        for (id, (token_ref, app_secret_ref)) in persisted_refs {
+        for (id, (token_ref, app_secret_ref, voice_api_key_ref)) in persisted_refs {
             if ids.contains(id) {
                 continue;
             }
-            for reference in token_ref.iter().chain(app_secret_ref.iter()) {
+            for reference in token_ref
+                .iter()
+                .chain(app_secret_ref.iter())
+                .chain(voice_api_key_ref.iter())
+            {
                 touched_refs.insert(reference.clone());
                 if candidate_counts.get(reference).copied().unwrap_or(0) == 0 {
                     changed |= document.entries.remove(reference).is_some();
                 }
             }
         }
+
 
         for (index, platform) in config.connect.platforms.iter_mut().enumerate() {
             let id = platform
@@ -1722,12 +1728,17 @@ impl CredentialStore {
             let persisted = persisted_refs.get(&id).cloned().unwrap_or_default();
             let canonical_token = crate::credential_ref("connect", &id, "token")?;
             let canonical_app_secret = crate::credential_ref("connect", &id, "app_secret")?;
+            let canonical_voice_api_key = crate::credential_ref("connect", &id, "voice_api_key")?;
 
             for (candidate, existing) in [
                 (platform.token_credential_ref.as_ref(), persisted.0.as_ref()),
                 (
                     platform.app_secret_credential_ref.as_ref(),
                     persisted.1.as_ref(),
+                ),
+                (
+                    platform.voice_api_key_credential_ref.as_ref(),
+                    persisted.2.as_ref(),
                 ),
             ] {
                 if candidate.is_some() && candidate != existing {
@@ -1755,6 +1766,15 @@ impl CredentialStore {
                     &mut platform.app_secret_configured,
                     persisted.1,
                     canonical_app_secret,
+                ),
+                (
+                    secret_intents.voice_api_key.contains(&index),
+                    &mut platform.voice_api_key,
+                    &mut platform.voice_api_key_encrypted,
+                    &mut platform.voice_api_key_credential_ref,
+                    &mut platform.voice_api_key_configured,
+                    persisted.2,
+                    canonical_voice_api_key,
                 ),
             ];
 

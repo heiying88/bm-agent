@@ -57,13 +57,21 @@
 
 ## 2. 配置设计（connect.json，微信平台条目内）
 
+> **2026-10-03 修订**：存储层的凭据材料守卫禁止普通分区出现明文密钥（最初设计的
+> `siliconflow_api_key` 明文字段被 400 拒绝）。密钥改为**平台级 secret 字段
+> `voice_api_key`**，与 `token` 走同一套凭据管道（加密落盘/凭据库引用/GET
+> 状态视图/掩码回填）；设置 API 提交形态为
+> `voice_api_key_change: {"action": "replace|keep|clear", "value": …}`，
+> `voice` 段只保留非秘密参数。完整问题记录、接入清单与 API 契约见
+> [`wechat-voice-secret-pipeline.md`](wechat-voice-secret-pipeline.md)。
+
 ```jsonc
 {
   "type": "wechat",
   "token": "ilink bot_token（既有加密管道）",
   "allow_from": ["wxid_xxx@im.wechat"],
   "voice": {
-    "siliconflow_api_key": "sk-…",            // 密钥：接入与 token 同一套加密/掩码管道
+    // 密钥不在 voice 段——它是平台级 secret 字段 voice_api_key（token 同款加密管道）
     "siliconflow_base_url": "https://api.siliconflow.cn",  // 可选，默认即此
     "tts_model": "FunAudioLLM/CosyVoice2-0.5B",
     "tts_voice": "FunAudioLLM/CosyVoice2-0.5B:anna",
@@ -77,9 +85,6 @@
 
 - **整个 `voice` 段可选**：缺省（无 `voice` 或无 `api_key`）时行为与现状完全一致
   （出站无语音条、入站只用微信转写）——向后兼容，零迁移；
-- `siliconflow_api_key` 必须注册进 connect 平台配置的 **secret 字段清单**
-  （与 `token` 同管道：落盘加密、GET 掩码 `****…`、占位符回填保留语义）；
-- 写入走既有正规路径（`bamboo config set` / 设置 API `PUT …/config/sections/connect`），
   **不要手改文件**——`connect.json` 受分区哈希账本（attestation）保护，手改会导致 serve 拒绝启动
   （前车之鉴，见 CONNECT.md 故障排查）；
 - `file_asr`（**音频文件转写开关，默认关**，见 §4）：微信语音条永远走微信自带转写，
@@ -218,7 +223,7 @@ providers.json（语音密钥与模型商无关，只在 connect）。
 
 | # | 风险/未知 | 等级 | 对策 |
 |---|---|---|---|
-| R1 | iLink **出站** `voice_item` 的确切字段名（`voice_size`/`voice_length`/`play_length`…）与 `getuploadurl` 的语音 media type 未在本文档写作时核实 | P0 | M0 首项：对照 cc-connect 源码 + 真机抓包；拿不到则用图片通道同构假设真机试错（1/2/4 逐个试） |
+| R1 | iLink **出站** `voice_item` 的确切字段名与 `getuploadurl` 的语音 media type | ~~P0~~ **已结案（2026-10-05）：通道不支持，转文件投递** | 排查矩阵穷尽（encode_type 4/6/观测值、VOICE/FILE 上传、24k/16k、极简/全字段）后由**干净回显实验**定案：微信自己的语音条凭据全新、原样回显，`ret=0` 仍不渲染——bot 发出的 voice_item 被 iLink 通道丢弃，与字段/载荷无关。处置：`voice.delivery` 默认 `file`（TTS 直出 mp3 走文件通道，真机可用），`bubble` 保留实验开关。全程记录见 `wechat-voice-delivery-debug-log.md` |
 | R2 | `silk-codec` 在 crates.io 的发布名/版本/维护状态未核实（现仅需**编码**方向，无解码需求） | P0 | M0 核对；备选： vendored C（kn007 silk-v3）FFI，或带 `ffmpeg` 子进程转码（打破"零外部依赖"，仅作最后手段） |
 | R3 | CosyVoice2 `pcm` 输出的实际采样率/声道与文档声明不符 | P1 | M0 真机打印返回头核对；不符则请求 `wav` 并解析头重采样/抽取（纯 Rust，几十行） |
 | R4 | SenseVoice 对长音频/大文件的支持边界（音乐文件返回空或报错） | P2 | ~25MB 上限 + 失败/空结果一律静默跳过（文件标记照旧）；长音频上限 M2 真机校准 |
