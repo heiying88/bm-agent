@@ -210,6 +210,18 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::put().to(settings::put_connect_config),
         )
         .route(
+            "/bamboo/config/connect/wechat-qr/start",
+            web::post().to(settings::post_wechat_qr_start),
+        )
+        .route(
+            "/bamboo/config/connect/wechat-qr/status",
+            web::post().to(settings::post_wechat_qr_status),
+        )
+        .route(
+            "/bamboo/config/connect/wechat-qr/apply",
+            web::post().to(settings::post_wechat_qr_apply),
+        )
+        .route(
             "/bamboo/proxy-auth",
             web::post().to(settings::set_proxy_auth),
         )

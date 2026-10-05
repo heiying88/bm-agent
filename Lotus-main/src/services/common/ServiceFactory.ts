@@ -214,7 +214,7 @@ export interface ConnectPlatformConfig {
   id?: string;
   /** First-class Project assigned to sessions created by this connector. */
   project_id?: string;
-  /** Platform adapter selector: `"telegram"` | `"feishu"`. */
+  /** Platform adapter selector: `"telegram"` | `"feishu"` | `"wechat"`. */
   type: string;
   /** Telegram bot token. Secret — see the masked-secret contract above. */
   token?: string;
@@ -229,6 +229,14 @@ export interface ConnectPlatformConfig {
    */
   domain?: string;
   /**
+   * WeChat (personal, iLink) voice capability — the non-secret `voice`
+   * section (TTS/ASR switches and model picks). Submitting it replaces the
+   * whole section server-side; absent/null preserves the stored one. The
+   * SiliconFlow API key is a platform-level secret and travels via
+   * `voice_api_key_change`, never here.
+   */
+  voice?: WechatVoiceConfig;
+  /**
    * Platform-scoped user/open ids allowed to drive a session. An EMPTY list
    * means deny-all (every inbound message is rejected) — deliberately
    * stricter than other allow-list precedents in this app.
@@ -236,6 +244,28 @@ export interface ConnectPlatformConfig {
   allow_from?: string[];
   /** Platform-scoped user/open ids allowed to run privileged commands. */
   admin_from?: string[];
+}
+
+/**
+ * WeChat voice capability (`voice` section of a wechat connect platform).
+ * Mirrors `bamboo_config::WechatVoiceConfig` — every field optional with
+ * server-side defaults; `reply_mode` gates AUTO voice only (explicit
+ * `[SEND_VOICE]` markers still synthesize when off), `delivery` selects
+ * mp3-file (default, the iLink channel drops bot voice bubbles) vs the
+ * experimental native bubble, and `file_asr` transcribes inbound audio-file
+ * attachments via SiliconFlow.
+ */
+export interface WechatVoiceConfig {
+  siliconflow_base_url?: string;
+  tts_model?: string;
+  tts_voice?: string;
+  tts_sample_rate?: number;
+  tts_speed?: number;
+  tts_bitrate?: number;
+  reply_mode?: string;
+  delivery?: string;
+  asr_model?: string;
+  file_asr?: string;
 }
 
 export interface ConnectConfig {

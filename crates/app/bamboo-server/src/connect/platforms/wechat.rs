@@ -548,6 +548,114 @@ struct QrStatusResponse {
     baseurl: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// 扫码登录轻量客户端（设置页扫码配置流程与平台 qr_login 共用）
+// ---------------------------------------------------------------------------
+
+/// 默认 iLink 网关地址（设置页扫码流程无平台实例，直接用默认网关）。
+pub(crate) fn ilink_default_base_url() -> &'static str {
+    DEFAULT_BASE_URL
+}
+
+/// `get_bot_qrcode` 的结果（`image_kind` 区分登录页链接与内联 PNG）。
+pub(crate) struct WechatLoginQr {
+    pub qrcode_id: String,
+    /// `"url"`（http 登录页链接）| `"png_base64"`（内联图片）| `""`（无图）。
+    pub image_kind: &'static str,
+    pub image_content: String,
+    pub url: Option<String>,
+}
+
+/// `get_qrcode_status` 的结果（`token` 仅在 `confirmed` 时存在）。
+pub(crate) struct WechatLoginStatus {
+    pub status: String,
+    pub token: Option<String>,
+    pub baseurl: Option<String>,
+}
+
+/// 拉取登录二维码（免鉴权端点；`X-WECHAT-UIN` 为防重放一次性值）。
+pub(crate) async fn fetch_login_qrcode(base_url: &str) -> Result<WechatLoginQr, String> {
+    let url = format!("{base_url}/ilink/bot/get_bot_qrcode");
+    let response = http_client()
+        .request(reqwest::Method::GET, &url)
+        .header("AuthorizationType", "ilink_bot_token")
+        .header("X-WECHAT-UIN", random_wechat_uin())
+        .query(&[("bot_type", LOGIN_BOT_TYPE)])
+        .send()
+        .await
+        .map_err(|error| format!("get_bot_qrcode request failed: {}", error.without_url()))?;
+    let parsed: QrCodeResponse = response
+        .json()
+        .await
+        .map_err(|error| format!("get_bot_qrcode response parse failed: {error}"))?;
+    if parsed.ret != 0 {
+        return Err(format!(
+            "get_bot_qrcode failed with ret={}: {}",
+            parsed.ret,
+            parsed.errmsg.unwrap_or_else(|| "no errmsg".to_string())
+        ));
+    }
+    let qrcode_id = parsed
+        .qrcode
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "get_bot_qrcode returned no qrcode id".to_string())?;
+    let image_content = parsed.qrcode_img_content.unwrap_or_default();
+    let image_kind = if image_content.starts_with("http://") || image_content.starts_with("https://")
+    {
+        "url"
+    } else if !image_content.is_empty()
+    {
+        "png_base64"
+    } else {
+        ""
+    };
+    Ok(WechatLoginQr {
+        qrcode_id,
+        image_kind,
+        image_content,
+        url: parsed.url.filter(|value| !value.is_empty()),
+    })
+}
+
+/// 查询扫码状态一次（`confirmed` 时携带新 bot_token；token 只在服务器侧
+/// 使用，绝不透传给浏览器明文展示以外的路径）。
+pub(crate) async fn poll_login_qrcode(
+    base_url: &str,
+    qrcode_id: &str,
+) -> Result<WechatLoginStatus, String> {
+    let url = format!("{base_url}/ilink/bot/get_qrcode_status");
+    let response = http_client()
+        .request(reqwest::Method::GET, &url)
+        .header("AuthorizationType", "ilink_bot_token")
+        .header("X-WECHAT-UIN", random_wechat_uin())
+        .query(&[("qrcode", qrcode_id)])
+        .send()
+        .await
+        .map_err(|error| format!("get_qrcode_status request failed: {}", error.without_url()))?;
+    let parsed: QrStatusResponse = response
+        .json()
+        .await
+        .map_err(|error| format!("get_qrcode_status response parse failed: {error}"))?;
+    if parsed.ret != 0 {
+        return Err(format!(
+            "get_qrcode_status failed with ret={}: {}",
+            parsed.ret,
+            parsed.errmsg.unwrap_or_else(|| "no errmsg".to_string())
+        ));
+    }
+    Ok(WechatLoginStatus {
+        status: parsed.status.unwrap_or_else(|| "unknown".to_string()),
+        token: parsed
+            .bot_token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty()),
+        baseurl: parsed
+            .baseurl
+            .filter(|value| value.starts_with("https://"))
+            .map(|value| value.trim_end_matches('/').to_string()),
+    })
+}
+
 /// 统一的 iLink 错误构造：错误文本同时携带 `ret` 与 `errcode`——
 /// `start()` 靠 [`is_session_expired_text`]（ret=-14 或 errcode=-14）分流重登路径。
 fn ret_error(operation: &str, ret: i64, errmsg: Option<String>) -> PlatformError {

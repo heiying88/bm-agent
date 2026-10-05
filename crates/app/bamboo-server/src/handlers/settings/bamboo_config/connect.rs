@@ -205,7 +205,14 @@ pub async fn put_connect_config(
     app_state: web::Data<AppState>,
     payload: web::Json<ConnectMutationRequest>,
 ) -> Result<HttpResponse, AppError> {
-    let payload = payload.into_inner();
+    apply_connect_mutation(&app_state, payload.into_inner()).await
+}
+
+/// [`put_connect_config`] 的核心（扫码登录确认后的落库同样复用）。
+pub(crate) async fn apply_connect_mutation(
+    app_state: &AppState,
+    payload: ConnectMutationRequest,
+) -> Result<HttpResponse, AppError> {
     let mut ids = BTreeSet::new();
     let mut intents = bamboo_config::patch::ConnectSecretIntents::default();
     for (index, platform) in payload.data.platforms.iter().enumerate() {
@@ -317,6 +324,128 @@ pub async fn put_connect_config(
         metadata.credential_statuses,
         metadata.credential_health,
     )))
+}
+
+// ---------------------------------------------------------------------------
+// 微信扫码登录（设置页流程）：iLink 网关无 CORS 头，浏览器无法直读，
+// 由本服务同源转发；确认后的 bot_token 只驻留短 TTL 内存缓存，经
+// `apply` 走与手填 token 完全相同的凭据管道落库，不经浏览器明文。
+// ---------------------------------------------------------------------------
+
+/// 扫码确认结果的服务器侧暂存（qrcode_id → 新 token），5 分钟 TTL。
+static QR_CONFIRMED_TOKENS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+> = std::sync::OnceLock::new();
+
+const QR_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn qr_token_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
+    QR_CONFIRMED_TOKENS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 开始扫码：拉取登录二维码（登录页链接或内联 PNG）与轮询用的
+/// `qrcode_id`。端点免鉴权，凭据在扫码确认后才产生。
+pub async fn post_wechat_qr_start() -> Result<HttpResponse, AppError> {
+    let qr = crate::connect::platforms::wechat::fetch_login_qrcode(
+        crate::connect::platforms::wechat::ilink_default_base_url(),
+    )
+    .await
+    .map_err(AppError::BadRequest)?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "qrcode_id": qr.qrcode_id,
+        "image_kind": qr.image_kind,
+        "image": qr.image_content,
+        "url": qr.url,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WechatQrStatusRequest {
+    qrcode_id: String,
+}
+
+/// 查询扫码状态一次（前端 2–3 秒轮询）。`confirmed` 时新 token 进入
+/// 服务器侧短 TTL 缓存，响应只报状态不回 token。
+pub async fn post_wechat_qr_status(
+    payload: web::Json<WechatQrStatusRequest>,
+) -> Result<HttpResponse, AppError> {
+    let qrcode_id = payload.into_inner().qrcode_id;
+    let status = crate::connect::platforms::wechat::poll_login_qrcode(
+        crate::connect::platforms::wechat::ilink_default_base_url(),
+        &qrcode_id,
+    )
+    .await
+    .map_err(AppError::BadRequest)?;
+    if status.status == "confirmed" {
+        if let Some(token) = status.token {
+            qr_token_cache()
+                .lock()
+                .expect("wechat qr token cache lock")
+                .insert(qrcode_id, (token, std::time::Instant::now()));
+        }
+    }
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "status": status.status,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WechatQrApplyRequest {
+    qrcode_id: String,
+    expected_revision: u64,
+    /// 已存在微信平台条目时传入其稳定 id（凭据归属不漂移）。
+    id: Option<String>,
+    #[serde(default)]
+    allow_from: Vec<String>,
+    #[serde(default)]
+    admin_from: Vec<String>,
+    voice: Option<bamboo_config::WechatVoiceConfig>,
+    voice_api_key_change: Option<CredentialAction>,
+}
+
+/// 扫码确认后落库：用缓存中的新 token 构造与手填完全一致的 connect
+/// 变更（token 走凭据管道替换，凭据永不回浏览器）。
+pub async fn post_wechat_qr_apply(
+    app_state: web::Data<AppState>,
+    payload: web::Json<WechatQrApplyRequest>,
+) -> Result<HttpResponse, AppError> {
+    let request = payload.into_inner();
+    let cached = {
+        let mut cache = qr_token_cache().lock().expect("wechat qr token cache lock");
+        cache.remove(&request.qrcode_id)
+    };
+    let Some((token, cached_at)) = cached else {
+        return Err(AppError::BadRequest(
+            "扫码结果已过期或未确认，请重新扫码".to_string(),
+        ));
+    };
+    if cached_at.elapsed() > QR_TOKEN_TTL {
+        return Err(AppError::BadRequest(
+            "扫码结果已过期（超过 5 分钟），请重新扫码".to_string(),
+        ));
+    }
+    let mutation = ConnectMutationRequest {
+        expected_revision: request.expected_revision,
+        data: ConnectMutationData {
+            platforms: vec![ConnectPlatformMutation {
+                id: request.id,
+                project_id: None,
+                platform_type: "wechat".to_string(),
+                app_id: None,
+                domain: None,
+                allow_from: request.allow_from,
+                admin_from: request.admin_from,
+                voice: request.voice,
+                token_change: Some(CredentialAction::Replace { value: token }),
+                app_secret_change: None,
+                voice_api_key_change: request.voice_api_key_change,
+            }],
+        },
+    };
+    apply_connect_mutation(&app_state, mutation).await
 }
 
 #[cfg(test)]

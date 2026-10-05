@@ -22,6 +22,7 @@ import {
   type CredentialStatusView,
 } from "@services/config/configSections";
 import { useConfigSectionStore } from "@shared/store/configSectionStore";
+import { configSectionsService } from "@services/config/configSections";
 import { reapplyConfigChanges } from "@shared/hooks/useConfigSectionDraft";
 import { redactConfigError } from "@shared/utils/configErrors";
 
@@ -37,6 +38,17 @@ interface ConnectDraft {
   feishuAppSecret: string;
   feishuDomain: string;
   feishuAllowFrom: string[];
+  wechatEnabled: boolean;
+  wechatToken: string;
+  wechatAllowFrom: string[];
+  wechatVoiceApiKey: string;
+  /** `off` | `mirror` | `always` — gates AUTO voice only (markers stay live). */
+  wechatReplyMode: string;
+  /** `file` (default, mp3) | `bubble` (native voice, experimental). */
+  wechatDelivery: string;
+  wechatFileAsr: boolean;
+  wechatTtsModel: string;
+  wechatTtsVoice: string;
 }
 
 const findPlatform = (
@@ -47,6 +59,8 @@ const findPlatform = (
 function draftFromConfig(connect: ConnectSection | undefined): ConnectDraft {
   const telegram = findPlatform(connect?.platforms, "telegram");
   const feishu = findPlatform(connect?.platforms, "feishu");
+  const wechat = findPlatform(connect?.platforms, "wechat");
+  const voice = wechat?.voice;
   return {
     telegramEnabled: Boolean(telegram),
     telegramToken: "",
@@ -56,6 +70,15 @@ function draftFromConfig(connect: ConnectSection | undefined): ConnectDraft {
     feishuAppSecret: "",
     feishuDomain: feishu?.domain ?? "",
     feishuAllowFrom: feishu?.allow_from ?? [],
+    wechatEnabled: Boolean(wechat),
+    wechatToken: "",
+    wechatAllowFrom: wechat?.allow_from ?? [],
+    wechatVoiceApiKey: "",
+    wechatReplyMode: voice?.reply_mode ?? "off",
+    wechatDelivery: voice?.delivery ?? "file",
+    wechatFileAsr: voice?.file_asr === "on",
+    wechatTtsModel: voice?.tts_model ?? "",
+    wechatTtsVoice: voice?.tts_voice ?? "",
   };
 }
 
@@ -63,6 +86,8 @@ const secretFreeDraft = (draft: ConnectDraft) => ({
   ...draft,
   telegramToken: draft.telegramToken ? "[replace requested]" : "",
   feishuAppSecret: draft.feishuAppSecret ? "[replace requested]" : "",
+  wechatToken: draft.wechatToken ? "[replace requested]" : "",
+  wechatVoiceApiKey: draft.wechatVoiceApiKey ? "[replace requested]" : "",
 });
 
 /**
@@ -99,6 +124,18 @@ const SystemSettingsConnectTab: React.FC = () => {
   const [dirty, setDirty] = useState(false);
   const [clearTelegramToken, setClearTelegramToken] = useState(false);
   const [clearFeishuSecret, setClearFeishuSecret] = useState(false);
+  const [clearWechatToken, setClearWechatToken] = useState(false);
+  const [clearWechatVoiceKey, setClearWechatVoiceKey] = useState(false);
+  const [qrCode, setQrCode] = useState<{
+    qrcodeId: string;
+    imageKind: string;
+    image: string;
+  } | null>(null);
+  const [qrPhase, setQrPhase] = useState<"idle" | "loading" | "waiting" | "applying" | "done">(
+    "idle",
+  );
+  const [qrError, setQrError] = useState<string | null>(null);
+  const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [showComparison, setShowComparison] = useState(false);
   const baseDraftRef = useRef<ConnectDraft | null>(null);
   const snapshot = useConfigSectionStore((state) => state.sections.connect);
@@ -114,6 +151,8 @@ const SystemSettingsConnectTab: React.FC = () => {
     setDirty(false);
     setClearTelegramToken(false);
     setClearFeishuSecret(false);
+    setClearWechatToken(false);
+    setClearWechatVoiceKey(false);
     setShowComparison(false);
   }, []);
 
@@ -155,10 +194,16 @@ const SystemSettingsConnectTab: React.FC = () => {
 
   const storedTelegram = findPlatform(connect?.platforms, "telegram");
   const storedFeishu = findPlatform(connect?.platforms, "feishu");
+  const storedWechat = findPlatform(connect?.platforms, "wechat");
   const hasStoredTelegramToken =
     storedTelegram?.token_configured ?? Boolean(storedTelegram?.token_credential_ref);
   const hasStoredFeishuSecret =
     storedFeishu?.app_secret_configured ?? Boolean(storedFeishu?.app_secret_credential_ref);
+  const hasStoredWechatToken =
+    storedWechat?.token_configured ?? Boolean(storedWechat?.token_credential_ref);
+  const hasStoredWechatVoiceKey =
+    storedWechat?.voice_api_key_configured ??
+    Boolean(storedWechat?.voice_api_key_credential_ref);
 
   const save = async () => {
     setSaving(true);
@@ -210,12 +255,53 @@ const SystemSettingsConnectTab: React.FC = () => {
         admin_from: storedFeishu?.admin_from ?? [],
       });
 
+      const buildWechatEntry = (): ConnectSectionDraftPlatform => ({
+        ...(storedWechat?.id ? { id: storedWechat.id } : {}),
+        ...(storedWechat?.project_id !== undefined
+          ? { project_id: storedWechat.project_id }
+          : {}),
+        type: "wechat",
+        ...(clearWechatToken
+          ? { token_change: { action: "clear" as const } }
+          : draft.wechatToken.trim()
+            ? {
+                token_change: {
+                  action: "replace" as const,
+                  value: draft.wechatToken.trim(),
+                },
+              }
+            : {}),
+        ...(clearWechatVoiceKey
+          ? { voice_api_key_change: { action: "clear" as const } }
+          : draft.wechatVoiceApiKey.trim()
+            ? {
+                voice_api_key_change: {
+                  action: "replace" as const,
+                  value: draft.wechatVoiceApiKey.trim(),
+                },
+              }
+            : {}),
+        // Submitting `voice` replaces the whole section server-side; blank
+        // optional fields fall back to server defaults (same behavior as an
+        // absent section value there).
+        voice: {
+          reply_mode: draft.wechatReplyMode,
+          delivery: draft.wechatDelivery,
+          file_asr: draft.wechatFileAsr ? "on" : "off",
+          ...(draft.wechatTtsModel.trim() ? { tts_model: draft.wechatTtsModel.trim() } : {}),
+          ...(draft.wechatTtsVoice.trim() ? { tts_voice: draft.wechatTtsVoice.trim() } : {}),
+        },
+        allow_from: draft.wechatAllowFrom,
+        admin_from: storedWechat?.admin_from ?? [],
+      });
+
       // Preserve original order and stable ids. Untouched/unknown platform
       // types (future adapters) pass through without server-managed metadata.
       const original = connect?.platforms ?? [];
       const platforms: ConnectSectionDraftPlatform[] = [];
       let telegramSeen = false;
       let feishuSeen = false;
+      let wechatSeen = false;
       for (const entry of original) {
         if (entry.type === "telegram") {
           telegramSeen = true;
@@ -223,6 +309,9 @@ const SystemSettingsConnectTab: React.FC = () => {
         } else if (entry.type === "feishu") {
           feishuSeen = true;
           if (draft.feishuEnabled) platforms.push(buildFeishuEntry());
+        } else if (entry.type === "wechat") {
+          wechatSeen = true;
+          if (draft.wechatEnabled) platforms.push(buildWechatEntry());
         } else {
           const sanitized = { ...entry } as ConnectSectionPlatform;
           delete sanitized.token;
@@ -233,11 +322,15 @@ const SystemSettingsConnectTab: React.FC = () => {
           delete sanitized.app_secret_configured;
           delete sanitized.app_secret_credential_ref;
           delete sanitized.app_secret_credential;
+          delete sanitized.voice_api_key_configured;
+          delete sanitized.voice_api_key_credential_ref;
+          delete sanitized.voice_api_key_credential;
           platforms.push(sanitized);
         }
       }
       if (draft.telegramEnabled && !telegramSeen) platforms.push(buildTelegramEntry());
       if (draft.feishuEnabled && !feishuSeen) platforms.push(buildFeishuEntry());
+      if (draft.wechatEnabled && !wechatSeen) platforms.push(buildWechatEntry());
 
       const envelope = await saveConnect({ platforms }, baseSectionRevision);
       adoptSnapshot(envelope);
@@ -252,6 +345,7 @@ const SystemSettingsConnectTab: React.FC = () => {
 
   const telegramDenyAll = draft.telegramEnabled && draft.telegramAllowFrom.length === 0;
   const feishuDenyAll = draft.feishuEnabled && draft.feishuAllowFrom.length === 0;
+  const wechatDenyAll = draft.wechatEnabled && draft.wechatAllowFrom.length === 0;
   const externalSectionRevision =
     dirty &&
     snapshot.envelope &&
@@ -271,6 +365,8 @@ const SystemSettingsConnectTab: React.FC = () => {
               ...secretFreeDraft(draft),
               clearTelegramToken,
               clearFeishuSecret,
+              clearWechatToken,
+              clearWechatVoiceKey,
             },
             latest: secretFreeDraft(draftFromConfig(snapshot.envelope.data)),
           },
@@ -319,6 +415,121 @@ const SystemSettingsConnectTab: React.FC = () => {
       setShowComparison(false);
     } catch (error) {
       setLoadError(redactConfigError(getErrorMessage(error)));
+    }
+  };
+
+  const stopQrPolling = useCallback(() => {
+    if (qrPollRef.current !== null) {
+      clearInterval(qrPollRef.current);
+      qrPollRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => stopQrPolling, [stopQrPolling]);
+
+  const resetQrFlow = useCallback(() => {
+    stopQrPolling();
+    setQrCode(null);
+    setQrPhase("idle");
+    setQrError(null);
+  }, [stopQrPolling]);
+
+  const applyQrToken = useCallback(
+    async (qrcodeId: string) => {
+      if (baseSectionRevision === null) {
+        setQrError("Connect configuration is not loaded.");
+        resetQrFlow();
+        return;
+      }
+      setQrPhase("applying");
+      setQrError(null);
+      try {
+        const envelope = await configSectionsService.wechatQrApply({
+          qrcode_id: qrcodeId,
+          expected_revision: baseSectionRevision,
+          ...(storedWechat?.id ? { id: storedWechat.id } : {}),
+          allow_from: draft.wechatAllowFrom,
+          admin_from: storedWechat?.admin_from ?? [],
+          voice: {
+            reply_mode: draft.wechatReplyMode,
+            delivery: draft.wechatDelivery,
+            file_asr: draft.wechatFileAsr ? "on" : "off",
+            ...(draft.wechatTtsModel.trim()
+              ? { tts_model: draft.wechatTtsModel.trim() }
+              : {}),
+            ...(draft.wechatTtsVoice.trim()
+              ? { tts_voice: draft.wechatTtsVoice.trim() }
+              : {}),
+          },
+          ...(draft.wechatVoiceApiKey.trim()
+            ? {
+                voice_api_key_change: {
+                  action: "replace" as const,
+                  value: draft.wechatVoiceApiKey.trim(),
+                },
+              }
+            : {}),
+        });
+        stopQrPolling();
+        adoptSnapshot(envelope);
+        setQrPhase("done");
+        setQrCode(null);
+      } catch (error) {
+        setQrError(redactConfigError(getErrorMessage(error)));
+        resetQrFlow();
+      }
+    },
+    [
+      adoptSnapshot,
+      baseSectionRevision,
+      draft,
+      resetQrFlow,
+      stopQrPolling,
+      storedWechat,
+    ],
+  );
+
+  const startQrLogin = async () => {
+    stopQrPolling();
+    setQrError(null);
+    setQrPhase("loading");
+    setQrCode(null);
+    try {
+      const result = await configSectionsService.wechatQrStart();
+      setQrCode({
+        qrcodeId: result.qrcode_id,
+        imageKind: result.image_kind,
+        image: result.image,
+      });
+      setQrPhase("waiting");
+      if (result.image_kind === "url") {
+        window.open(result.image, "_blank", "noopener");
+      }
+      const qrcodeId = result.qrcode_id;
+      qrPollRef.current = setInterval(() => {
+        void (async () => {
+          try {
+            const status = await configSectionsService.wechatQrStatus(qrcodeId);
+            if (status.status === "confirmed") {
+              stopQrPolling();
+              await applyQrToken(qrcodeId);
+            } else if (["expired", "cancelled", "timeout"].includes(status.status)) {
+              stopQrPolling();
+              setQrPhase("idle");
+              setQrCode(null);
+              setQrError(
+                `QR login ${status.status} — click the button to request a fresh code.`,
+              );
+            }
+          } catch (error) {
+            // 瞬时轮询失败不打断流程（与网关侧 qr_login 同款策略）。
+            setQrError(redactConfigError(getErrorMessage(error)));
+          }
+        })();
+      }, 2500);
+    } catch (error) {
+      setQrError(redactConfigError(getErrorMessage(error)));
+      setQrPhase("idle");
     }
   };
 
@@ -528,6 +739,245 @@ const SystemSettingsConnectTab: React.FC = () => {
                   {t("settings.connectTab.denyAllWarning")}
                 </Text>
               ) : null}
+            </Flex>
+
+            <Divider style={{ margin: `${token.marginXS}px 0` }} />
+
+            <Flex vertical gap={token.marginXS}>
+              <Flex align="center" justify="space-between" gap={token.marginSM}>
+                <Text>{t("settings.connectTab.wechat.title")}</Text>
+                <Switch
+                  data-testid="connect-wechat-enabled"
+                  checked={draft.wechatEnabled}
+                  onChange={(checked) => patch({ wechatEnabled: checked })}
+                  aria-label={t("settings.connectTab.wechat.enable")}
+                />
+              </Flex>
+
+              <Divider style={{ margin: `${token.marginXS}px 0` }} />
+              <Flex align="center" justify="space-between" gap={token.marginSM} wrap="wrap">
+                <Text style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.qrTitle")}
+                </Text>
+                <Button
+                  size="small"
+                  data-testid="connect-wechat-qr-start"
+                  loading={qrPhase === "loading"}
+                  disabled={qrPhase === "applying"}
+                  onClick={() => void startQrLogin()}
+                >
+                  {qrPhase === "waiting"
+                    ? t("settings.connectTab.wechat.qrRestart")
+                    : t("settings.connectTab.wechat.qrStart")}
+                </Button>
+              </Flex>
+              <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                {t("settings.connectTab.wechat.qrHint")}
+              </Text>
+              {qrPhase === "waiting" && qrCode ? (
+                qrCode.imageKind === "png_base64" ? (
+                  <img
+                    data-testid="connect-wechat-qr-image"
+                    src={`data:image/png;base64,${qrCode.image}`}
+                    alt="WeChat login QR"
+                    style={{ width: 220, height: 220, imageRendering: "pixelated" }}
+                  />
+                ) : qrCode.imageKind === "url" ? (
+                  <Button
+                    size="small"
+                    href={qrCode.image}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    {t("settings.connectTab.wechat.qrOpenPage")}
+                  </Button>
+                ) : null
+              ) : null}
+              {qrPhase === "waiting" ? (
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.qrWaiting")}
+                </Text>
+              ) : null}
+              {qrPhase === "applying" ? (
+                <Text type="warning" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.qrApplying")}
+                </Text>
+              ) : null}
+              {qrPhase === "done" ? (
+                <Text type="success" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.qrDone")}
+                </Text>
+              ) : null}
+              {qrError ? (
+                <Alert type="error" showIcon message={qrError} closable onClose={() => setQrError(null)} />
+              ) : null}
+
+              <Divider style={{ margin: `${token.marginXS}px 0` }} />
+              <label>
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.token")}
+                </Text>
+                <Input.Password
+                  data-testid="connect-wechat-token"
+                  value={draft.wechatToken}
+                  onChange={(e) => {
+                    setClearWechatToken(false);
+                    patch({ wechatToken: e.target.value });
+                  }}
+                  placeholder={
+                    hasStoredWechatToken
+                      ? t("settings.connectTab.wechat.tokenPlaceholderConfigured")
+                      : t("settings.connectTab.wechat.tokenPlaceholderEmpty")
+                  }
+                />
+              </label>
+              {credentialStatus(storedWechat?.token_credential, hasStoredWechatToken)}
+              {hasStoredWechatToken ? (
+                <Button
+                  size="small"
+                  danger={clearWechatToken}
+                  onClick={() => {
+                    setClearWechatToken((current) => !current);
+                    setDraft((current) => ({ ...current, wechatToken: "" }));
+                    setDirty(true);
+                  }}
+                >
+                  {clearWechatToken
+                    ? t("settings.connectTab.wechat.tokenClearArmed")
+                    : t("settings.connectTab.wechat.tokenClear")}
+                </Button>
+              ) : null}
+              <label>
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.allowFrom")}
+                </Text>
+                <Select<string[]>
+                  data-testid="connect-wechat-allow-from"
+                  mode="tags"
+                  open={false}
+                  tokenSeparators={[",", " "]}
+                  value={draft.wechatAllowFrom}
+                  onChange={(value) => patch({ wechatAllowFrom: value })}
+                  placeholder={t("settings.connectTab.wechat.allowFromPlaceholder")}
+                  style={{ width: "100%" }}
+                />
+              </label>
+              {wechatDenyAll ? (
+                <Text type="warning" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.denyAllWarning")}
+                </Text>
+              ) : null}
+
+              <Divider style={{ margin: `${token.marginXS}px 0` }} />
+              <Text style={{ fontSize: token.fontSizeSM }}>
+                {t("settings.connectTab.wechat.voiceTitle")}
+              </Text>
+              <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                {t("settings.connectTab.wechat.voiceDescription")}
+              </Text>
+              <label>
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.voiceApiKey")}
+                </Text>
+                <Input.Password
+                  data-testid="connect-wechat-voice-key"
+                  value={draft.wechatVoiceApiKey}
+                  onChange={(e) => {
+                    setClearWechatVoiceKey(false);
+                    patch({ wechatVoiceApiKey: e.target.value });
+                  }}
+                  placeholder={
+                    hasStoredWechatVoiceKey
+                      ? t("settings.connectTab.wechat.voiceKeyPlaceholderConfigured")
+                      : t("settings.connectTab.wechat.voiceKeyPlaceholderEmpty")
+                  }
+                />
+              </label>
+              {credentialStatus(storedWechat?.voice_api_key_credential, hasStoredWechatVoiceKey)}
+              {hasStoredWechatVoiceKey ? (
+                <Button
+                  size="small"
+                  danger={clearWechatVoiceKey}
+                  onClick={() => {
+                    setClearWechatVoiceKey((current) => !current);
+                    setDraft((current) => ({ ...current, wechatVoiceApiKey: "" }));
+                    setDirty(true);
+                  }}
+                >
+                  {clearWechatVoiceKey
+                    ? t("settings.connectTab.wechat.voiceKeyClearArmed")
+                    : t("settings.connectTab.wechat.voiceKeyClear")}
+                </Button>
+              ) : null}
+              <label>
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.replyMode")}
+                </Text>
+                <Select<string>
+                  data-testid="connect-wechat-reply-mode"
+                  value={draft.wechatReplyMode}
+                  onChange={(value) => patch({ wechatReplyMode: value })}
+                  style={{ width: "100%" }}
+                  options={[
+                    { value: "off", label: t("settings.connectTab.wechat.replyModeOff") },
+                    { value: "mirror", label: t("settings.connectTab.wechat.replyModeMirror") },
+                    { value: "always", label: t("settings.connectTab.wechat.replyModeAlways") },
+                  ]}
+                />
+              </label>
+              <label>
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.delivery")}
+                </Text>
+                <Select<string>
+                  data-testid="connect-wechat-delivery"
+                  value={draft.wechatDelivery}
+                  onChange={(value) => patch({ wechatDelivery: value })}
+                  style={{ width: "100%" }}
+                  options={[
+                    { value: "file", label: t("settings.connectTab.wechat.deliveryFile") },
+                    { value: "bubble", label: t("settings.connectTab.wechat.deliveryBubble") },
+                  ]}
+                />
+              </label>
+              <Flex align="center" justify="space-between" gap={token.marginSM}>
+                <Flex vertical>
+                  <Text style={{ fontSize: token.fontSizeSM }}>
+                    {t("settings.connectTab.wechat.fileAsr")}
+                  </Text>
+                  <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                    {t("settings.connectTab.wechat.fileAsrDescription")}
+                  </Text>
+                </Flex>
+                <Switch
+                  data-testid="connect-wechat-file-asr"
+                  checked={draft.wechatFileAsr}
+                  onChange={(checked) => patch({ wechatFileAsr: checked })}
+                  aria-label={t("settings.connectTab.wechat.fileAsr")}
+                />
+              </Flex>
+              <label>
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.ttsModel")}
+                </Text>
+                <Input
+                  data-testid="connect-wechat-tts-model"
+                  value={draft.wechatTtsModel}
+                  onChange={(e) => patch({ wechatTtsModel: e.target.value })}
+                  placeholder={t("settings.connectTab.wechat.ttsModelPlaceholder")}
+                />
+              </label>
+              <label>
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.ttsVoice")}
+                </Text>
+                <Input
+                  data-testid="connect-wechat-tts-voice"
+                  value={draft.wechatTtsVoice}
+                  onChange={(e) => patch({ wechatTtsVoice: e.target.value })}
+                  placeholder={t("settings.connectTab.wechat.ttsVoicePlaceholder")}
+                />
+              </label>
             </Flex>
 
             {saveError ? <Alert type="error" showIcon message={saveError} /> : null}

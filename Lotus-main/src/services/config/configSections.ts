@@ -166,6 +166,10 @@ export interface ConnectSectionPlatform extends ConnectPlatformConfig {
   app_secret_configured?: boolean;
   app_secret_credential_ref?: string | null;
   app_secret_credential?: CredentialStatusView;
+  /** WeChat SiliconFlow voice API key — configured-state metadata only. */
+  voice_api_key_configured?: boolean;
+  voice_api_key_credential_ref?: string | null;
+  voice_api_key_credential?: CredentialStatusView;
 }
 
 export interface ConnectSection {
@@ -175,10 +179,36 @@ export interface ConnectSection {
 export type ConnectSectionDraftPlatform = Omit<ConnectPlatformConfig, "token" | "app_secret"> & {
   token_change?: CredentialAction;
   app_secret_change?: CredentialAction;
+  /** WeChat SiliconFlow voice API key replace/clear (never read back). */
+  voice_api_key_change?: CredentialAction;
 };
 
 export interface ConnectSectionDraft {
   platforms: ConnectSectionDraftPlatform[];
+}
+
+/** `POST …/wechat-qr/start` result: login QR (page link or inline PNG). */
+export interface WechatQrStartResult {
+  qrcode_id: string;
+  image_kind: "url" | "png_base64" | "";
+  image: string;
+  url?: string | null;
+}
+
+/** `POST …/wechat-qr/status` result: scan state; the token never leaves the server. */
+export interface WechatQrStatusResult {
+  status: string;
+}
+
+/** `POST …/wechat-qr/apply` payload: finalize a confirmed scan into config. */
+export interface WechatQrApplyPayload {
+  qrcode_id: string;
+  expected_revision: number;
+  id?: string;
+  allow_from: string[];
+  admin_from: string[];
+  voice?: ConnectSectionPlatform["voice"];
+  voice_api_key_change?: CredentialAction;
 }
 
 export type ClusterNodeStatus =
@@ -865,6 +895,31 @@ class ConfigSectionsService {
       return normalizeConnectEnvelope(response);
     } catch (error) {
       return mapConflict(error, expectedRevision);
+    }
+  }
+
+  /** WeChat QR login (browser cannot read the iLink gateway directly — no CORS). */
+  async wechatQrStart(): Promise<WechatQrStartResult> {
+    return apiClient.post<WechatQrStartResult>("/bamboo/config/connect/wechat-qr/start", {});
+  }
+
+  async wechatQrStatus(qrcodeId: string): Promise<WechatQrStatusResult> {
+    return apiClient.post<WechatQrStatusResult>("/bamboo/config/connect/wechat-qr/status", {
+      qrcode_id: qrcodeId,
+    });
+  }
+
+  async wechatQrApply(
+    payload: WechatQrApplyPayload,
+  ): Promise<ConfigSectionEnvelope<ConnectSection>> {
+    try {
+      const response = await apiClient.post<ConnectConfigResponse>(
+        "/bamboo/config/connect/wechat-qr/apply",
+        payload,
+      );
+      return normalizeConnectEnvelope(response);
+    } catch (error) {
+      return mapConflict(error, payload.expected_revision);
     }
   }
 
