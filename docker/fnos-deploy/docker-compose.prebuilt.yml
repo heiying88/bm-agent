@@ -1,0 +1,28 @@
+# 免构建部署：配合 Dockerfile.prebuilt 构建的本地镜像 bamboo-server:latest。
+# 安全语义与主 docker/docker-compose.yml 完全一致（见其注释）：
+# 默认仅发布到主机回环；家庭内网使用按 README 改成 "9562:9562"。
+services:
+  bamboo:
+    image: bamboo-server:latest
+    container_name: bamboo
+    ports:
+      - "9562:9562"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    environment:
+      - RUST_LOG=info
+      - TZ=Asia/Shanghai
+      - BAMBOO_DATA_DIR=/data
+      - BAMBOO_PORT=9562
+      - BAMBOO_BIND=0.0.0.0
+      - BAMBOO_CORS_ALLOW_ORIGINS=
+    volumes:
+      - bamboo-data:/data
+    restart: unless-stopped
+
+volumes:
+  bamboo-data:
+    driver: local

@@ -1,86 +1,74 @@
 # 飞牛 OS（fnOS）Docker 部署 Bamboo
 
-> 本目录两个包由 Windows 侧打包（2026-10-05）：
-> - `bamboo-src.tar.gz`（9.4MB）：完整源码，**前端已嵌入 crate**
->   （`crates/app/bamboo-server/frontend_package/lotus-frontend.zip`，
->   含微信配置卡片 + 扫码登录 UI），NAS 上不需要 Lotus-main / node。
-> - `bamboo-data.tar.gz`（99KB）：Windows 侧 `~/.bamboo` 的配置迁移包
->   （模型 provider 配置、加密密钥、凭据库、会话历史；**不含** frontend/
->   ——容器首次启动会自己解包；**微信平台配置为空**——迁移后在网页里
->   用"扫码登录"首配，正好走新流程）。
+> 本目录内容（2026-10-05 由 Windows 侧打包）：
+>
+> | 文件 | 说明 |
+> |---|---|
+> | `bamboo-linux.gz`（50MB） | **已交叉编译好的 Linux x86-64 二进制**（glibc 2.36 / bookworm，OpenSSL 已静态链入，前端已嵌入）。免构建路线用这个 |
+> | `Dockerfile.prebuilt` + `docker-compose.prebuilt.yml` | 免构建镜像定义（NAS 上秒级构建） |
+> | `bamboo-data.tar.gz`（99KB） | Windows 侧 `~/.bamboo` 迁移包（模型 provider 配置、加密密钥、凭据库、会话；**不含** frontend/，**微信配置为空**——到网页里扫码首配） |
+> | `bamboo-src.tar.gz`（9.4MB） | 完整源码（备选：NAS 上从源码构建；Dockerfile 已默认 LTO off + jobs=2 适配小内存，NAS ≥4GB 可编） |
 
-## 0. 传输与准备
+## 路线 A（推荐）：免构建，秒级起容器
 
-1. 把 `bamboo-src.tar.gz`、`bamboo-data.tar.gz` 两个文件复制到 NAS
-   （SMB 共享目录或 `scp` 均可），假设放在 `/vol1/docker/`。
-2. SSH 登录飞牛 OS（fnOS 设置里开启 SSH）。
+### 0. 传输
 
-## 1. 解压源码并启动构建
+把 `bamboo-linux.gz`、`Dockerfile.prebuilt`、`docker-compose.prebuilt.yml`、
+`bamboo-data.tar.gz` 四个文件复制到 NAS（SMB 或 scp），假设放 `/vol1/docker/bamboo/`。
+SSH 登录飞牛 OS。
+
+### 1. 解压二进制并构建镜像（约 1 分钟，无编译）
 
 ```bash
-mkdir -p /vol1/docker/bamboo && tar -xzf /vol1/docker/bamboo-src.tar.gz -C /vol1/docker/bamboo
-cd /vol1/docker/bamboo/docker
-
-# 家庭内网使用：把发布从"仅本机回环"改为局域网可访问
-# （默认 127.0.0.1:9562:9562 在 NAS 上意味着 PC 浏览器打不开）
-sed -i 's/127.0.0.1:9562:9562/9562:9562/' docker-compose.yml
-
-# 时区（可选，日志时间戳对齐本地）
-sed -i 's/- RUST_LOG=info/- RUST_LOG=info\n      - TZ=Asia\/Shanghai/' docker-compose.yml
-
-# 构建并启动。首次构建要编译全部依赖（NAS CPU 上约 30–90 分钟），
-# 之后 cargo-chef 缓存依赖层，改代码重建只需几分钟。
-docker compose -p bamboo up -d --build
+cd /vol1/docker/bamboo
+gunzip bamboo-linux.gz && chmod +x bamboo-linux
+docker build -f Dockerfile.prebuilt -t bamboo-server:latest .
 ```
 
-构建内存提示：release + LTO 峰值需要 ~4GB 内存。NAS 内存紧张时在
-`docker-compose.yml` 的 `build:` 块加 `args:` 传 `CARGO_BUILD_JOBS=2`
-（Dockerfile 需加一行 `ARG CARGO_BUILD_JOBS` + `ENV CARGO_BUILD_JOBS=$CARGO_BUILD_JOBS`），
-或先给 fnOS 加 swap。
-
-## 2. 迁移 Windows 侧配置
+### 2. 启动并迁移数据
 
 ```bash
-docker compose -p bamboo stop
+docker compose -f docker-compose.prebuilt.yml -p bamboo up -d
+docker compose -f docker-compose.prebuilt.yml -p bamboo stop
 
-# 数据解进 named volume（项目名 bamboo → volume 名 bamboo_bamboo-data）
+# 数据灌进 named volume（项目名 bamboo → volume 名 bamboo_bamboo-data）
 docker run --rm \
   -v bamboo_bamboo-data:/data \
-  -v /vol1/docker:/mnt \
+  -v /vol1/docker/bamboo:/mnt \
   alpine sh -c "tar -xzf /mnt/bamboo-data.tar.gz -C /data && chown -R 10001:10001 /data"
 
-docker compose -p bamboo up -d
-curl http://127.0.0.1:9562/api/v1/health   # → 应返回健康 JSON
+docker compose -f docker-compose.prebuilt.yml -p bamboo up -d
+curl http://127.0.0.1:9562/api/v1/health   # → 健康 JSON
 ```
 
-迁移包带过去的：模型 provider（glm 等 API 配置）、加密密钥 + 凭据库
-（成对迁移，互相能解开）、会话历史。**微信桥接是空的**——下一步首配。
+### 3. 微信扫码首配
 
-## 3. 微信扫码首配（新功能首秀）
+PC 浏览器打开 `http://<NAS_IP>:9562` → 设置 → 系统设置 → Connect → 微信卡片：
 
-PC 浏览器打开 `http://<NAS_IP>:9562`：
-
-1. 设置 → 系统设置 → Connect → 微信卡片
-2. 打开微信启用开关
-3. 允许的用户 ID：`o9cq8099v8BpzJwAHZ0jvF3EErnc@im.wechat`
-4. 硅基流动 API Key：填你的 `sk-` 密钥
-5. 语音开关：自动语音 `off`、投递 `file`、音频文件转写 `on`（当前偏好）
-6. 点"开始扫码登录"→ 手机微信确认 → "✅ Token 已保存"
+1. 打开微信启用开关
+2. 允许的用户 ID：`o9cq8099v8BpzJwAHZ0jvF3EErnc@im.wechat`
+3. 硅基流动 API Key：填你的 `sk-` 密钥
+4. 语音开关：自动语音 `off`、投递 `file`、音频文件转写 `on`
+5. 点"开始扫码登录"→ 手机微信确认 → "✅ Token 已保存"
 
 ```bash
-docker compose -p bamboo restart   # 重启让微信桥接加载新 token
-```
-
-## 4. 验证
-
-```bash
+docker compose -f docker-compose.prebuilt.yml -p bamboo restart
 docker logs bamboo 2>&1 | grep -a "wechat voice enabled"
 # 期望：reply_mode=Off delivery=File file_asr=true ...
 ```
 
-微信发条消息 → 文字回复；发个 mp3 → 模型直接按内容回答；
-说"念一下" → mp3 语音文件回复。智能度/模型切换（/think、/model、
-自然语言标记）只在微信入口生效。
+## 路线 B（备选）：NAS 上从源码构建
+
+```bash
+mkdir -p /vol1/docker/bamboo-src && tar -xzf bamboo-src.tar.gz -C /vol1/docker/bamboo-src
+cd /vol1/docker/bamboo-src/docker
+sed -i 's/127.0.0.1:9562:9562/9562:9562/' docker-compose.yml   # 内网可访问
+docker compose -p bamboo up -d --build     # 30–90 分钟（依赖层之后重建只要几分钟）
+```
+
+内存紧张（≤4GB）：Dockerfile 已默认 `BAMBOO_LTO=false`/`BAMBOO_JOBS=2`；
+大内存机器可用 `--build-arg BAMBOO_LTO=true --build-arg BAMBOO_JOBS=8` 恢复。
+数据迁移同路线 A 第 2 步。
 
 ## 安全注意（来自 DEPLOY.md，必须知道）
 

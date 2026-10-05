@@ -1,0 +1,46 @@
+# 免构建镜像：交叉编译好的 Linux 二进制直接成镜像（NAS 上秒级）。
+# 与主 Dockerfile 的运行时层保持同构（debian bookworm-slim + uid 10001
+# + 相同的 env/healthcheck/entrypoint）。二进制按 glibc 2.36（bookworm）
+# 交叉编译，与该基础镜像匹配。
+#
+# NAS 上使用（把本目录整个拷过去后）：
+#   cd fnos-deploy
+#   docker build -f Dockerfile.prebuilt -t bamboo-server:latest .
+#   # 然后用与源码构建相同的 compose（只把 build: 块去掉或改用此镜像）
+
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin bamboo \
+    && mkdir -p /data \
+    && chown -R bamboo:bamboo /data
+
+COPY bamboo-linux /usr/local/bin/bamboo
+RUN chmod +x /usr/local/bin/bamboo
+
+ENV RUST_LOG=info
+ENV BAMBOO_DATA_DIR=/data
+ENV BAMBOO_PORT=9562
+# 容器内绑 0.0.0.0，实际暴露由 compose 发布层控制（见主 compose 注释）。
+ENV BAMBOO_BIND=0.0.0.0
+
+EXPOSE 9562
+
+USER bamboo
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:9562/api/v1/health >/dev/null \
+    && curl -fsS http://127.0.0.1:9562/ >/dev/null \
+    && test -s /data/frontend/.frontend-manifest.json \
+    || exit 1
+
+ENTRYPOINT ["bamboo"]
+CMD ["serve", "--port", "9562", "--bind", "0.0.0.0", "--data-dir", "/data"]

@@ -36,6 +36,17 @@ FROM chef AS builder
 
 WORKDIR /app
 
+# Small-RAM builders (home NAS, CI runners with ≤4GB): the release profile's
+# LTO=true makes the final link peak at several GB of RAM and is the usual
+# OOM culprit, and unbounded parallel rustc invocations multiply compile RAM.
+# Defaults trade some binary size/perf for a build that fits; override back
+# on beefy machines:
+#   docker compose build --build-arg BAMBOO_LTO=true --build-arg BAMBOO_JOBS=8
+ARG BAMBOO_LTO=false
+ARG BAMBOO_JOBS=2
+ENV CARGO_PROFILE_RELEASE_LTO=${BAMBOO_LTO}
+ENV CARGO_BUILD_JOBS=${BAMBOO_JOBS}
+
 # Builds ONLY the dependency graph (crates.io deps) described by recipe.json.
 # This layer is invalidated by a Cargo.toml/Cargo.lock change, NOT by a
 # source-only change, so it's reused across builds where just application
