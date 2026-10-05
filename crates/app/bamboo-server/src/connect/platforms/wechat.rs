@@ -876,9 +876,9 @@ impl WechatPlatform {
 
     /// 入站音频文件转写（`voice.file_asr` 开启时）：把已解密落盘的音频
     /// 上传硅基流动识别，成功则向 `lines` 追加 `[音频转写] <文本>` 行。
-    /// 音乐/无语音内容/超限/接口失败一律静默跳过（debug 日志）——不打扰
-    /// 主流程，文件路径行始终保留。微信**语音条**不走这里（永远用微信
-    /// 自带转写，见设计文档 §4）。
+    /// 音乐/无语音内容/超限/接口失败不阻塞主流程（文件路径行始终保留），
+    /// 但**失败记 WARN**——静默跳过只对用户体验，排查必须有痕。微信
+    /// **语音条**不走这里（永远用微信自带转写，见设计文档 §4）。
     async fn maybe_transcribe_audio(
         &self,
         path: &std::path::Path,
@@ -894,12 +894,12 @@ impl WechatPlatform {
         let bytes = match tokio::fs::read(path).await {
             Ok(bytes) => bytes,
             Err(error) => {
-                tracing::debug!("connect: wechat audio asr read failed: {error}");
+                tracing::warn!("connect: wechat audio asr read failed: {error}");
                 return;
             }
         };
         if bytes.len() > wechat_voice::MAX_ASR_FILE_BYTES {
-            tracing::debug!(
+            tracing::warn!(
                 "connect: wechat audio asr skipped ({} bytes over cap)",
                 bytes.len()
             );
@@ -907,11 +907,17 @@ impl WechatPlatform {
         }
         match wechat_voice::transcribe_file(http_client(), voice, &bytes, file_name).await {
             Ok(text) if !text.is_empty() => {
+                tracing::info!(
+                    "connect: wechat audio asr ok file={file_name} chars={}",
+                    text.chars().count()
+                );
                 lines.push(format!("[音频转写] {text}"));
             }
-            Ok(_) => {}
+            Ok(_) => {
+                tracing::warn!("connect: wechat audio asr empty result for {file_name}");
+            }
             Err(error) => {
-                tracing::debug!("connect: wechat audio asr failed for {file_name}: {error}");
+                tracing::warn!("connect: wechat audio asr failed for {file_name}: {error}");
             }
         }
     }
