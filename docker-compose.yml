@@ -1,0 +1,36 @@
+# fnOS（飞牛）"创建项目"专用 compose：放在仓库根目录，飞牛项目路径直接
+# 指向仓库根即可（路径下存在 docker-compose.yml → 启用 → up 自动构建）。
+# 与 docker/docker-compose.yml 的区别：发布到局域网（家庭内网从 PC 浏览器
+# 访问 http://<NAS_IP>:9562）+ 显式时区；安全语义见 docs/guides/DEPLOY.md
+# 的"网络暴露"一节——不可信网络环境请改回 127.0.0.1:9562:9562 并加反代。
+#
+# 首次构建在 NAS 上编译全部依赖（Dockerfile 已默认 LTO off + jobs=2 适配
+# 小内存；大内存可在飞牛构建参数里加 --build-arg BAMBOO_LTO=true）。
+services:
+  bamboo:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: bamboo-server:latest
+    container_name: bamboo
+    ports:
+      - "9562:9562"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    environment:
+      - RUST_LOG=info
+      - TZ=Asia/Shanghai
+      - BAMBOO_DATA_DIR=/data
+      - BAMBOO_PORT=9562
+      - BAMBOO_BIND=0.0.0.0
+      - BAMBOO_CORS_ALLOW_ORIGINS=
+    volumes:
+      - bamboo-data:/data
+    restart: unless-stopped
+
+volumes:
+  bamboo-data:
+    driver: local

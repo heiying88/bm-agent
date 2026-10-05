@@ -58,3 +58,11 @@ config.local.json
 
 # Documentation is tracked
 !docs/
+
+# fnOS 部署产物：大二进制/镜像 tar 不进 git（build-image.sh 现场重打）；
+# bamboo-data.tar.gz 含加密密钥与凭据库，绝不能提交
+docker/fnos-deploy/bamboo-linux
+docker/fnos-deploy/bamboo-linux.gz
+docker/fnos-deploy/bamboo-server-image.tar
+docker/fnos-deploy/bamboo-src.tar.gz
+docker/fnos-deploy/bamboo-data.tar.gz

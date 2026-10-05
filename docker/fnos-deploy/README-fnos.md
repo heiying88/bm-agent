@@ -4,26 +4,24 @@
 >
 > | 文件 | 说明 |
 > |---|---|
-> | `bamboo-linux.gz`（50MB） | **已交叉编译好的 Linux x86-64 二进制**（glibc 2.36 / bookworm，OpenSSL 已静态链入，前端已嵌入）。免构建路线用这个 |
-> | `Dockerfile.prebuilt` + `docker-compose.prebuilt.yml` | 免构建镜像定义（NAS 上秒级构建） |
+> | `bamboo-server-image.tar`（187MB） | **成品 Docker 镜像** `bamboo-server:latest`（amd64，未压缩 docker-save 规范布局，飞牛"导入镜像"界面可用；`docker load` 亦可）。内含 Debian bookworm-slim + 交叉编译二进制（OpenSSL 静态链入、前端已嵌入）+ CA 证书 + 运行用户 |
 > | `bamboo-data.tar.gz`（99KB） | Windows 侧 `~/.bamboo` 迁移包（模型 provider 配置、加密密钥、凭据库、会话；**不含** frontend/，**微信配置为空**——到网页里扫码首配） |
-> | `bamboo-src.tar.gz`（9.4MB） | 完整源码（备选：NAS 上从源码构建；Dockerfile 已默认 LTO off + jobs=2 适配小内存，NAS ≥4GB 可编） |
+> | `docker-compose.prebuilt.yml` | 启动编排（内网发布、安全加固、时区） |
+> | `bamboo-linux.gz` + `Dockerfile.prebuilt` | 备选：NAS 上 `docker build` 现场构建（1 分钟，标准官方流程，兜底一切格式问题） |
+> | `build-image.sh` | 无 Docker 引擎下重打镜像的脚本（改代码重新交叉编译后运行出新 tar） |
+> | `bamboo-src.tar.gz`（9.4MB） | 完整源码（备选：从源码构建；Dockerfile 已默认 LTO off + jobs=2 适配小内存） |
 
-## 路线 A（推荐）：免构建，秒级起容器
+## 路线 A（推荐）：导入成品镜像
 
 ### 0. 传输
 
-把 `bamboo-linux.gz`、`Dockerfile.prebuilt`、`docker-compose.prebuilt.yml`、
-`bamboo-data.tar.gz` 四个文件复制到 NAS（SMB 或 scp），假设放 `/vol1/docker/bamboo/`。
-SSH 登录飞牛 OS。
+把 `bamboo-server-image.tar`、`docker-compose.prebuilt.yml`、
+`bamboo-data.tar.gz` 复制到 NAS（SMB 或 scp），假设放 `/vol1/docker/bamboo/`。
 
-### 1. 解压二进制并构建镜像（约 1 分钟，无编译）
+### 1. 导入镜像（秒级）
 
-```bash
-cd /vol1/docker/bamboo
-gunzip bamboo-linux.gz && chmod +x bamboo-linux
-docker build -f Dockerfile.prebuilt -t bamboo-server:latest .
-```
+- 界面：fnOS → Docker → 镜像 → 导入 → 选 `bamboo-server-image.tar`
+- 或 SSH：`docker load -i /vol1/docker/bamboo/bamboo-server-image.tar`
 
 ### 2. 启动并迁移数据
 
@@ -70,7 +68,27 @@ docker compose -p bamboo up -d --build     # 30–90 分钟（依赖层之后重
 大内存机器可用 `--build-arg BAMBOO_LTO=true --build-arg BAMBOO_JOBS=8` 恢复。
 数据迁移同路线 A 第 2 步。
 
+## 路线 C：fnOS"创建项目"（git 仓库方式，官方 compose 流程）
+
+仓库根目录已放好 `docker-compose.yml`（fnOS 专用：构建源码 + 局域网发布 + 时区）。
+
+1. 把仓库弄到 NAS 上（任选）：
+   - NAS 上 `git clone https://github.com/heiying88/bm-agent.git /vol1/docker/bamboo`
+   - 或把 Windows 工作区整个目录 SMB 拷到 `/vol1/docker/bamboo`（不含 target/）
+2. 飞牛界面：Docker → 项目 → 创建项目 → 项目名 `bamboo`、路径
+   `/vol1/docker/bamboo` → 启用 docker-compose.yml → 启动
+   （首次构建 30–90 分钟；日志里能看到 cargo 编译进度）
+3. 数据迁移与微信扫码首配同路线 A 第 2/3 步（volume 名为 `bamboo_bamboo-data`）
+
 ## 安全注意（来自 DEPLOY.md，必须知道）
+
+**⚠️ 曾有密钥泄露事故（2026-10-05）**：`bamboo-data.tar.gz`（含数据目录
+加密密钥）曾被误提交并推送到 GitHub，已从 git 移除并要求历史抹除 +
+force push；若仓库曾为 public，请视为密钥已泄露——在网页设置里重录所有
+API Key（重录会以（可能已泄露的）旧密钥加密？不会：凭据明文只在录入
+瞬间出现，但**解密它们的对称密钥已泄露**，所以请先删除
+`~/.bamboo/.bamboo_encryption_key` 与 `credentials.json` 让 bamboo 重新
+生成，再重录所有密钥）。
 
 `9562:9562` 的局域网发布意味着：**同一内网的任何设备**都能无认证使用
 这个 agent（服务端按设计把 RFC1918 内网对端视为可信本地、跳过密码）。
