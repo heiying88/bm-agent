@@ -70,7 +70,8 @@ use crate::store::builtin::{archive_exact_legacy_materialization, load_builtin_s
 use crate::store::parser::render_skill_markdown;
 use crate::store::storage::{
     discover_plugin_skill_dirs, ensure_skills_dir,
-    load_skills_from_discovery_dirs_detailed_with_limits, open_skill_file_no_follow,
+    load_skills_from_discovery_dirs_detailed_with_limits,
+    load_skills_from_discovery_dirs_detailed_with_workflow_limits, open_skill_file_no_follow,
     write_skill_file, FailedSkillRecord, LoadedSkillRecord, SkillDirectorySource,
     SkillDiscoveryDir,
 };
@@ -79,10 +80,10 @@ use crate::types::{
 };
 
 const MAX_PINNED_SKILL_ACTIVATIONS: usize = 256;
-const MAX_WORKFLOW_FILE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_WORKFLOW_SKILL_BYTES: usize = 32 * 1024 * 1024;
-const MAX_WORKFLOW_PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
-const MAX_RETAINED_WORKFLOW_BYTES: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_WORKFLOW_FILE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_WORKFLOW_SKILL_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_WORKFLOW_PUBLICATION_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_RETAINED_WORKFLOW_BYTES: usize = 256 * 1024 * 1024;
 const MAX_WORKFLOW_RESOURCES_PER_SKILL: usize = 1024;
 const MAX_WORKFLOW_RESOURCES_PER_PUBLICATION: usize = 4096;
 const MAX_WORKFLOW_RESOURCE_PATH_BYTES: usize = 1024;
@@ -526,7 +527,9 @@ async fn snapshot_skill_resources(
             let file_bytes = tokio::fs::metadata(&resource).await?.len() as usize;
             if file_bytes > limits.max_file_bytes {
                 return Err(SkillError::Storage(format!(
-                    "workflow '{skill_id}' resource '{relative_path}' exceeds per-file limit ({file_bytes} > {} bytes)",
+                    "workflow '{skill_id}' resource '{relative_path}' exceeds per-file limit \
+                     ({file_bytes} > {} bytes) — delete the file (other-OS platform binaries \
+                     are usually dead weight) or raise skills.limits in config",
                     limits.max_file_bytes
                 )));
             }
@@ -1167,10 +1170,29 @@ impl SkillStore {
     /// let store = SkillStore::new(config);
     /// ```
     pub fn new(config: SkillStoreConfig) -> Self {
+        // v0.0.4 可配置限额：钳制后注入；非法/不全的配置只告警不拒启。
+        let snapshot_limits = match config.limits {
+            None => SkillSnapshotLimits::default(),
+            Some(limits) => {
+                let (clamped, changed) = limits.clamped();
+                if !changed.is_empty() {
+                    tracing::warn!(
+                        "skills storage limits adjusted to a valid hierarchy: {}",
+                        changed.join(", ")
+                    );
+                }
+                SkillSnapshotLimits {
+                    max_file_bytes: clamped.max_file_bytes,
+                    max_skill_bytes: clamped.max_skill_bytes,
+                    max_publication_bytes: clamped.max_publication_bytes,
+                    max_retained_bytes: clamped.max_retained_bytes,
+                }
+            }
+        };
         Self::new_with_shared_snapshot_state(
             config,
             Arc::new(RetainedResourceBudget::default()),
-            SkillSnapshotLimits::default(),
+            snapshot_limits,
         )
     }
 
@@ -1315,10 +1337,14 @@ impl SkillStore {
         let mut dirs = dirs;
         let plugins_root = Self::plugins_root_dir(&self.config.skills_dir);
         dirs.extend(discover_plugin_skill_dirs(&plugins_root).await);
-        let mut report = load_skills_from_discovery_dirs_detailed_with_limits(
+        let mut report = load_skills_from_discovery_dirs_detailed_with_workflow_limits(
             &dirs,
             self.snapshot_limits.max_file_bytes,
             MAX_WORKFLOWS_PER_PUBLICATION,
+            // 资源预检（v0.0.4）：与激活层同一套限额——超标的技能在加载
+            // 时即 invalid，激活层不再接触（fnos 事故根治点）。
+            self.snapshot_limits.max_file_bytes,
+            self.snapshot_limits.max_skill_bytes,
         )
         .await?;
         let mut legacy_dirs =
@@ -2556,6 +2582,7 @@ impl SkillStore {
                 skills_dir: self.config.skills_dir.clone(),
                 project_dir: self.config.project_dir.clone(),
                 active_mode: Some(mode.clone()),
+                limits: self.config.limits,
             },
             self.retained_budget.clone(),
             self.snapshot_limits,
@@ -2705,6 +2732,7 @@ impl SkillStore {
                 skills_dir: self.config.skills_dir.clone(),
                 project_dir: Some(workspace.clone()),
                 active_mode: self.config.active_mode.clone(),
+                limits: self.config.limits,
             },
             self.retained_budget.clone(),
             self.snapshot_limits,
@@ -2779,6 +2807,7 @@ impl SkillStore {
                 skills_dir: self.config.skills_dir.clone(),
                 project_dir: None,
                 active_mode: self.config.active_mode.clone(),
+                limits: self.config.limits,
             },
             self.retained_budget.clone(),
             self.snapshot_limits,
@@ -4371,6 +4400,7 @@ Use this skill for testing.
             skills_dir: global_skills_dir,
             project_dir: Some(workspace_dir),
             active_mode: None,
+            limits: None,
         };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
@@ -4438,6 +4468,7 @@ Use this skill for testing.
             skills_dir: global_skills_dir,
             project_dir: None,
             active_mode: Some("code".to_string()),
+            limits: None,
         };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
@@ -4484,6 +4515,7 @@ Use this skill for testing.
             skills_dir: global_skills_dir,
             project_dir: None,
             active_mode: None,
+            limits: None,
         };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
@@ -4518,6 +4550,7 @@ Use this skill for testing.
             skills_dir: global_skills_dir,
             project_dir: None,
             active_mode: None,
+            limits: None,
         };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
@@ -4578,6 +4611,7 @@ Use this skill for testing.
             skills_dir: global_skills_dir,
             project_dir: None,
             active_mode: None,
+            limits: None,
         };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
@@ -4617,6 +4651,7 @@ Use this skill for testing.
             skills_dir: global_skills_dir,
             project_dir: None,
             active_mode: None,
+            limits: None,
         };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
@@ -4653,6 +4688,7 @@ Use this skill for testing.
             skills_dir: global_skills_dir.clone(),
             project_dir: None,
             active_mode: None,
+            limits: None,
         };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
@@ -4715,6 +4751,7 @@ Use this skill for testing.
             skills_dir: global_skills_dir,
             project_dir: None,
             active_mode: None,
+            limits: None,
         };
         let store = SkillStore::new(config);
         store.initialize().await.expect("initialize");
@@ -4761,6 +4798,7 @@ Use this skill for testing.
             skills_dir: global_skills_dir,
             project_dir: None,
             active_mode: None,
+            limits: None,
         });
         store.initialize().await.expect("initialize");
         assert!(store
@@ -6189,9 +6227,25 @@ Use this skill for testing.
         fs::write(skill_dir.join("references/value.txt"), vec![b'b'; 129])
             .await
             .expect("oversize resource");
-        let error = store.reload().await.expect_err("oversize reload rejected");
-        assert!(error.to_string().contains("per-file limit"));
-        assert_eq!(store.skill_catalog_snapshot().await, catalog_n);
+        // v0.0.4 契约：超限技能在加载层记为 invalid（failed record），
+        // reload 不再硬报错；目录保留上一版内容（LKG）但条目标记
+        // Invalid 并点名超限文件——激活层据此拒绝，界面能看到原因。
+        store.reload().await.expect("oversize reload keeps LKG");
+        let snapshot_after = store.skill_catalog_snapshot().await;
+        assert_eq!(snapshot_after.entries.len(), 1);
+        let entry = &snapshot_after.entries[0];
+        assert_eq!(entry.id, "bounded-bytes");
+        assert_eq!(entry.content_digest, catalog_n.entries[0].content_digest);
+        assert_eq!(entry.status, WorkflowStatus::Invalid);
+        assert!(
+            entry
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("references/value.txt")
+                    && error.contains("per-file limit")),
+            "last_error must name the file: {:?}",
+            entry.last_error
+        );
         assert_eq!(
             store
                 .get_pinned_skill_with_root("bounded-active", "bounded-bytes")

@@ -2918,6 +2918,11 @@ pub struct SkillsConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
 
+    /// Workflow/skill storage size limits (v0.0.4 可配置). Absent = built-in
+    /// defaults; values are clamped on use — see [`WorkflowStorageLimits`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<WorkflowStorageLimits>,
+
     /// Preserve skill configuration owned by newer Bamboo versions or plugins.
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -2925,7 +2930,87 @@ pub struct SkillsConfig {
 
 impl SkillsConfig {
     fn is_empty(&self) -> bool {
-        self.disabled.is_empty() && self.extra.is_empty()
+        self.disabled.is_empty() && self.limits.is_none() && self.extra.is_empty()
+    }
+}
+
+/// User-tunable workflow/skill storage limits (bytes). Clamped on use: each
+/// field within 1MB..=256MB and forced non-decreasing
+/// (file ≤ skill ≤ publication ≤ retained) — an inconsistent set bumps the
+/// smaller side up rather than rejecting, so a partial config still boots.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowStorageLimits {
+    /// Per resource file limit (default 8MB).
+    #[serde(default = "workflow_default_file_bytes")]
+    pub max_file_bytes: usize,
+    /// Per skill total limit (default 32MB).
+    #[serde(default = "workflow_default_skill_bytes")]
+    pub max_skill_bytes: usize,
+    /// Per publication package limit (default 128MB).
+    #[serde(default = "workflow_default_publication_bytes")]
+    pub max_publication_bytes: usize,
+    /// Retained workflow storage limit (default 256MB).
+    #[serde(default = "workflow_default_retained_bytes")]
+    pub max_retained_bytes: usize,
+}
+
+fn workflow_default_file_bytes() -> usize {
+    8 * 1024 * 1024
+}
+fn workflow_default_skill_bytes() -> usize {
+    32 * 1024 * 1024
+}
+fn workflow_default_publication_bytes() -> usize {
+    128 * 1024 * 1024
+}
+fn workflow_default_retained_bytes() -> usize {
+    256 * 1024 * 1024
+}
+
+impl Default for WorkflowStorageLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: workflow_default_file_bytes(),
+            max_skill_bytes: workflow_default_skill_bytes(),
+            max_publication_bytes: workflow_default_publication_bytes(),
+            max_retained_bytes: workflow_default_retained_bytes(),
+        }
+    }
+}
+
+impl WorkflowStorageLimits {
+    const MIN_LIMIT: usize = 1024 * 1024;
+    const MAX_LIMIT: usize = 256 * 1024 * 1024;
+
+    /// Clamp into a valid non-decreasing hierarchy; returns the field names
+    /// that had to be adjusted (for a startup warning).
+    pub fn clamped(mut self) -> (Self, Vec<&'static str>) {
+        let mut changed: Vec<&'static str> = Vec::new();
+        for (value, name) in [
+            (&mut self.max_file_bytes, "max_file_bytes"),
+            (&mut self.max_skill_bytes, "max_skill_bytes"),
+            (&mut self.max_publication_bytes, "max_publication_bytes"),
+            (&mut self.max_retained_bytes, "max_retained_bytes"),
+        ] {
+            let clamped = (*value).clamp(Self::MIN_LIMIT, Self::MAX_LIMIT);
+            if clamped != *value {
+                *value = clamped;
+                changed.push(name);
+            }
+        }
+        if self.max_skill_bytes < self.max_file_bytes {
+            self.max_skill_bytes = self.max_file_bytes;
+            changed.push("max_skill_bytes");
+        }
+        if self.max_publication_bytes < self.max_skill_bytes {
+            self.max_publication_bytes = self.max_skill_bytes;
+            changed.push("max_publication_bytes");
+        }
+        if self.max_retained_bytes < self.max_publication_bytes {
+            self.max_retained_bytes = self.max_publication_bytes;
+            changed.push("max_retained_bytes");
+        }
+        (self, changed)
     }
 }
 

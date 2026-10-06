@@ -393,6 +393,27 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
     max_skill_file_bytes: usize,
     max_skill_candidates: usize,
 ) -> SkillResult<SkillLoadReport> {
+    load_skills_from_discovery_dirs_detailed_with_workflow_limits(
+        discovery_dirs,
+        max_skill_file_bytes,
+        max_skill_candidates,
+        crate::store::MAX_WORKFLOW_FILE_BYTES,
+        crate::store::MAX_WORKFLOW_SKILL_BYTES,
+    )
+    .await
+}
+
+/// [`load_skills_from_discovery_dirs_detailed_with_limits`] 的完整形态：
+/// `workflow_resource_file_limit` / `workflow_skill_total_limit` 是资源
+/// 文件的逐文件与总量限额（v0.0.4 加载层预检用，可配置注入）。
+#[allow(clippy::too_many_arguments)]
+pub async fn load_skills_from_discovery_dirs_detailed_with_workflow_limits(
+    discovery_dirs: &[SkillDiscoveryDir],
+    max_skill_file_bytes: usize,
+    max_skill_candidates: usize,
+    workflow_resource_file_limit: usize,
+    workflow_skill_total_limit: usize,
+) -> SkillResult<SkillLoadReport> {
     let mut report = SkillLoadReport::default();
 
     for discovery in discovery_dirs {
@@ -497,6 +518,35 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
                             .parent()
                             .map(Path::to_path_buf)
                             .unwrap_or_else(|| discovery.dir.clone());
+                        // 资源限额预检：超标的技能整体 invalid（点名文件），
+                        // 不进入 loaded 目录，激活层碰不到它。
+                        if let Some(error) = audit_skill_resources(
+                            &skill_root,
+                            workflow_resource_file_limit,
+                            workflow_skill_total_limit,
+                        )
+                        .await
+                        {
+                            let key = ("resource-limit", &skill_file);
+                            if STATIC_WARNINGS.insert_if_new(&key, &error) {
+                                warn!(
+                                    "Skill {:?} marked invalid by resource limits: {}",
+                                    skill_file, error
+                                );
+                            }
+                            report.failed.push(FailedSkillRecord {
+                                skill_id: skill_root
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .map(str::to_string),
+                                skill_root,
+                                skill_file,
+                                source: discovery.source,
+                                mode: discovery.mode.clone(),
+                                error,
+                            });
+                            continue;
+                        }
                         report.loaded.push(LoadedSkillRecord {
                             skill,
                             skill_root,
@@ -564,6 +614,50 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
         report.failed.len()
     );
     Ok(report)
+}
+
+/// 技能资源限额审计（v0.0.4 加载层预检）：技能目录除 SKILL.md 外的
+/// 每个文件都不得超过 `max_resource_file_bytes`，总量不得超过
+/// `max_skill_total_bytes`。超标返回点名文件的错误文本——调用方把该
+/// 技能标记为 invalid，激活层因此永远不会碰到它（否则会出现
+/// "retained workflow activation" 的存储崩溃循环，fnos 技能事故的
+/// 根治点）。目录缺失/枚举失败按"无资源"处理，不阻塞加载。
+pub async fn audit_skill_resources(
+    skill_root: &Path,
+    max_resource_file_bytes: usize,
+    max_skill_total_bytes: usize,
+) -> Option<String> {
+    const MAX_RESOURCES: usize = 1024;
+    const MAX_PATH_BYTES: usize = 512;
+    let paths = crate::resource_helpers::list_skill_resource_paths_bounded(
+        skill_root,
+        MAX_RESOURCES,
+        MAX_PATH_BYTES,
+    )
+    .ok()?;
+    let mut total: u64 = 0;
+    for relative in paths {
+        let Ok(metadata) = tokio::fs::metadata(skill_root.join(&relative)).await else {
+            continue;
+        };
+        let size = metadata.len();
+        if size > max_resource_file_bytes as u64 {
+            return Some(format!(
+                "resource '{relative}' exceeds per-file limit ({size} > {max_resource_file_bytes} \
+                 bytes) — delete the file (platform binaries for other OSes are usually \
+                 dead weight) or raise the skills storage limits in config"
+            ));
+        }
+        total = total.saturating_add(size);
+    }
+    if total > max_skill_total_bytes as u64 {
+        return Some(format!(
+            "skill resources total {total} bytes exceed the per-skill limit \
+             ({max_skill_total_bytes} bytes) — remove unused platform binaries or raise \
+             the skills storage limits in config"
+        ));
+    }
+    None
 }
 
 /// Discover additional skill-discovery dirs contributed by installed
@@ -825,6 +919,83 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].skill.id, "good");
         assert_eq!(records[0].source, SkillDirectorySource::Agents);
+    }
+
+    /// v0.0.4 加载层资源预检：超限资源把整个技能标记 invalid 并点名文件
+    /// （fnos 事故根治点——激活层从此碰不到超限技能）。
+    #[tokio::test]
+    async fn oversized_resource_marks_skill_invalid_with_named_file() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let skill = root.path().join("fnos");
+        fs::create_dir_all(skill.join("bin")).await.expect("dirs");
+        fs::write(skill.join("SKILL.md"), valid_skill("fnos"))
+            .await
+            .expect("skill");
+        fs::write(skill.join("bin/trim-cli-darwin-x64"), vec![0u8; 1024])
+            .await
+            .expect("oversized binary");
+
+        let discovery = [SkillDiscoveryDir {
+            dir: root.path().to_path_buf(),
+            source: SkillDirectorySource::Global,
+            mode: None,
+        }];
+        // 逐文件限额 512B：1024B 的资源必须超标。
+        let report = load_skills_from_discovery_dirs_detailed_with_workflow_limits(
+            &discovery,
+            8 * 1024 * 1024,
+            1024,
+            512,
+            32 * 1024 * 1024,
+        )
+        .await
+        .expect("load with workflow limits");
+        assert!(report.loaded.is_empty(), "oversized skill must not load");
+        assert_eq!(report.failed.len(), 1);
+        let error = &report.failed[0].error;
+        assert!(
+            error.contains("bin/trim-cli-darwin-x64") && error.contains("per-file limit"),
+            "error must name the file and limit: {error}"
+        );
+    }
+
+    /// 总量超限同样在加载层拦截，错误带 per-skill limit 字样。
+    #[tokio::test]
+    async fn total_resource_overflow_marks_skill_invalid() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let skill = root.path().join("bundle");
+        fs::create_dir_all(&skill).await.expect("dir");
+        fs::write(skill.join("SKILL.md"), valid_skill("bundle"))
+            .await
+            .expect("skill");
+        fs::write(skill.join("a.bin"), vec![0u8; 400])
+            .await
+            .expect("resource a");
+        fs::write(skill.join("b.bin"), vec![0u8; 400])
+            .await
+            .expect("resource b");
+
+        let discovery = [SkillDiscoveryDir {
+            dir: root.path().to_path_buf(),
+            source: SkillDirectorySource::Global,
+            mode: None,
+        }];
+        let report = load_skills_from_discovery_dirs_detailed_with_workflow_limits(
+            &discovery,
+            8 * 1024 * 1024,
+            1024,
+            512,
+            700, // 总量 800B 超过 700B
+        )
+        .await
+        .expect("load");
+        assert!(report.loaded.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert!(
+            report.failed[0].error.contains("per-skill limit"),
+            "{}",
+            report.failed[0].error
+        );
     }
 
     #[cfg(unix)]

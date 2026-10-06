@@ -121,11 +121,23 @@ pub async fn init_skill_manager(data_dir: &Path) -> Arc<SkillManager> {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    // v0.0.4 可配置存储限额：config.json 的 skills.limits 原样透传，
+    // 钳制与告警在 SkillStore 构造时统一执行。读不到/解析失败 = 默认。
+    let limits = std::fs::read_to_string(data_dir.join("config.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|root| root.get("skills").cloned())
+        .and_then(|skills| {
+            serde_json::from_value::<bamboo_config::SkillsConfig>(skills)
+                .ok()
+                .and_then(|config| config.limits)
+        });
 
     let skill_manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
         skills_dir: data_dir.join("skills"),
         project_dir,
         active_mode,
+        limits,
     }));
     if let Err(error) = skill_manager.initialize().await {
         tracing::warn!("Failed to initialize skill manager: {}", error);

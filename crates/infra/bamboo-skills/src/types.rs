@@ -92,7 +92,16 @@ pub struct SkillStoreConfig {
     /// - `<project_dir>/.bamboo/skills-<active_mode>` (if project_dir is set)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_mode: Option<String>,
+    /// Storage size limits override (v0.0.4 可配置). `None` keeps the
+    /// built-in defaults (8MB per resource file / 32MB per skill / 128MB
+    /// publication / 256MB retained); see [`WorkflowStorageLimits`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<WorkflowStorageLimits>,
 }
+
+/// 可调工作流/技能存储限额（字节）。规范定义在 bamboo-config（配置域），
+/// 此处 re-export 供 [`SkillStoreConfig::limits`] 使用。
+pub use bamboo_config::WorkflowStorageLimits;
 
 impl Default for SkillStoreConfig {
     fn default() -> Self {
@@ -102,6 +111,7 @@ impl Default for SkillStoreConfig {
             skills_dir: bamboo_config::paths::bamboo_dir().join("skills"),
             project_dir: None,
             active_mode: None,
+            limits: None,
         }
     }
 }

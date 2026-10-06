@@ -96,6 +96,17 @@ export interface BambooToolsConfig {
 
 export interface BambooSkillsConfig {
   disabled?: string[];
+  /** Workflow/skill storage size limits (bytes; v0.0.4). Backend clamps each
+   * field into 1MB..=256MB and a non-decreasing hierarchy on use. */
+  limits?: WorkflowStorageLimits;
+}
+
+/** Workflow/skill storage limits, all in BYTES. UI edits MB and converts. */
+export interface WorkflowStorageLimits {
+  max_file_bytes?: number;
+  max_skill_bytes?: number;
+  max_publication_bytes?: number;
+  max_retained_bytes?: number;
 }
 
 export interface BambooMemoryConfig {

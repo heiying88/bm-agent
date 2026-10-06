@@ -42,7 +42,7 @@ interface ConfigFormState {
 
 type ConfigSaveSection = "network" | "memory" | "subagents";
 
-const { Text } = Typography;
+const { Text, Paragraph } = Typography;
 const { useToken } = theme;
 const DEFAULT_BACKEND_BASE_URL = "http://127.0.0.1:9562/v1";
 const SUBAGENT_EXECUTOR_BUILT_IN = "bamboo_runtime";
@@ -66,6 +66,40 @@ const readDisabledTools = (section: ToolsSkillsSection): string[] => {
 
   return normalizeToolNames(rawDisabled.filter((name): name is string => typeof name === "string"));
 };
+
+/** 工作流/技能存储限额的 UI 形态：四项均以 MB 编辑，存取时换算字节。
+ * null = 未配置（用后端默认 8/32/128/256MB）。 */
+export type SkillLimitsMb = {
+  fileMb: number;
+  skillMb: number;
+  publicationMb: number;
+  retainedMb: number;
+};
+
+const BYTES_PER_MB = 1024 * 1024;
+const DEFAULT_LIMITS_MB: SkillLimitsMb = { fileMb: 8, skillMb: 32, publicationMb: 128, retainedMb: 256 };
+
+const readSkillLimitsMb = (section: ToolsSkillsSection): SkillLimitsMb => {
+  const limits = section.skills?.limits;
+  if (!limits) return { ...DEFAULT_LIMITS_MB };
+  const mb = (value: number | undefined, fallback: number): number => {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+    return Math.round(value / BYTES_PER_MB);
+  };
+  return {
+    fileMb: mb(limits.max_file_bytes, DEFAULT_LIMITS_MB.fileMb),
+    skillMb: mb(limits.max_skill_bytes, DEFAULT_LIMITS_MB.skillMb),
+    publicationMb: mb(limits.max_publication_bytes, DEFAULT_LIMITS_MB.publicationMb),
+    retainedMb: mb(limits.max_retained_bytes, DEFAULT_LIMITS_MB.retainedMb),
+  };
+};
+
+const limitsToBytes = (limits: SkillLimitsMb) => ({
+  max_file_bytes: Math.max(1, Math.round(limits.fileMb)) * BYTES_PER_MB,
+  max_skill_bytes: Math.max(1, Math.round(limits.skillMb)) * BYTES_PER_MB,
+  max_publication_bytes: Math.max(1, Math.round(limits.publicationMb)) * BYTES_PER_MB,
+  max_retained_bytes: Math.max(1, Math.round(limits.retainedMb)) * BYTES_PER_MB,
+});
 
 const normalizeSubagentsForm = (subagents: BambooSubagentsConfig): BambooSubagentsConfig => ({
   max_concurrent: subagents.max_concurrent,
@@ -136,6 +170,8 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
   const [availableTools, setAvailableTools] = useState<string[]>([]);
   const [disabledTools, setDisabledTools] = useState<string[]>([]);
   const [savedDisabledTools, setSavedDisabledTools] = useState<string[]>([]);
+  const [skillLimits, setSkillLimits] = useState<SkillLimitsMb>({ ...DEFAULT_LIMITS_MB });
+  const [savedSkillLimits, setSavedSkillLimits] = useState<SkillLimitsMb>({ ...DEFAULT_LIMITS_MB });
   const [isLoading, setIsLoading] = useState(false);
   const [isToolsBusy, setIsToolsBusy] = useState(false);
   const [subagentValidationIssues, setSubagentValidationIssues] = useState<
@@ -179,6 +215,8 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
       const nextDisabled = readDisabledTools(toolsSkills.data);
       setDisabledTools(nextDisabled);
       setSavedDisabledTools(nextDisabled);
+      setSkillLimits(readSkillLimitsMb(toolsSkills.data));
+      setSavedSkillLimits(readSkillLimitsMb(toolsSkills.data));
       setAvailableTools(normalizeToolNames(toolsResponse.tools || []));
       baseDraftsRef.current = {
         core: {
@@ -267,6 +305,8 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
     const nextDisabled = readDisabledTools(envelope.data);
     setDisabledTools(nextDisabled);
     setSavedDisabledTools(nextDisabled);
+    setSkillLimits(readSkillLimitsMb(envelope.data));
+    setSavedSkillLimits(readSkillLimitsMb(envelope.data));
     if (baseDraftsRef.current) {
       baseDraftsRef.current.toolsDisabled = [...nextDisabled];
     }
@@ -622,10 +662,15 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
             ...(toolsSnapshot.envelope?.data.tools ?? {}),
             disabled: nextDisabled,
           },
+          skills: {
+            ...(toolsSnapshot.envelope?.data.skills ?? {}),
+            limits: limitsToBytes(skillLimits),
+          },
         },
         baseRevision,
       );
       const canonicalDisabled = readDisabledTools(saved.data);
+      const canonicalLimits = readSkillLimitsMb(saved.data);
       if (baseDraftsRef.current) {
         baseDraftsRef.current.toolsDisabled = [...canonicalDisabled];
       }
@@ -633,6 +678,8 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
       setDirtySections((current) => ({ ...current, "tools-skills": false }));
       setDisabledTools(canonicalDisabled);
       setSavedDisabledTools(canonicalDisabled);
+      setSkillLimits(canonicalLimits);
+      setSavedSkillLimits(canonicalLimits);
       msgApi.success(t("settings.configTab.toolsSaveSuccess"));
     } catch (error) {
       console.error(
@@ -645,7 +692,9 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
     }
   };
 
-  const hasToolChanges = JSON.stringify(disabledTools) !== JSON.stringify(savedDisabledTools);
+  const hasToolChanges =
+    JSON.stringify(disabledTools) !== JSON.stringify(savedDisabledTools) ||
+    JSON.stringify(skillLimits) !== JSON.stringify(savedSkillLimits);
   const disabledToolSet = new Set(disabledTools);
   const externalSections = [
     ["core", coreSnapshot.envelope?.revision, baseRevisions.core, dirtySections.core],
@@ -1225,6 +1274,46 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
                       >
                         {t("settings.configTab.save")}
                       </Button>
+                    </div>
+
+                    <div>
+                      <Text strong>{t("settings.configTab.skillLimits.title")}</Text>
+                      <Paragraph type="secondary" style={{ marginBottom: token.marginSM }}>
+                        {t("settings.configTab.skillLimits.description")}
+                      </Paragraph>
+                      <Space wrap size={token.marginLG}>
+                        {(
+                          [
+                            ["fileMb", "file"],
+                            ["skillMb", "skill"],
+                            ["publicationMb", "publication"],
+                            ["retainedMb", "retained"],
+                          ] as const
+                        ).map(([field, label]) => (
+                          <label key={field}>
+                            <Text type="secondary" style={{ display: "block", fontSize: 12 }}>
+                              {t(`settings.configTab.skillLimits.${label}`)}
+                            </Text>
+                            <InputNumber
+                              min={1}
+                              max={256}
+                              step={1}
+                              addonAfter="MB"
+                              value={skillLimits[field]}
+                              onChange={(value) => {
+                                setSkillLimits((current) => ({
+                                  ...current,
+                                  [field]: Math.min(256, Math.max(1, Math.round(Number(value) || 1))),
+                                }));
+                                setDirtySections((current) => ({
+                                  ...current,
+                                  "tools-skills": true,
+                                }));
+                              }}
+                            />
+                          </label>
+                        ))}
+                      </Space>
                     </div>
                   </Space>
                 </Card>
