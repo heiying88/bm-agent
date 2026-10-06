@@ -15,10 +15,11 @@ describe("backendBaseUrl", () => {
   let originalFetch: typeof fetch;
   let mockFetch: ReturnType<typeof vi.fn>;
 
-  const stubLocation = (protocol: string, hostname: string, href?: string) => {
+  const stubLocation = (protocol: string, hostname: string, href?: string, port?: string) => {
     vi.stubGlobal("location", {
       protocol,
       hostname,
+      port: port ?? "",
       href: href ?? `${protocol}//${hostname}/`,
     } as Partial<Location>);
   };
@@ -64,6 +65,14 @@ describe("backendBaseUrl", () => {
 
     expect(getDefaultBackendBaseUrl()).toBe("http://mac.local:9562/v1");
     expect(getBackendBaseUrlSync()).toBe("http://mac.local:9562/v1");
+  });
+
+  it("derives same-origin port when the page is opened on a non-standard port (frp tunnel)", () => {
+    // frp/反代把 9562 发布为外网 54716：页面与 API 同源同端口，零配置可连。
+    stubLocation("http:", "123.57.254.92", "http://123.57.254.92:54716/", "54716");
+
+    expect(getDefaultBackendBaseUrl()).toBe("http://123.57.254.92:54716/v1");
+    expect(getBackendBaseUrlSync()).toBe("http://123.57.254.92:54716/v1");
   });
 
   it("derives default backend URL from current https page hostname as same-origin https /v1", () => {

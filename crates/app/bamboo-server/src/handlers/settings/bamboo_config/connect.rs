@@ -380,10 +380,10 @@ pub async fn post_wechat_qr_status(
     .map_err(AppError::BadRequest)?;
     if status.status == "confirmed" {
         if let Some(token) = status.token {
-            qr_token_cache()
-                .lock()
-                .expect("wechat qr token cache lock")
-                .insert(qrcode_id, (token, std::time::Instant::now()));
+            let mut cache = qr_token_cache().lock().expect("wechat qr token cache lock");
+            cache.insert(qrcode_id, (token, std::time::Instant::now()));
+            // 扫码后未 apply 的确认项随插入清扫，缓存不会无限增长。
+            cache.retain(|_, (_, cached_at)| cached_at.elapsed() <= QR_TOKEN_TTL);
         }
     }
     Ok(HttpResponse::Ok().json(serde_json::json!({

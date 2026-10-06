@@ -4,7 +4,7 @@ const FALLBACK_BACKEND_BASE_URL = "http://127.0.0.1:9562/v1";
 
 const DEFAULT_PORT = 9562;
 
-type LocationLike = Pick<Location, "protocol" | "hostname">;
+type LocationLike = Pick<Location, "protocol" | "hostname" | "port">;
 
 export const normalizeBackendBaseUrl = (value: string): string => value.trim().replace(/\/+$/, "");
 
@@ -23,11 +23,20 @@ const getCurrentLocation = (): LocationLike | null => {
 
   const protocol = typeof locationValue.protocol === "string" ? locationValue.protocol : "";
   const hostname = typeof locationValue.hostname === "string" ? locationValue.hostname : "";
+  const port = typeof locationValue.port === "string" ? locationValue.port : "";
   if (!protocol || !hostname) {
     return null;
   }
 
-  return { protocol, hostname };
+  return { protocol, hostname, port };
+};
+
+/** `host[:port]` exactly as the page was opened — bamboo serves both the page
+ * and the API from one origin, so a non-standard page port (frp/reverse proxy
+ * publishing 9562 as e.g. 54716) means the API is on that same port. */
+const hostWithPagePort = (locationLike: LocationLike): string => {
+  const port = locationLike.port.trim();
+  return port ? `${locationLike.hostname.trim()}:${port}` : locationLike.hostname.trim();
 };
 
 const isLoopbackHostname = (hostname: string): boolean => {
@@ -64,17 +73,17 @@ const getSameOriginBackendBaseUrl = (
   }
 
   const protocol = locationLike.protocol.toLowerCase();
-  const hostname = locationLike.hostname.trim();
-  if (!hostname) {
+  const host = hostWithPagePort(locationLike);
+  if (!host) {
     return null;
   }
 
   if (protocol === "https:") {
-    return normalizeBackendBaseUrl(`https://${hostname}/v1`);
+    return normalizeBackendBaseUrl(`https://${host}/v1`);
   }
 
   if (protocol === "http:") {
-    return normalizeBackendBaseUrl(`http://${hostname}/v1`);
+    return normalizeBackendBaseUrl(`http://${host}/v1`);
   }
 
   return null;
@@ -129,6 +138,12 @@ const getHostDerivedBackendBaseUrl = (
     return FALLBACK_BACKEND_BASE_URL;
   }
 
+  // 同源优先：页面带非标准端口打开（frp 穿透/反代发布）时，后端 API 就在
+  // 同一端口；只有页面在标准端口（80，无显式 port）时才试默认 9562。
+  const pagePort = locationLike.port.trim();
+  if (pagePort) {
+    return normalizeBackendBaseUrl(`http://${hostname}:${pagePort}/v1`);
+  }
   return normalizeBackendBaseUrl(`http://${hostname}:${DEFAULT_PORT}/v1`);
 };
 
