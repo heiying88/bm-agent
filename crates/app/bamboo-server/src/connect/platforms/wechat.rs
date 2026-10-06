@@ -697,6 +697,11 @@ pub struct WechatPlatform {
     token: RwLock<String>,
     /// 游标与登录二维码的落盘目录（`{data_dir}/connect_wechat/`）。
     state_dir: Option<PathBuf>,
+    /// "信任首个发信人"开关（v0.0.4；扫码登录端点默认开启）。
+    trust_first_sender: bool,
+    /// 已记录的首信人（配置加载或首条消息写入；持久化在
+    /// `{state_dir}/first_sender.json`）。
+    first_sender: RwLock<Option<String>>,
     /// 语音能力配置（`voice` 段；无 `siliconflow_api_key` 时为 `None`，
     /// 全部语音行为关闭，与未配置时完全一致）。
     voice: Option<VoiceConfig>,
@@ -744,6 +749,8 @@ impl WechatPlatform {
             cdn_base_url: DEFAULT_CDN_BASE_URL.to_string(),
             token: RwLock::new(token),
             state_dir,
+            trust_first_sender: false,
+            first_sender: RwLock::new(None),
             voice,
             observed_voice_encode_type: AtomicI64::new(0),
             voice_probe_done: AtomicBool::new(false),
@@ -758,6 +765,41 @@ impl WechatPlatform {
     fn with_cdn_base(mut self, cdn_base_url: String) -> Self {
         self.cdn_base_url = cdn_base_url;
         self
+    }
+
+    /// 开启"信任首个发信人"闩锁（v0.0.4；扫码登录端点默认开启）。
+    pub(crate) fn with_trust_first_sender(mut self, enabled: bool) -> Self {
+        self.trust_first_sender = enabled;
+        if enabled {
+            self.first_sender = RwLock::new(Self::load_first_sender(self.state_dir.as_deref()));
+        }
+        self
+    }
+
+    /// 首信人落盘文件：`{state_dir}/first_sender.json`（同游标先例，
+    /// 平台自有持久化，不进受账本保护的 connect.json）。
+    fn first_sender_path(state_dir: Option<&std::path::Path>) -> Option<PathBuf> {
+        state_dir.map(|dir| dir.join("first_sender.json"))
+    }
+
+    fn load_first_sender(state_dir: Option<&std::path::Path>) -> Option<String> {
+        let text = std::fs::read_to_string(Self::first_sender_path(state_dir)?).ok()?;
+        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+        value
+            .get("user_id")
+            .and_then(|id| id.as_str())
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| id.trim().to_string())
+    }
+
+    fn save_first_sender(state_dir: Option<&std::path::Path>, user_id: &str) {
+        let Some(path) = Self::first_sender_path(state_dir) else {
+            return;
+        };
+        let body = serde_json::json!({ "user_id": user_id });
+        if let Err(error) = std::fs::write(&path, body.to_string()) {
+            tracing::warn!("connect: wechat failed to persist first sender: {error}");
+        }
     }
 
     fn base_url(&self) -> String {
@@ -2229,6 +2271,27 @@ impl Platform for WechatPlatform {
 
     async fn stop(&self) -> PlatformResult<()> {
         Ok(())
+    }
+
+    fn wants_first_sender_trust(&self) -> bool {
+        self.trust_first_sender
+            && self
+                .first_sender
+                .read()
+                .expect("first sender lock")
+                .is_none()
+    }
+
+    fn trusted_first_sender(&self) -> Option<String> {
+        self.first_sender.read().expect("first sender lock").clone()
+    }
+
+    fn record_trusted_first_sender(&self, user_id: &str) {
+        let mut guard = self.first_sender.write().expect("first sender lock");
+        if guard.is_none() {
+            *guard = Some(user_id.to_string());
+            Self::save_first_sender(self.state_dir.as_deref(), user_id);
+        }
     }
 }
 

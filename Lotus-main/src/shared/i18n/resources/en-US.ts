@@ -1310,6 +1310,7 @@ export const enUsTranslation = {
           tokenClearArmed: "Token will be cleared",
           allowFrom: "Allowed user IDs",
           allowFromPlaceholder: "WeChat user id (e.g. wxid_xxx or oXXXX…@im.wechat)",
+          allowFromAutoTrustHint: "Leave empty + QR login = the first person to message the bot is auto-allowed (one-shot; the QR scan proves operator intent). Add an explicit ID to disable.",
           voiceTitle: "Voice (TTS / ASR via SiliconFlow)",
           voiceDescription:
             "Optional. Bot voice replies are sent as mp3 audio files — the iLink channel does not render native voice bubbles sent by bots.",

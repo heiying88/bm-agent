@@ -45,6 +45,10 @@ struct ConnectPlatformMutation {
     /// `token_change` 同一套凭据管道。
     #[serde(default)]
     voice: Option<bamboo_config::WechatVoiceConfig>,
+    /// "信任首个发信人"闩锁（v0.0.4）。**缺省/null = 保留现有值**；
+    /// 扫码登录端点在未显式提供 allow_from 时默认置 true。
+    #[serde(default)]
+    trust_first_sender: Option<bool>,
     #[serde(default)]
     token_change: Option<CredentialAction>,
     #[serde(default)]
@@ -305,6 +309,9 @@ pub(crate) async fn apply_connect_mutation(
                     voice_api_key_credential_ref,
                     voice_api_key_configured,
                     domain: input.domain,
+                    trust_first_sender: input
+                        .trust_first_sender
+                        .unwrap_or_else(|| existing.is_some_and(|p| p.trust_first_sender)),
                     allow_from: input.allow_from,
                     admin_from: input.admin_from,
                 });
@@ -427,6 +434,11 @@ pub async fn post_wechat_qr_apply(
             "扫码结果已过期（超过 5 分钟），请重新扫码".to_string(),
         ));
     }
+    let allow_from = request.allow_from;
+    // 扫码 = 操作者证明：未显式提供 allow_from 时默认开启"信任首个发信人"
+    // 闩锁——扫码接口不返回扫码人 ID，首条入站消息的发送者自动获准并
+    // 由平台持久化（v0.0.4）。
+    let trust_first_sender = allow_from.is_empty();
     let mutation = ConnectMutationRequest {
         expected_revision: request.expected_revision,
         data: ConnectMutationData {
@@ -436,9 +448,10 @@ pub async fn post_wechat_qr_apply(
                 platform_type: "wechat".to_string(),
                 app_id: None,
                 domain: None,
-                allow_from: request.allow_from,
+                allow_from,
                 admin_from: request.admin_from,
                 voice: request.voice,
+                trust_first_sender: Some(trust_first_sender),
                 token_change: Some(CredentialAction::Replace { value: token }),
                 app_secret_change: None,
                 voice_api_key_change: request.voice_api_key_change,

@@ -585,18 +585,29 @@ pub fn build_security_headers() -> DefaultHeaders {
 /// cloudflared tunnel) that surface in the browser as Vite's
 /// "Unable to preload CSS for …" / "Failed to fetch dynamically imported module".
 ///
-/// Only `/assets/*` is affected; `index.html` and API routes are left untouched
-/// so they always serve fresh (a new deploy must be picked up immediately).
+/// - `/assets/*` → `public, max-age=31536000, immutable`（带哈希，内容变文件名即变）
+/// - `/` 与 `index.html` → `no-cache`（v0.0.4）：HTML 永远回源校验。此前
+///   只有 last-modified/etag，浏览器按启发式缓存旧页面，升级/换端口/换
+///   穿透环境后旧 HTML 请求旧哈希资源 → 服务器 SPA 兜底回 200 HTML →
+///   控制台报 CSS 解析/MIME 错误、页面无样式。HTML 不缓存后根治。
+/// - 其余路径（API）不動。
 pub async fn add_asset_cache_headers<B: MessageBody + 'static>(
     req: ServiceRequest,
     next: Next<B>,
 ) -> Result<ServiceResponse<B>, actix_web::Error> {
-    let is_asset = req.path().starts_with("/assets/");
+    let path = req.path();
+    let is_asset = path.starts_with("/assets/");
+    let is_index = path == "/" || path.ends_with("/index.html") || path == "/index.html";
     let mut res = next.call(req).await?;
     if is_asset {
         res.headers_mut().insert(
             header::CACHE_CONTROL,
             header::HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    } else if is_index {
+        res.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-cache"),
         );
     }
     Ok(res)
@@ -894,13 +905,26 @@ mod tests {
             Some("public, max-age=31536000, immutable"),
         );
 
-        // `index.html` (and anything outside `/assets/`) must stay fresh so a new
-        // deploy is picked up immediately — no long-cache header added.
+        // `index.html` gets `no-cache` (v0.0.4): HTML must always revalidate so
+        // a new deploy (or a changed port/tunnel environment) is picked up
+        // immediately instead of serving a stale page that references dead
+        // asset hashes. Long-cache is still reserved for hashed assets only.
         let req = test::TestRequest::get().uri("/index.html").to_request();
+        let res = test::call_service(&app, req).await;
+        assert_eq!(
+            res.headers()
+                .get(CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "index.html must revalidate on every load"
+        );
+
+        // Non-index, non-asset routes (API) stay untouched.
+        let req = test::TestRequest::get().uri("/v1/sessions").to_request();
         let res = test::call_service(&app, req).await;
         assert!(
             res.headers().get(CACHE_CONTROL).is_none(),
-            "non-asset routes must not be long-cached"
+            "API routes must not carry a static cache policy"
         );
     }
 

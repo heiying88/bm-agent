@@ -823,14 +823,29 @@ impl ConnectBridge {
         allow_from: Vec<String>,
         msg: InboundMessage,
     ) {
-        if !allow_from.iter().any(|allowed| allowed == &msg.user_id) {
-            tracing::warn!(
-                platform = %msg.platform,
-                chat_id = %msg.chat_id,
-                user_id = %msg.user_id,
-                "connect: rejected inbound message — user not in allow_from"
-            );
-            return;
+        let allowed = allow_from.iter().any(|allowed| allowed == &msg.user_id)
+            // "信任首个发信人"闩锁：显式 allow_from 为空时，平台记录过的
+            // 首信人唯一放行（v0.0.4；用户一旦在配置里写了 allow_from，
+            // 这条路径自然失效——配置列表优先）。
+            || (allow_from.is_empty()
+                && platform.trusted_first_sender().as_deref() == Some(msg.user_id.as_str()));
+        if !allowed {
+            if allow_from.is_empty() && platform.wants_first_sender_trust() {
+                platform.record_trusted_first_sender(&msg.user_id);
+                tracing::warn!(
+                    platform = %msg.platform,
+                    user_id = %msg.user_id,
+                    "connect: first sender auto-trusted (one-shot latch from the QR login flow)"
+                );
+            } else {
+                tracing::warn!(
+                    platform = %msg.platform,
+                    chat_id = %msg.chat_id,
+                    user_id = %msg.user_id,
+                    "connect: rejected inbound message — user not in allow_from"
+                );
+                return;
+            }
         }
 
         if msg.sent_at < self.process_start {
@@ -2004,6 +2019,9 @@ mod tests {
         sent_messages: TokioMutex<Vec<OutboundMessage>>,
         edits: TokioMutex<Vec<String>>,
         answered_callbacks: TokioMutex<Vec<(String, Option<String>)>>,
+        // v0.0.4 首信人闩锁测试钩子。
+        trust_enabled: std::sync::atomic::AtomicBool,
+        recorded_first_sender: std::sync::Mutex<Option<String>>,
     }
 
     impl FakePlatform {
@@ -2022,6 +2040,8 @@ mod tests {
                 sent_messages: TokioMutex::new(Vec::new()),
                 edits: TokioMutex::new(Vec::new()),
                 answered_callbacks: TokioMutex::new(Vec::new()),
+                trust_enabled: std::sync::atomic::AtomicBool::new(false),
+                recorded_first_sender: std::sync::Mutex::new(None),
             })
         }
 
@@ -2075,6 +2095,65 @@ mod tests {
         async fn stop(&self) -> super::super::platform::PlatformResult<()> {
             Ok(())
         }
+        fn wants_first_sender_trust(&self) -> bool {
+            self.trust_enabled
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && self.recorded_first_sender.lock().unwrap().is_none()
+        }
+        fn trusted_first_sender(&self) -> Option<String> {
+            self.recorded_first_sender.lock().unwrap().clone()
+        }
+        fn record_trusted_first_sender(&self, user_id: &str) {
+            let mut guard = self.recorded_first_sender.lock().unwrap();
+            if guard.is_none() {
+                *guard = Some(user_id.to_string());
+            }
+        }
+    }
+
+    /// v0.0.4 首信人闩锁：显式 allow_from 为空 + 平台开启信任时，第一条
+    /// 入站消息的发送者被记录并放行；之后另一用户不再被记录（一次性）；
+    /// 已记录的发送者继续放行。
+    #[tokio::test]
+    async fn first_sender_trust_latches_on_first_inbound_message() {
+        let (ctx, _dir) = test_context().await;
+        let bridge = std::sync::Arc::new(ConnectBridge::new(ctx, None));
+        let platform = FakePlatform::new("fake");
+        platform
+            .trust_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let msg = |user: &str| InboundMessage {
+            platform: "fake".to_string(),
+            chat_id: "c1".to_string(),
+            user_id: user.to_string(),
+            text: "hi".to_string(),
+            message_id: format!("m-{user}"),
+            sent_at: chrono::Utc::now(),
+            reply_ctx: ReplyCtx(serde_json::Value::Null),
+        };
+
+        // 第一条消息：空 allow + 信任开关 → 记录发送者（放行后由测试
+        // provider 的快速失败终结本轮，不影响断言）。
+        ConnectBridge::handle_inbound(bridge.clone(), platform.clone(), Vec::new(), msg("alice"))
+            .await;
+        assert_eq!(
+            platform.trusted_first_sender().as_deref(),
+            Some("alice"),
+            "first sender must be recorded and allowed through"
+        );
+
+        // 第二条消息（另一用户）：闩锁已闭合 → 不记录、被拒绝。
+        ConnectBridge::handle_inbound(bridge.clone(), platform.clone(), Vec::new(), msg("bob"))
+            .await;
+        assert_eq!(
+            platform.trusted_first_sender().as_deref(),
+            Some("alice"),
+            "latch is one-shot: bob must not be recorded"
+        );
+
+        // 已记录的 alice 再次发消息：继续放行（trusted 命中）。
+        ConnectBridge::handle_inbound(bridge.clone(), platform.clone(), Vec::new(), msg("alice"))
+            .await;
     }
 
     /// Fake [`Responder`] (issue #458: "tests inject a fake instead of full

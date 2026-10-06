@@ -7598,6 +7598,7 @@ for line in sys.stdin:
                     app_secret_configured: false,
                     domain: None,
                     allow_from: Vec::new(),
+                    trust_first_sender: false,
                     admin_from: Vec::new(),
                 });
             live.providers_mut().openai = Some(bamboo_config::OpenAIConfig {

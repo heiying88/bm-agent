@@ -39,6 +39,7 @@ pub async fn skills_list(data_dir: Option<PathBuf>) -> anyhow::Result<()> {
         skills_dir: skills_dir.clone(),
         project_dir: None,
         active_mode: None,
+        limits: None,
     });
     let skills = store.list_skills(None, true).await;
 

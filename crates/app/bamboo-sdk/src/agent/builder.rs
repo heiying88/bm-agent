@@ -644,6 +644,7 @@ impl AgentBuilder {
             skills_dir: data_dir.join("skills"),
             project_dir: std::env::current_dir().ok(),
             active_mode: None,
+            limits: None,
         }));
         skill_manager
             .initialize()

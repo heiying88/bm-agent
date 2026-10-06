@@ -619,6 +619,7 @@ impl BambooRuntimeExecutor {
                 .then(|| spec.workspace.clone().map(PathBuf::from))
                 .flatten(),
             active_mode: None,
+            limits: None,
         }));
         if !strict_native {
             skill_manager

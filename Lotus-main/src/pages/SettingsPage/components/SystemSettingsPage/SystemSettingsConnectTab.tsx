@@ -862,6 +862,9 @@ const SystemSettingsConnectTab: React.FC = () => {
                   style={{ width: "100%" }}
                 />
               </label>
+              <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                {t("settings.connectTab.wechat.allowFromAutoTrustHint")}
+              </Text>
               {wechatDenyAll ? (
                 <Text type="warning" style={{ fontSize: token.fontSizeSM }}>
                   {t("settings.connectTab.denyAllWarning")}

@@ -234,7 +234,8 @@ impl ConnectManager {
                         );
                     }
                     let platform: Arc<dyn Platform> = Arc::new(
-                        platforms::wechat::WechatPlatform::new(token, base_url, state_dir, voice),
+                        platforms::wechat::WechatPlatform::new(token, base_url, state_dir, voice)
+                            .with_trust_first_sender(platform_cfg.trust_first_sender),
                     );
                     spawn_platform_tasks(
                         &mut tasks,
@@ -460,6 +461,7 @@ mod tests {
             app_secret_configured: false,
             domain: None,
             allow_from: Vec::new(),
+            trust_first_sender: false,
             admin_from: Vec::new(),
         }
     }

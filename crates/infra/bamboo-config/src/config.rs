@@ -1297,6 +1297,12 @@ pub struct ConnectPlatformConfig {
     /// startup warning is logged when a platform has no allowed users.
     #[serde(default)]
     pub allow_from: Vec<String>,
+    /// 一次性"信任首个发信人"：为 true 且 allow_from 为空时，第一条入站
+    /// 消息的发送者会被自动加入 allow_from 并落库，随后本开关自动关闭
+    /// （闩锁语义）。扫码登录端点默认把它设为 true——扫码本身即操作者
+    /// 证明，扫码接口不返回扫码人 ID，只能等首条消息自证。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_first_sender: bool,
     /// User ids allowed to run privileged/admin commands. Parsed from day one
     /// but UNUSED in the MVP (#452) — no admin commands exist yet; reserved
     /// for the approvals/admin phase of epic #447.

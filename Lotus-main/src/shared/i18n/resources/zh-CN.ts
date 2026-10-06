@@ -1256,6 +1256,7 @@ export const zhCnTranslation = {
           tokenClearArmed: "Token 将被清除",
           allowFrom: "允许的用户 ID",
           allowFromPlaceholder: "微信用户 ID（如 wxid_xxx 或 oXXXX…@im.wechat）",
+          allowFromAutoTrustHint: "留空并扫码登录时，第一个给机器人发消息的人会被自动加入允许（一次性；扫码即操作者证明）。手动填写 ID 则关闭该行为。",
           voiceTitle: "语音能力（硅基流动 TTS / ASR）",
           voiceDescription:
             "可选。语音回复以 mp3 音频文件发送，iLink 通道不渲染机器人发送的原生语音条气泡。",

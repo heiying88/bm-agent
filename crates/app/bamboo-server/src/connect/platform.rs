@@ -184,7 +184,7 @@ pub trait Platform: Send + Sync {
     /// receive one to acknowledge, so the default no-op is correct for them).
     /// Telegram requires exactly one ack per callback query, success or not;
     /// `text`, when `Some`, is shown as a brief toast (e.g. an "expired"
-    /// notice for a stale/forged nonce).
+    /// notice for a stale or forged nonce).
     async fn answer_callback(
         &self,
         _callback_query_id: &str,
@@ -192,6 +192,20 @@ pub trait Platform: Send + Sync {
     ) -> PlatformResult<()> {
         Ok(())
     }
+
+    /// "信任首个发信人"闩锁（v0.0.4）：配置开启且尚未记录首信人时为 true。
+    /// bridge 据此放行第一条入站消息并记录其发送者，而不是拒绝它。
+    fn wants_first_sender_trust(&self) -> bool {
+        false
+    }
+
+    /// 已记录的首信人 user id（平台自有持久化，重启不丢，同游标先例）。
+    fn trusted_first_sender(&self) -> Option<String> {
+        None
+    }
+
+    /// 记录首信人（一次性）。至多被调用一次；实现方负责落盘。
+    fn record_trusted_first_sender(&self, _user_id: &str) {}
 
     /// Stop the adapter (best-effort; graceful shutdown).
     async fn stop(&self) -> PlatformResult<()>;

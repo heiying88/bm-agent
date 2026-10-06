@@ -161,7 +161,9 @@ pub async fn run_with_tls(
                         let index_file = index_file.clone();
                         async move {
                             let path = req.path().to_string();
-                            if is_api_path(&path) {
+                            // /assets/ 是带哈希的构建产物：缺失只可能是旧版本引用，绝不做 SPA 兜底
+                            // （回 404 让浏览器立刻报干净错误，而不是把 HTML 当 CSS/JS 造成 MIME 错）。
+                            if is_api_path(&path) || path.starts_with("/assets/") {
                                 let response = HttpResponse::NotFound().finish();
                                 return Ok(ServiceResponse::new(req.into_parts().0, response));
                             }
@@ -352,7 +354,9 @@ pub async fn run_with_bind_and_static_tls(
                         let index_file = index_file.clone();
                         async move {
                             let path = req.path().to_string();
-                            if is_api_path(&path) {
+                            // /assets/ 是带哈希的构建产物：缺失只可能是旧版本引用，绝不做 SPA 兜底
+                            // （回 404 让浏览器立刻报干净错误，而不是把 HTML 当 CSS/JS 造成 MIME 错）。
+                            if is_api_path(&path) || path.starts_with("/assets/") {
                                 let response = HttpResponse::NotFound().finish();
                                 return Ok(ServiceResponse::new(req.into_parts().0, response));
                             }
@@ -488,7 +492,9 @@ mod tests {
                             let index_file = index_file.clone();
                             async move {
                                 let path = req.path().to_string();
-                                if is_api_path(&path) {
+                                // /assets/ 是带哈希的构建产物：缺失只可能是旧版本引用，绝不做 SPA 兜底
+                                // （回 404 让浏览器立刻报干净错误，而不是把 HTML 当 CSS/JS 造成 MIME 错）。
+                                if is_api_path(&path) || path.starts_with("/assets/") {
                                     let response = HttpResponse::NotFound().finish();
                                     return Ok(ServiceResponse::new(req.into_parts().0, response));
                                 }

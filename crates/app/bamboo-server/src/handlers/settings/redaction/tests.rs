@@ -559,6 +559,7 @@ fn redact_config_masks_configured_connect_platform_token() {
         app_secret_configured: false,
         domain: None,
         allow_from: vec!["123".to_string()],
+        trust_first_sender: false,
         admin_from: Vec::new(),
     }];
 
@@ -601,6 +602,7 @@ fn redact_config_omits_unconfigured_connect_platform_token() {
         app_secret_configured: false,
         domain: None,
         allow_from: Vec::new(),
+        trust_first_sender: false,
         admin_from: Vec::new(),
     }];
 
@@ -658,6 +660,7 @@ fn redact_config_masks_configured_connect_platform_app_secret_but_not_app_id_or_
         app_secret_configured: false,
         domain: Some("lark".to_string()),
         allow_from: vec!["ou_1".to_string()],
+        trust_first_sender: false,
         admin_from: Vec::new(),
     }];
 
@@ -706,6 +709,7 @@ fn redact_config_omits_unconfigured_connect_platform_app_secret() {
         app_secret_configured: false,
         domain: None,
         allow_from: Vec::new(),
+        trust_first_sender: false,
         admin_from: Vec::new(),
     }];
 

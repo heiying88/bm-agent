@@ -41,11 +41,12 @@ const LazyCommandPalette = React.lazy(() =>
 );
 
 // FeatureGuide is an onboarding tour – never needed on the critical path.
-const LazyFeatureGuide = React.lazy(() =>
-  import("@shared/components/FeatureGuide/FeatureGuide").then((m) => ({
-    default: m.FeatureGuide,
-  })),
-);
+// 导览已禁用（v0.0.4，移动端遮罩盖住页面）；恢复渲染时取消下方注释即可。
+// const LazyFeatureGuide = React.lazy(() =>
+//   import("@shared/components/FeatureGuide/FeatureGuide").then((m) => ({
+//     default: m.FeatureGuide,
+//   })),
+// );
 
 // LedgerDrawer hosts the personal-assistant agenda (ledger records). It is
 // closed by default and only needs to exist to keep the trigger badge fresh,
@@ -219,7 +220,9 @@ export const MainLayout: React.FC<{
       )}
       {auxReady && (
         <React.Suspense fallback={null}>
-          <LazyFeatureGuide disabled={settingsOpen} />
+          {/* 导览已禁用：移动端遮罩层会盖住页面导致无法点击（v0.0.4）。
+              需要恢复时改回 disabled={settingsOpen}。 */}
+          {/* <LazyFeatureGuide disabled={settingsOpen} /> */}
         </React.Suspense>
       )}
       {auxReady && (

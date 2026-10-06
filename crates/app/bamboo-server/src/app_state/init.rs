@@ -681,6 +681,7 @@ mod connect_project_mapping_tests {
             app_secret_configured: false,
             domain: None,
             allow_from: vec!["allowed".to_string()],
+            trust_first_sender: false,
             admin_from: Vec::new(),
         }
     }
