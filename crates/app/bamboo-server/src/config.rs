@@ -165,6 +165,12 @@ fn rate_limiter_config(
 /// `BAMBOO_RATE_LIMIT_TRUSTED_HOPS`, default one hop). #169. XFF mode is OPT-IN
 /// because trusting the header when NOT behind a trusted proxy lets any client
 /// spoof its rate-limit key; see [`ClientIpKeyExtractor`].
+///
+/// Static frontend requests (`/`, `*/index.html`, hashed `/assets/*`) bypass
+/// the limiter entirely — a cold SPA load bursts dozens of asset requests and,
+/// behind a proxy/tunnel, all visitors share one key, which 429'd the tail
+/// chunks and broke the page (the frp external-access incident). See
+/// `rate_limit::is_rate_limit_exempt_static_path`; API routes stay throttled.
 pub fn build_rate_limiter() -> RateLimiterConfig<ClientIpKeyExtractor> {
     let per_second = std::env::var("BAMBOO_RATE_LIMIT_PER_SECOND")
         .ok()
@@ -211,7 +217,10 @@ pub fn build_rate_limiter() -> RateLimiterConfig<ClientIpKeyExtractor> {
 /// desktop sidecar serves the local frontend, which legitimately bursts ~45
 /// hashed `/assets/*` requests on load and would otherwise trip the 429 limit
 /// (`burst` default 20). Mirrors the loopback special-casing already used for
-/// CORS; network binds (`0.0.0.0`) are still throttled.
+/// CORS; network binds (`0.0.0.0`) are still throttled — though static
+/// frontend paths are exempted for EVERY bind inside the middleware itself
+/// (`rate_limit::is_rate_limit_exempt_static_path`), for the same cold-load
+/// reason, so the exemption holds behind proxies/tunnels too.
 ///
 /// Classification is via [`IpAddr::is_loopback`] (so the whole `127.0.0.0/8`
 /// range, not just `127.0.0.1`, and a bracketed IPv6 literal like `[::1]` are
@@ -936,18 +945,23 @@ mod tests {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
         // burst=2: the first two requests from an IP pass, the rest are throttled.
+        // Probe an API path: static frontend paths (`/`, `/index.html`,
+        // `/assets/*`) deliberately bypass the limiter — see
+        // `rate_limit::is_rate_limit_exempt_static_path`.
         let conf = rate_limiter_config(1, 2, ClientIpKeyExtractor::peer_ip());
-        let app = test::init_service(
-            App::new()
-                .wrap(RateLimit::new(&conf))
-                .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
-        )
+        let app = test::init_service(App::new().wrap(RateLimit::new(&conf)).route(
+            "/v1/sessions",
+            web::get().to(|| async { HttpResponse::Ok().finish() }),
+        ))
         .await;
 
         let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 9999);
         let (mut saw_ok, mut saw_429) = (false, false);
         for _ in 0..6 {
-            let req = test::TestRequest::get().uri("/").peer_addr(ip).to_request();
+            let req = test::TestRequest::get()
+                .uri("/v1/sessions")
+                .peer_addr(ip)
+                .to_request();
             match test::call_service(&app, req).await.status() {
                 StatusCode::OK => saw_ok = true,
                 StatusCode::TOO_MANY_REQUESTS => saw_429 = true,
@@ -962,7 +976,7 @@ mod tests {
         // global key extractor.
         let other_ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 8888);
         let req = test::TestRequest::get()
-            .uri("/")
+            .uri("/v1/sessions")
             .peer_addr(other_ip)
             .to_request();
         assert_eq!(
@@ -1134,6 +1148,11 @@ mod tests {
     // yielding `(last_get_status, last_get_has_acao, preflight_status)`.
     macro_rules! probe_cors_and_preflight {
         ($app:expr, $ip:expr, $origin:expr, $gets:expr) => {{
+            // Probe an API path — static frontend paths bypass the rate
+            // limiter by design, so they can't demonstrate a 429.
+            probe_cors_and_preflight!($app, $ip, $origin, $gets, "/v1/sessions")
+        }};
+        ($app:expr, $ip:expr, $origin:expr, $gets:expr, $uri:expr) => {{
             use actix_web::http::header;
             use actix_web::test;
 
@@ -1143,7 +1162,7 @@ mod tests {
                 let res = test::call_service(
                     &$app,
                     test::TestRequest::get()
-                        .uri("/")
+                        .uri($uri)
                         .peer_addr($ip)
                         .insert_header((header::ORIGIN, $origin))
                         .to_request(),
@@ -1159,7 +1178,7 @@ mod tests {
                 &$app,
                 test::TestRequest::default()
                     .method(actix_web::http::Method::OPTIONS)
-                    .uri("/")
+                    .uri($uri)
                     .peer_addr($ip)
                     .insert_header((header::ORIGIN, $origin))
                     .insert_header((header::ACCESS_CONTROL_REQUEST_METHOD, "GET"))
@@ -1321,7 +1340,10 @@ mod tests {
                 "0.0.0.0",
                 9562,
             )
-            .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
+            .route(
+                "/v1/sessions",
+                web::get().to(|| async { HttpResponse::Ok().finish() }),
+            ),
         )
         .await;
 
@@ -1366,7 +1388,10 @@ mod tests {
             App::new()
                 .wrap(build_cors("0.0.0.0", 9562)) // inner (WRONG)
                 .wrap(RateLimit::new(&conf)) // outer (WRONG)
-                .route("/", web::get().to(|| async { HttpResponse::Ok().finish() })),
+                .route(
+                    "/v1/sessions",
+                    web::get().to(|| async { HttpResponse::Ok().finish() }),
+                ),
         )
         .await;
 

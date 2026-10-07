@@ -9,6 +9,8 @@
 //! - per-key token-bucket throttling, backed by `governor`'s keyed rate
 //!   limiter (same GCRA algorithm, same `Quota::with_period(..).allow_burst(..)`
 //!   construction actix-governor's `GovernorConfigBuilder::finish()` used);
+//! - static frontend requests (hashed `/assets/*` plus the SPA shell) bypass
+//!   the bucket entirely — see [`is_rate_limit_exempt_static_path`];
 //! - request-driven, single-flight eviction of idle keyed state via governor's
 //!   `retain_recent`, with no per-request or per-worker background tasks;
 //! - on throttle: `429 Too Many Requests` with `retry-after` and
@@ -260,6 +262,25 @@ impl<K: KeyExtractor> RateLimiterConfig<K> {
     }
 }
 
+/// Static frontend requests that bypass the rate limiter entirely.
+///
+/// `/assets/*` files are content-hashed and immutable, and `/` +
+/// `*/index.html` are the no-cache SPA shell (see `config::add_asset_cache_headers`):
+/// serving them is a cheap read of embedded bytes with no auth or compute
+/// surface. But a cold frontend load bursts ~45 of them in parallel, and
+/// behind a reverse proxy or tunnel (frp, cloudflared) every external visitor
+/// shares the proxy's peer IP — the whole internet collapses into ONE bucket.
+/// With the default 10 req/s + burst 20 the tail chunks come back `429` and
+/// the browser surfaces "Failed to fetch dynamically imported module" /
+/// TypeError on the chunk, breaking the page (the frp external-access
+/// incident; the same failure `config` already sidesteps for loopback binds
+/// by skipping the limiter there). Throttling static files defends nothing
+/// the limiter can actually protect, so they are exempted unconditionally —
+/// on every bind — while API routes keep full per-IP throttling.
+fn is_rate_limit_exempt_static_path(path: &str) -> bool {
+    path == "/" || path.starts_with("/assets/") || path.ends_with("/index.html")
+}
+
 /// Rate-limiting middleware factory — mirrors `actix_governor::Governor`.
 pub struct RateLimit<K: KeyExtractor> {
     limiter: Arc<ManagedKeyedLimiter<K::Key>>,
@@ -316,6 +337,15 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
+        // Static frontend files skip the bucket (cold load bursts dozens of
+        // hashed assets; behind a proxy all visitors share one key — see
+        // [`is_rate_limit_exempt_static_path`]). Forwarded untouched so cache
+        // headers and routing behave exactly as before.
+        if is_rate_limit_exempt_static_path(req.path()) {
+            let fut = self.service.call(req);
+            return Box::pin(async move { fut.await.map(|res| res.map_into_left_body()) });
+        }
+
         let key = match self.key_extractor.extract(&req) {
             Ok(key) => key,
             Err(err) => {
@@ -571,25 +601,113 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn static_path_predicate_matches_frontend_shell_and_hashed_assets() {
+        for path in [
+            "/",
+            "/index.html",
+            "/sub/index.html",
+            "/assets/main-Ab12.css",
+        ] {
+            assert!(
+                is_rate_limit_exempt_static_path(path),
+                "{path} is a static frontend path and must bypass the limiter"
+            );
+        }
+        for path in [
+            "/v1/sessions",
+            "/api/v1/sessions",
+            "/assetsx",
+            "/assets",
+            "",
+            "/v1/assets/main.js",
+        ] {
+            assert!(
+                !is_rate_limit_exempt_static_path(path),
+                "{path} is not a static frontend path and must stay throttled"
+            );
+        }
+    }
+
+    /// The frp external-access incident, as a test: behind a tunnel every
+    /// visitor shares one peer IP, so a cold page load (dozens of parallel
+    /// `/assets/*` requests) used to drain the shared bucket and 429 the tail
+    /// chunks → "Failed to fetch dynamically imported module". Static frontend
+    /// requests must bypass the bucket even when it is fully exhausted, while
+    /// API routes keep being throttled by the SAME exhausted bucket.
+    #[actix_web::test]
+    async fn static_frontend_requests_bypass_the_exhausted_bucket() {
+        let key = IpAddr::V4(Ipv4Addr::new(10, 1, 1, 3));
+        // burst=1, one element per second: a single API request exhausts the
+        // bucket for the rest of the test.
+        let conf = RateLimiterConfig::new(Duration::from_secs(1), 1, FixedKeyExtractor(key));
+        let app = test::init_service(
+            App::new()
+                .wrap(RateLimit::new(&conf))
+                .route("/v1/ping", web::get().to(|| async { Resp::Ok().finish() }))
+                .route("/", web::get().to(|| async { Resp::Ok().finish() }))
+                .route(
+                    "/index.html",
+                    web::get().to(|| async { Resp::Ok().finish() }),
+                )
+                .default_service(web::to(|| async { Resp::Ok().finish() })),
+        )
+        .await;
+
+        // Drain the (single-token) bucket with an API request...
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/v1/ping").to_request()).await;
+        assert_eq!(res.status(), HttpStatusCode::OK);
+
+        // ...so the NEXT API request is throttled — the limiter stays armed.
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/v1/ping").to_request()).await;
+        assert_eq!(
+            res.status(),
+            HttpStatusCode::TOO_MANY_REQUESTS,
+            "API routes must keep being throttled after the burst drains"
+        );
+
+        // Static frontend requests sail through the SAME exhausted bucket —
+        // the exact requests a cold SPA load fires in parallel.
+        for uri in [
+            "/assets/QuestionDialog-CNAWeCyH.js",
+            "/assets/ChildApprovalDialog-Dsvxh5.js",
+            "/assets/main-tzfzLibK.js",
+            "/",
+            "/index.html",
+        ] {
+            let res =
+                test::call_service(&app, test::TestRequest::get().uri(uri).to_request()).await;
+            assert_eq!(
+                res.status(),
+                HttpStatusCode::OK,
+                "{uri} must bypass the rate limiter (frp 429 incident regression)"
+            );
+        }
+    }
+
+    #[actix_web::test]
     async fn burst_then_429_with_retry_after_header() {
         let key = IpAddr::V4(Ipv4Addr::new(10, 1, 1, 1));
         let conf = RateLimiterConfig::new(Duration::from_millis(100), 3, FixedKeyExtractor(key));
         let app = test::init_service(
             App::new()
                 .wrap(RateLimit::new(&conf))
-                .route("/", web::get().to(|| async { Resp::Ok().finish() })),
+                .route("/v1/ping", web::get().to(|| async { Resp::Ok().finish() })),
         )
         .await;
 
         // The first 3 requests (burst_size) pass.
         for _ in 0..3 {
             let res =
-                test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+                test::call_service(&app, test::TestRequest::get().uri("/v1/ping").to_request())
+                    .await;
             assert_eq!(res.status(), HttpStatusCode::OK);
         }
 
         // The 4th is throttled, with a Retry-After header.
-        let res = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/v1/ping").to_request()).await;
         assert_eq!(res.status(), HttpStatusCode::TOO_MANY_REQUESTS);
         assert!(
             res.headers().contains_key("retry-after"),
@@ -614,14 +732,16 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(RateLimit::new(&conf))
-                .route("/", web::get().to(|| async { Resp::Ok().finish() })),
+                .route("/v1/ping", web::get().to(|| async { Resp::Ok().finish() })),
         )
         .await;
 
-        let res = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/v1/ping").to_request()).await;
         assert_eq!(res.status(), HttpStatusCode::OK);
 
-        let res = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/v1/ping").to_request()).await;
         assert_eq!(
             res.status(),
             HttpStatusCode::TOO_MANY_REQUESTS,
@@ -630,7 +750,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(60)).await;
 
-        let res = test::call_service(&app, test::TestRequest::get().uri("/").to_request()).await;
+        let res =
+            test::call_service(&app, test::TestRequest::get().uri("/v1/ping").to_request()).await;
         assert_eq!(
             res.status(),
             HttpStatusCode::OK,
@@ -659,7 +780,7 @@ mod tests {
         let app = test::init_service(
             App::new()
                 .wrap(RateLimit::new(&conf))
-                .route("/", web::get().to(|| async { Resp::Ok().finish() })),
+                .route("/v1/ping", web::get().to(|| async { Resp::Ok().finish() })),
         )
         .await;
 
@@ -669,9 +790,10 @@ mod tests {
         // stack (in the H1/H2 dispatcher), so exercise that conversion directly
         // here via `try_call_service` + `ResponseError::error_response()` instead
         // of `call_service` (which panics on `Err`, since it bypasses that layer).
-        let err = test::try_call_service(&app, test::TestRequest::get().uri("/").to_request())
-            .await
-            .expect_err("extraction failure must reach the caller as an Err");
+        let err =
+            test::try_call_service(&app, test::TestRequest::get().uri("/v1/ping").to_request())
+                .await
+                .expect_err("extraction failure must reach the caller as an Err");
         let response = err.error_response();
         assert_eq!(response.status(), HttpStatusCode::INTERNAL_SERVER_ERROR);
         let body = actix_web::body::to_bytes(response.into_body())
