@@ -45,10 +45,21 @@ struct ConnectPlatformMutation {
     /// `token_change` 同一套凭据管道。
     #[serde(default)]
     voice: Option<bamboo_config::WechatVoiceConfig>,
+    /// 微信网关 Project Dream 自动运行计划（`dream` 段）。**缺省/null =
+    /// 保留现有配置**；提交即整体替换（校验 mode/daily_at/idle_minutes）。
+    #[serde(default)]
+    dream: Option<bamboo_config::WechatDreamConfig>,
+    /// 微信网关首条消息自动项目（`auto_project` 段）。**缺省/null = 保留
+    /// 现有配置**；提交即整体替换。
+    #[serde(default)]
+    auto_project: Option<bamboo_config::WechatAutoProjectConfig>,
     /// "信任首个发信人"闩锁（v0.0.4）。**缺省/null = 保留现有值**；
     /// 扫码登录端点在未显式提供 allow_from 时默认置 true。
     #[serde(default)]
     trust_first_sender: Option<bool>,
+    /// 微信"正在输入中"指示。**缺省/null = 保留现有值**。
+    #[serde(default)]
+    typing_indicator: Option<bool>,
     #[serde(default)]
     token_change: Option<CredentialAction>,
     #[serde(default)]
@@ -234,6 +245,24 @@ pub(crate) async fn apply_connect_mutation(
                 "connect platform type must be nonempty".to_string(),
             ));
         }
+        // 只校验显式提交的 dream/auto_project；缺省时写入路径会保留的
+        // 现有值在当初写入时已校验过。
+        if platform.platform_type == "wechat" {
+            if let Some(dream) = &platform.dream {
+                if let Err(message) = dream.validate() {
+                    return Err(AppError::BadRequest(format!(
+                        "connect platform {index}: {message}"
+                    )));
+                }
+            }
+            if let Some(auto_project) = &platform.auto_project {
+                if let Err(message) = auto_project.validate() {
+                    return Err(AppError::BadRequest(format!(
+                        "connect platform {index}: {message}"
+                    )));
+                }
+            }
+        }
         for (label, action, target) in [
             (
                 "connect token",
@@ -292,6 +321,13 @@ pub(crate) async fn apply_connect_mutation(
                     voice: input
                         .voice
                         .or_else(|| existing.and_then(|platform| platform.voice.clone())),
+                    // dream / auto_project 同 voice 的保留语义。
+                    dream: input
+                        .dream
+                        .or_else(|| existing.and_then(|platform| platform.dream.clone())),
+                    auto_project: input
+                        .auto_project
+                        .or_else(|| existing.and_then(|platform| platform.auto_project.clone())),
                     id: input.id,
                     project_id: input.project_id,
                     platform_type: input.platform_type,
@@ -312,6 +348,9 @@ pub(crate) async fn apply_connect_mutation(
                     trust_first_sender: input
                         .trust_first_sender
                         .unwrap_or_else(|| existing.is_some_and(|p| p.trust_first_sender)),
+                    typing_indicator: input
+                        .typing_indicator
+                        .unwrap_or_else(|| existing.is_some_and(|p| p.typing_indicator)),
                     allow_from: input.allow_from,
                     admin_from: input.admin_from,
                 });
@@ -452,6 +491,9 @@ pub async fn post_wechat_qr_apply(
                 admin_from: request.admin_from,
                 voice: request.voice,
                 trust_first_sender: Some(trust_first_sender),
+                typing_indicator: None,
+                dream: None,
+                auto_project: None,
                 token_change: Some(CredentialAction::Replace { value: token }),
                 app_secret_change: None,
                 voice_api_key_change: request.voice_api_key_change,
@@ -459,6 +501,142 @@ pub async fn post_wechat_qr_apply(
         },
     };
     apply_connect_mutation(&app_state, mutation).await
+}
+
+// ---------------------------------------------------------------------------
+// connect 会话管理（设置页微信连接区块的会话面板）：列表 / 新建 / 切换 /
+// 删除。全部作用在 ConnectManager 持有的实时桥接上（会话映射、忙锁、
+// 挂起审批），与聊天内的 /sessions、/switch、/del、/new 命令同源。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConnectSessionsQuery {
+    platform: Option<String>,
+}
+
+/// `GET /api/v1/bamboo/connect/sessions?platform=wechat`
+pub async fn get_connect_sessions(
+    app_state: web::Data<AppState>,
+    query: web::Query<ConnectSessionsQuery>,
+) -> Result<HttpResponse, AppError> {
+    let platform = query
+        .platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(platform) = platform {
+        if !matches!(platform, "telegram" | "feishu" | "wechat") {
+            return Err(AppError::BadRequest(format!(
+                "unsupported connect platform '{platform}'"
+            )));
+        }
+    }
+    let sessions = app_state
+        .connect_manager
+        .bridge()
+        .list_connect_sessions(platform)
+        .await;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "sessions": sessions })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateConnectSessionRequest {
+    platform: String,
+    chat_id: String,
+    /// 缺省与 chat_id 相同（微信私聊两者一致）。
+    #[serde(default)]
+    user_id: Option<String>,
+}
+
+/// `POST /api/v1/bamboo/connect/sessions` — 为指定聊天立即新建会话
+/// （聊天内 `/new` 的"马上创建"版本）。
+pub async fn post_connect_session(
+    app_state: web::Data<AppState>,
+    payload: web::Json<CreateConnectSessionRequest>,
+) -> Result<HttpResponse, AppError> {
+    let request = payload.into_inner();
+    let platform = request.platform.trim().to_string();
+    if !matches!(platform.as_str(), "telegram" | "feishu" | "wechat") {
+        return Err(AppError::BadRequest(format!(
+            "unsupported connect platform '{platform}'"
+        )));
+    }
+    if request.chat_id.trim().is_empty() {
+        return Err(AppError::BadRequest("chat_id must be nonempty".to_string()));
+    }
+    let user_id = request
+        .user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| request.chat_id.trim().to_string());
+    let key = crate::connect::SessionKey {
+        platform,
+        chat_id: request.chat_id.trim().to_string(),
+        user_id,
+    }
+    .as_string();
+    let bridge = app_state.connect_manager.bridge();
+    let session = bridge
+        .create_session_for_key(&key)
+        .await
+        .map_err(AppError::BadRequest)?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "session_id": session.id,
+        "connect_key": key,
+        "title": session.title,
+        "project_id": session.metadata.get("project_id"),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivateConnectSessionRequest {
+    connect_key: String,
+}
+
+/// `POST /api/v1/bamboo/connect/sessions/{session_id}/activate` — 把会话
+/// 所属聊天的当前会话切回这个历史会话（聊天内 `/switch` 同款）。
+pub async fn post_connect_session_activate(
+    app_state: web::Data<AppState>,
+    path: web::Path<String>,
+    payload: web::Json<ActivateConnectSessionRequest>,
+) -> Result<HttpResponse, AppError> {
+    let session_id = path.into_inner();
+    let key = payload.into_inner().connect_key;
+    app_state
+        .connect_manager
+        .bridge()
+        .activate_session_for_key(key.trim(), &session_id)
+        .await
+        .map_err(AppError::BadRequest)?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "session_id": session_id,
+    })))
+}
+
+/// `DELETE /api/v1/bamboo/connect/sessions/{session_id}` — 先摘除桥接映射
+/// 与挂起状态，再复用通用会话删除处理器（技能激活释放、运行取消、存储
+/// 删除、账户事件广播等全量逻辑）。
+pub async fn delete_connect_session(
+    app_state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, AppError> {
+    let session_id = path.into_inner();
+    app_state
+        .connect_manager
+        .bridge()
+        .detach_connect_session(&session_id)
+        .await;
+    crate::handlers::agent::delete::handler(app_state.clone(), web::Path::from(session_id))
+        .await
+        .map_err(|error| {
+            AppError::InternalError(anyhow::anyhow!("failed to delete connect session: {error}"))
+        })
 }
 
 #[cfg(test)]

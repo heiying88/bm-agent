@@ -2,7 +2,7 @@ export const enUsTranslation = {
   translation: {
     app: {
       loading: "Loading...",
-      loadingSlow: "Connecting to the backend — this can take up to ~20 seconds…",
+      loadingSlow: "Connecting to the backend â this can take up to ~20 secondsâ¦",
       retry: "Retry",
       backendNotReachable: "Backend not reachable at {{baseUrl}} (last error: {{message}})",
       errorBoundary: {
@@ -38,7 +38,7 @@ export const enUsTranslation = {
           completedTitle: "Background Task Completed",
           completedBody: '"{{title}}" has completed',
           completedFallback: "A background task has completed",
-          completedToast: "Background shell finished — {{command}} ({{status}}, exit {{code}})",
+          completedToast: "Background shell finished â {{command}} ({{status}}, exit {{code}})",
         },
         clarification: {
           title: "Bodhi AI needs your response",
@@ -122,7 +122,7 @@ export const enUsTranslation = {
           sequence: "Sequence group",
           parallel: "Parallel group",
           map: "Map group",
-          retry: "Retry group · up to {{count}} attempts",
+          retry: "Retry group Â· up to {{count}} attempts",
         },
         suspension: {
           tool_approval: "Suspended for backend-owned tool approval",
@@ -137,7 +137,7 @@ export const enUsTranslation = {
     },
     commandPalette: {
       searchPlaceholder: "Search sessions, settings, and actions",
-      navigationHint: "Use ↑↓ to navigate, Enter to open, and Esc to close.",
+      navigationHint: "Use ââ to navigate, Enter to open, and Esc to close.",
       empty: "No matching commands",
       groups: {
         quickActions: "Quick actions",
@@ -220,7 +220,7 @@ export const enUsTranslation = {
         refresh: "Refresh",
       },
       quickAdd: {
-        placeholder: "Add a todo…",
+        placeholder: "Add a todoâ¦",
         dueLabel: "Due date",
         add: "Add todo",
         added: "Todo added",
@@ -273,13 +273,13 @@ export const enUsTranslation = {
       source: {
         salvaged: "Salvaged {{count}} field(s) directly from the corrupt file.",
         backup: "Restored from the last-known-good backup (generation {{generation}}).",
-        defaults: "No usable salvage or backup was found — reset to built-in defaults.",
+        defaults: "No usable salvage or backup was found â reset to built-in defaults.",
       },
       quarantinePath: "Corrupt original preserved at: {{path}}",
       rejectNotice:
-        "Rejected — nothing was discarded. config.json is untouched on disk and settings stay locked until you Accept, or hand-fix config.json and restart the backend.",
-      accept: "Accept — save recovered configuration",
-      reject: "Reject — keep the corrupt file for manual repair",
+        "Rejected â nothing was discarded. config.json is untouched on disk and settings stay locked until you Accept, or hand-fix config.json and restart the backend.",
+      accept: "Accept â save recovered configuration",
+      reject: "Reject â keep the corrupt file for manual repair",
     },
     common: {
       cancel: "Cancel",
@@ -480,7 +480,7 @@ export const enUsTranslation = {
         resourcesFailed: "Failed to load shared resources",
         resourceRevision: "Resource revision: {{revision}}",
         conflict:
-          "This project was modified elsewhere. The latest data has been reloaded — please retry.",
+          "This project was modified elsewhere. The latest data has been reloaded â please retry.",
         selectProject: "Select a project to manage",
         selectForSession: "Select Project",
         sessionModalTitle: "Assign session to Project",
@@ -510,7 +510,7 @@ export const enUsTranslation = {
         entry: "Migrate legacy sessions",
         entryCount: "{{count}} unassigned",
         title: "Legacy session migration",
-        loading: "Analyzing unassigned sessions…",
+        loading: "Analyzing unassigned sessionsâ¦",
         loadFailed: "Failed to analyze legacy sessions",
         nothingToMigrate: "No unassigned sessions found.",
         assignmentsTitle: "Ready to assign ({{count}})",
@@ -520,18 +520,18 @@ export const enUsTranslation = {
         basisExact: "exact binding match",
         basisGit: "same Git common directory",
         targetProject: "Target project",
-        createNewProject: "Create new project…",
+        createNewProject: "Create new projectâ¦",
         newProjectName: "New project name",
         newProjectPath: "Project folder (confirm explicitly)",
         sessionCount: "{{count}} sessions",
         apply: "Assign selected ({{count}})",
-        applying: "Assigning…",
+        applying: "Assigningâ¦",
         skip: "Skip for now",
         done: "Migration finished: {{ok}} assigned, {{failed}} failed",
         close: "Close",
         childrenInherit: "Child sessions inherit their root session's project.",
-        noVersion: "Session metadata version unavailable — please retry",
-        runningConflict: "Session is running — stop it before migrating",
+        noVersion: "Session metadata version unavailable â please retry",
+        runningConflict: "Session is running â stop it before migrating",
       },
       workspace: {
         modalTitle: "Set Workspace Path",
@@ -582,7 +582,7 @@ export const enUsTranslation = {
         otherFolder: "Other folder",
         otherFolderHint:
           "Other folders are not bound automatically. If this Project does not already own the folder, bind it in Projects first.",
-        projectPathsLoading: "Refreshing Project workspaces…",
+        projectPathsLoading: "Refreshing Project workspacesâ¦",
         projectPathsLoadFailed:
           "Project workspaces could not be refreshed. The backend will still validate your choice.",
       },
@@ -600,7 +600,7 @@ export const enUsTranslation = {
         toolCallsOnly: "Tool calls only (allowed tools: {{tools}})",
         autoPrefixMode: "Auto-prefix mode: {{prefix}} (type '/' to select tools)",
         toolSpecificMode: "Tool-specific mode (allowed tools: {{tools}})",
-        processingFiles: "Processing files…",
+        processingFiles: "Processing filesâ¦",
         dropImagesHere: "Drop images here",
         referencing: "Referencing",
         addAttachments: "Add attachments",
@@ -624,12 +624,12 @@ export const enUsTranslation = {
         bypassPermissions: {
           label: "Bypass",
           onTitle:
-            "Bypass is ON — ordinary permission prompts are skipped, but hard-dangerous operations and your always-ask rules still require approval. Click to turn off.",
+            "Bypass is ON â ordinary permission prompts are skipped, but hard-dangerous operations and your always-ask rules still require approval. Click to turn off.",
           offTitle:
-            "Bypass is OFF — high-risk operations may ask for approval. Click to bypass ordinary prompts for this session.",
+            "Bypass is OFF â high-risk operations may ask for approval. Click to bypass ordinary prompts for this session.",
           onLabel: "Bypass ON",
           offLabel: "Bypass OFF",
-          pending: "Saving…",
+          pending: "Savingâ¦",
           success: "Saved",
           error: "Failed to update bypass permissions",
         },
@@ -654,7 +654,7 @@ export const enUsTranslation = {
             },
           },
           status: {
-            pending: "Saving…",
+            pending: "Savingâ¦",
             success: "Saved",
             error: "Failed to update permission mode",
           },
@@ -663,7 +663,7 @@ export const enUsTranslation = {
             warning:
               "Bamboo will not ask for approval before tool calls, including high-risk operations.",
             scope:
-              "This applies only to session “{{session}}” and remains active until you change its permission mode.",
+              "This applies only to session â{{session}}â and remains active until you change its permission mode.",
             boundaries:
               "Plan/read-only restrictions, explicit hard denies, authentication, OS permissions, and sandbox limits still apply.",
             enable: "Enable Auto for this session",
@@ -697,9 +697,12 @@ export const enUsTranslation = {
         runProjectDreamSuccess: "Project Dream updated",
         runProjectDreamNoChange: "No Project Dream update was needed",
         runProjectDreamFailed: "Failed to run Project Dream",
-        scheduleThis: "Schedule this…",
+        runProjectDreamStatusLost: "Dream job status unavailable (the server may have restarted); check results later",
+        runProjectDreamSessionOnly: "Run Dream (this session only)",
+        runProjectDreamTimeout: "Dream run timed out (over 10 minutes); check results in the session list later",
+        scheduleThis: "Schedule thisâ¦",
         copySession: "Copy Session",
-        copySessionRunning: "Copying session…",
+        copySessionRunning: "Copying sessionâ¦",
         copySessionSuccess: "Session copied",
         copySessionFailed: "Failed to copy session",
       },
@@ -733,8 +736,8 @@ export const enUsTranslation = {
           sections: {
             base: "Base",
             enhancement: "Enhancement",
-            project: "Project context · Bamboo",
-            workspace: "Workspace context · Bamboo",
+            project: "Project context Â· Bamboo",
+            workspace: "Workspace context Â· Bamboo",
             instruction: "Instruction",
             env: "Environment",
             skills: "Skills",
@@ -862,7 +865,7 @@ export const enUsTranslation = {
       },
       machine: {
         label: "Machine",
-        tooltip: "Runs on {{kind}} · {{host}}",
+        tooltip: "Runs on {{kind}} Â· {{host}}",
       },
       subAgents: {
         title: "Sub-agents",
@@ -887,7 +890,7 @@ export const enUsTranslation = {
         statusError: "error",
         statusCancelled: "cancelled",
         steeredLive: "Steering message delivered to the running sub-agent",
-        queuedNextTurn: "Queued — takes effect at the next turn",
+        queuedNextTurn: "Queued â takes effect at the next turn",
         statusFailed: "failed",
         statusAwaitingPermission: "awaiting permission",
         statusWaitingChildren: "waiting for children",
@@ -941,7 +944,7 @@ export const enUsTranslation = {
         title: "Start with a task",
         subtitle:
           "Create a focused session in this pane and prefill the first message before you send it.",
-        hint: "Nothing is sent automatically — you can edit the prompt first.",
+        hint: "Nothing is sent automatically â you can edit the prompt first.",
         categories: {
           development: "Development",
           debugging: "Debugging",
@@ -1133,11 +1136,11 @@ export const enUsTranslation = {
       },
       statusRail: {
         idle: "Ready",
-        thinking: "Thinking…",
-        runningTools: "Running tools…",
+        thinking: "Thinkingâ¦",
+        runningTools: "Running toolsâ¦",
         waitingAnswer: "Waiting for your answer",
-        runningChildren: "Running sub-agents…",
-        evaluatingTasks: "Evaluating task progress…",
+        runningChildren: "Running sub-agentsâ¦",
+        evaluatingTasks: "Evaluating task progressâ¦",
         completed: "Completed",
         error: "Error",
         childrenTooltip: "{{running}} running sub-agents",
@@ -1154,7 +1157,7 @@ export const enUsTranslation = {
       },
       planMode: {
         badge: "Plan",
-        tooltip: "Plan mode active · phase: {{status}} · previous mode: {{mode}}",
+        tooltip: "Plan mode active Â· phase: {{status}} Â· previous mode: {{mode}}",
         active: "Plan mode",
       },
     },
@@ -1227,10 +1230,10 @@ export const enUsTranslation = {
             "Configure how the backend delivers notifications (desktop, ntfy, Bark). Saved settings apply to every device.",
           retry: "Retry",
           save: "Save channel settings",
-          saving: "Saving…",
+          saving: "Savingâ¦",
           saved: "Saved",
           test: "Send test notification",
-          testing: "Sending…",
+          testing: "Sendingâ¦",
           testNone: "No channels are currently enabled",
           testAttempted: "Attempted: {{channels}}",
           desktop: {
@@ -1246,7 +1249,7 @@ export const enUsTranslation = {
             topic: "Topic",
             topicPlaceholder: "my-bamboo-topic",
             token: "Token (optional, for self-hosted instances)",
-            tokenPlaceholderConfigured: "Configured — leave blank to keep",
+            tokenPlaceholderConfigured: "Configured â leave blank to keep",
             tokenPlaceholderEmpty: "Not required for the public ntfy.sh topic",
           },
           bark: {
@@ -1254,7 +1257,7 @@ export const enUsTranslation = {
             enable: "Enable Bark",
             baseUrl: "Base URL",
             deviceKey: "Device Key",
-            deviceKeyPlaceholderConfigured: "Configured — leave blank to keep",
+            deviceKeyPlaceholderConfigured: "Configured â leave blank to keep",
             deviceKeyPlaceholderEmpty: "The device key from the Bark iOS app",
           },
         },
@@ -1265,15 +1268,15 @@ export const enUsTranslation = {
           "Drive Bamboo sessions from an external chat platform. Enabling a platform starts a persistent bridge; disabling removes it.",
         retry: "Retry",
         save: "Save connect settings",
-        saving: "Saving…",
+        saving: "Savingâ¦",
         saved: "Saved",
         denyAllWarning:
-          "No allowed users configured — every inbound message will be rejected until you add at least one ID.",
+          "No allowed users configured â every inbound message will be rejected until you add at least one ID.",
         telegram: {
           title: "Telegram",
           enable: "Enable Telegram bridge",
           token: "Bot Token",
-          tokenPlaceholderConfigured: "Configured — leave blank to keep",
+          tokenPlaceholderConfigured: "Configured â leave blank to keep",
           tokenPlaceholderEmpty: "Token from @BotFather",
           allowFrom: "Allowed user IDs",
           allowFromPlaceholder: "Telegram numeric user ID",
@@ -1284,7 +1287,7 @@ export const enUsTranslation = {
           appId: "App ID",
           appIdPlaceholder: "cli_xxxxxxxx",
           appSecret: "App Secret",
-          appSecretPlaceholderConfigured: "Configured — leave blank to keep",
+          appSecretPlaceholderConfigured: "Configured â leave blank to keep",
           appSecretPlaceholderEmpty: "App secret from the Feishu/Lark developer console",
           domain: "Domain",
           domainPlaceholder: "feishu (default), lark, or a private-deployment https:// base URL",
@@ -1300,39 +1303,63 @@ export const enUsTranslation = {
           qrOpenPage: "Open the WeChat login page",
           qrHint:
             "Scan-and-configure: a login page/QR opens, confirm on your phone, and the fresh bot token is saved into the credential store automatically (it never passes through this form). Restart serve afterwards to activate.",
-          qrWaiting: "Waiting for scan confirmation… (polling every 2.5s)",
-          qrApplying: "Scan confirmed — saving configuration…",
-          qrDone: "✅ Token saved. Restart serve to activate the bridge.",
+          qrWaiting: "Waiting for scan confirmationâ¦ (polling every 2.5s)",
+          qrApplying: "Scan confirmed â saving configurationâ¦",
+          qrDone: "â Token saved. Restart serve to activate the bridge.",
           token: "Bot Token",
-          tokenPlaceholderConfigured: "Configured — leave blank to keep",
+          tokenPlaceholderConfigured: "Configured â leave blank to keep",
           tokenPlaceholderEmpty: "iLink bot token obtained via QR login",
           tokenClear: "Clear configured token",
           tokenClearArmed: "Token will be cleared",
           allowFrom: "Allowed user IDs",
-          allowFromPlaceholder: "WeChat user id (e.g. wxid_xxx or oXXXX…@im.wechat)",
+          allowFromPlaceholder: "WeChat user id (e.g. wxid_xxx or oXXXXâ¦@im.wechat)",
           allowFromAutoTrustHint: "Leave empty + QR login = the first person to message the bot is auto-allowed (one-shot; the QR scan proves operator intent). Add an explicit ID to disable.",
+          typingIndicator: "Typing indicator",
+          typingIndicatorDescription: "While the agent is thinking in the background, the WeChat chat shows \"typing…\" (same experience as picoclaw/openclaw).",
           voiceTitle: "Voice (TTS / ASR via SiliconFlow)",
           voiceDescription:
-            "Optional. Bot voice replies are sent as mp3 audio files — the iLink channel does not render native voice bubbles sent by bots.",
+            "Optional. Bot voice replies are sent as mp3 audio files â the iLink channel does not render native voice bubbles sent by bots.",
           voiceApiKey: "SiliconFlow API Key",
-          voiceKeyPlaceholderConfigured: "Configured — leave blank to keep",
-          voiceKeyPlaceholderEmpty: "sk-… from siliconflow.cn",
+          voiceKeyPlaceholderConfigured: "Configured â leave blank to keep",
+          voiceKeyPlaceholderEmpty: "sk-â¦ from siliconflow.cn",
           voiceKeyClear: "Clear configured API key",
           voiceKeyClearArmed: "API key will be cleared",
           replyMode: "Auto voice mode",
-          replyModeOff: "off — text replies (explicit read-aloud requests still synthesize)",
-          replyModeMirror: "mirror — reply voice to voice",
-          replyModeAlways: "always — reply voice whenever content fits",
+          replyModeOff: "off â text replies (explicit read-aloud requests still synthesize)",
+          replyModeMirror: "mirror â reply voice to voice",
+          replyModeAlways: "always â reply voice whenever content fits",
           delivery: "Voice delivery form",
-          deliveryFile: "file — mp3 audio file (default)",
-          deliveryBubble: "bubble — native voice note (experimental)",
+          deliveryFile: "file â mp3 audio file (default)",
+          deliveryBubble: "bubble â native voice note (experimental)",
           fileAsr: "Transcribe audio-file attachments",
           fileAsrDescription:
-            "Inbound mp3/wav/… files get a [transcription] line via SenseVoiceSmall. WeChat voice notes always use WeChat's own transcription.",
+            "Inbound mp3/wav/â¦ files get a [transcription] line via SenseVoiceSmall. WeChat voice notes always use WeChat's own transcription.",
           ttsModel: "TTS model",
           ttsModelPlaceholder: "FunAudioLLM/CosyVoice2-0.5B (default)",
           ttsVoice: "TTS voice",
           ttsVoicePlaceholder: "FunAudioLLM/CosyVoice2-0.5B:anna (default)",
+          dreamTitle: "Project Dream schedule",
+          dreamDescription:
+            "Automatically run Project Dream for this gateway's project (default '微信工作') — it consolidates project memory. Trigger daily at a fixed time, or after the gateway has been idle for a while.",
+          dreamMode: "Trigger",
+          dreamModeOff: "Off",
+          dreamModeDaily: "Daily at a fixed time",
+          dreamModeIdle: "After idle (rest time)",
+          dreamDailyAt: "Daily run time",
+          dreamIdleMinutes: "Idle minutes before running",
+          sessionsTitle: "WeChat gateway sessions",
+          sessionsDescription:
+            "Sessions created by this gateway. Create new ones, switch a chat back to a past session, or delete; the same works in-chat via /sessions, /switch, /del, /new (model switching is /switch_model).",
+          sessionsRefresh: "Refresh",
+          sessionsEmpty:
+            "No WeChat sessions yet — the first inbound message creates one (and auto-assigns it to the '微信工作' project).",
+          sessionsNew: "New session",
+          sessionsActivate: "Make current",
+          sessionsCurrent: "Current",
+          sessionsDelete: "Delete",
+          sessionsDeleteConfirm: "Delete this session? Its history will be removed permanently.",
+          sessionsBusyHint:
+            "While a chat has a run in flight, create/switch is rejected (send /stop in chat first).",
         },
       },
       pluginsTab: {
@@ -1364,7 +1391,7 @@ export const enUsTranslation = {
           installing: "Installing",
           installed: "Installed",
           installingHint:
-            "This plugin is still marked as installing. If this persists, the install process may have crashed — you can remove it and try again.",
+            "This plugin is still marked as installing. If this persists, the install process may have crashed â you can remove it and try again.",
         },
         registered: {
           mcpServers_one: "{{count}} MCP server",
@@ -1426,7 +1453,7 @@ export const enUsTranslation = {
             title: "Advanced trust overrides",
             warningTitle: "These overrides bypass supply-chain verification",
             warningDescription:
-              "By default a URL install must come from a trusted host, carry a valid publisher signature, and be checksum-pinned. Only enable an override below if you fully trust this source — each one removes a check bamboo would otherwise enforce.",
+              "By default a URL install must come from a trusted host, carry a valid publisher signature, and be checksum-pinned. Only enable an override below if you fully trust this source â each one removes a check bamboo would otherwise enforce.",
             allowUntrustedHost: "Allow untrusted host",
             allowUntrustedHostHelp:
               "Fetch from a host outside the configured trusted-hosts allowlist.",
@@ -1462,7 +1489,7 @@ export const enUsTranslation = {
             "Controls which hosts, publisher signing keys, and checksum enforcement level are trusted by default for URL plugin installs.",
           retry: "Retry",
           save: "Save trust policy",
-          saving: "Saving…",
+          saving: "Savingâ¦",
           saved: "Saved",
           trustedHosts: {
             title: "Trusted hosts",
@@ -1485,7 +1512,7 @@ export const enUsTranslation = {
             off: "Off (insecure)",
             offWarningTitle: "All trust checks are disabled for URL installs",
             offWarningDescription:
-              "Every URL plugin install/update will skip the host allowlist, signature, and checksum requirements — equivalent to passing an insecure override on every install, server-wide. Only use this on a private or development instance.",
+              "Every URL plugin install/update will skip the host allowlist, signature, and checksum requirements â equivalent to passing an insecure override on every install, server-wide. Only use this on a private or development instance.",
           },
         },
       },
@@ -1747,7 +1774,7 @@ export const enUsTranslation = {
         claudeCodeModelPlaceholder: "CLI default",
         claudeCodePermissionMode: "Permission mode",
         claudeCodePermissionModeHint:
-          "Maps to the CLI's --permission-mode flag. Always sent explicitly — the CLI's own headless default (auto) would self-approve every tool without asking.",
+          "Maps to the CLI's --permission-mode flag. Always sent explicitly â the CLI's own headless default (auto) would self-approve every tool without asking.",
         claudeCodePermissionModes: {
           default: "Default (ask / relay for approval)",
           acceptEdits: "Accept edits (auto-allow file edits)",
@@ -1759,7 +1786,7 @@ export const enUsTranslation = {
           "When off (default), the child is isolated from your personal MCP servers, skills, and settings (--strict-mcp-config --setting-sources project). Turn on only if sub-agents should see your personal Claude Code configuration.",
         claudeCodeForwardEnv: "Forwarded environment variables",
         claudeCodeForwardEnvHint:
-          "Extra environment variable NAMES forwarded verbatim to the child process, on top of the fixed HOME/PATH/SHELL/... allowlist. Enter NAMES only — never values or secrets. Forwarding ANTHROPIC_API_KEY here switches billing from CLI subscription auth to API-key auth.",
+          "Extra environment variable NAMES forwarded verbatim to the child process, on top of the fixed HOME/PATH/SHELL/... allowlist. Enter NAMES only â never values or secrets. Forwarding ANTHROPIC_API_KEY here switches billing from CLI subscription auth to API-key auth.",
         claudeCodeForwardEnvPlaceholder: "e.g. ANTHROPIC_API_KEY, press Enter to add",
         memoryTitle: "Memory & Auto Dream",
         memoryDescription:
@@ -1778,7 +1805,7 @@ export const enUsTranslation = {
         reloadTools: "Reload Tools",
         skillLimits: {
           title: "Workflow / Skill Storage Limits",
-          description: "Skills that exceed a limit load as invalid (named in the error) instead of crashing activations. Each field is clamped to 1–256MB and ordered file ≤ skill ≤ publication ≤ retained.",
+          description: "Skills that exceed a limit load as invalid (named in the error) instead of crashing activations. Each field is clamped to 1â256MB and ordered file â¤ skill â¤ publication â¤ retained.",
           file: "Per file (MB)",
           skill: "Per skill (MB)",
           publication: "Per publication (MB)",
@@ -1931,10 +1958,10 @@ export const enUsTranslation = {
         loadFailed: "Failed to load model limits settings",
         saveSuccess: "Model limits saved",
         saveFailed: "Failed to save model limits settings",
-        resetSuccess: "Model limits reset — every model now uses the global default",
+        resetSuccess: "Model limits reset â every model now uses the global default",
         resetFailed: "Failed to reset model limits settings",
         badge: {
-          default: "Default · unchanged",
+          default: "Default Â· unchanged",
           defaultTooltip:
             "Using the global default. Unchanged rows automatically follow future default updates.",
           customized: "Customized",
@@ -2261,7 +2288,7 @@ export const enUsTranslation = {
         scheduleThis: {
           title: "Schedule this session",
           description:
-            "Prefilled from this session's prompt, workspace, and model — pick a trigger and save.",
+            "Prefilled from this session's prompt, workspace, and model â pick a trigger and save.",
           defaultNameTemplate: "Schedule: {{title}}",
         },
         columns: {
@@ -2366,11 +2393,11 @@ export const enUsTranslation = {
           sun: "Sun",
         },
         triggerLabels: {
-          interval: "{{type}} · {{seconds}}s",
-          daily: "{{type}} · {{time}}",
-          weekly: "{{type}} · {{weekdays}}",
-          monthly: "{{type}} · {{days}}",
-          cron: "{{type}} · {{expr}}",
+          interval: "{{type}} Â· {{seconds}}s",
+          daily: "{{type}} Â· {{time}}",
+          weekly: "{{type}} Â· {{weekdays}}",
+          monthly: "{{type}} Â· {{days}}",
+          cron: "{{type}} Â· {{expr}}",
         },
         statusLabels: {
           running: "Running",
@@ -2734,7 +2761,7 @@ export const enUsTranslation = {
         bodhiBaseUrlExtra: "Your Bodhi Server endpoint address",
         targetProviderExtra: "Which upstream provider to route through Bodhi",
         apiKeyRequired: "API key is required",
-        apiKeyKeepPlaceholder: "Configured — leave empty to keep",
+        apiKeyKeepPlaceholder: "Configured â leave empty to keep",
         bodhiApiKeyPlaceholder: "bhi_sk_...",
         bodhiBaseUrlPlaceholder: "http://localhost:8080",
         targetProviderPlaceholder: "openai",
@@ -3244,7 +3271,7 @@ export const enUsTranslation = {
         passwordRequired: "Password is required",
         keepSecret: "Enter new password or leave empty",
         privateKeyPath: "Private key file path (on this host)",
-        privateKeyInline: "…or paste key (PEM)",
+        privateKeyInline: "â¦or paste key (PEM)",
         privateKeyRequired: "Provide a key file path or paste a private key",
         passphrase: "Passphrase",
         passphraseWillClear: "Passphrase will be cleared",
@@ -3267,10 +3294,10 @@ export const enUsTranslation = {
         reload: "Reload",
         compare: "Compare",
         reapply: "Reapply",
-        logsTitle: "Logs — {{label}}",
+        logsTitle: "Logs â {{label}}",
         refresh: "Refresh",
         close: "Close",
-        loading: "Loading…",
+        loading: "Loadingâ¦",
       },
     },
     components: {
@@ -3308,7 +3335,7 @@ export const enUsTranslation = {
         checkpoint: "Checkpoint",
         checkpointNone: "None",
         diffTruncated: "Diff is too long and has been truncated",
-        structuredToolResultHint: "Tool result · {{tool}}",
+        structuredToolResultHint: "Tool result Â· {{tool}}",
         memory: {
           action: {
             inspect: "Inspect",
@@ -3340,8 +3367,8 @@ export const enUsTranslation = {
       },
       toolSteps: {
         title: "Tool Run",
-        running: "running…",
-        runningInBackground: "Running in background…",
+        running: "runningâ¦",
+        runningInBackground: "Running in backgroundâ¦",
         backgroundCompleted: "Completed",
         backgroundKilled: "Killed",
         backgroundFailed: "Failed",

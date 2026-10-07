@@ -768,8 +768,12 @@ impl ProjectStore {
     /// containment below registered canonical workspace bindings.
     ///
     /// A candidate that is equal to a binding or is a descendant of one
-    /// matches. If nested bindings make more than one Project match, resolution
-    /// fails closed instead of picking the longest prefix or registry order.
+    /// matches. Nested bindings (one project's root inside another project's
+    /// root) resolve by LONGEST MATCH: the innermost, most specific binding
+    /// owns the path — the same semantics as nested git repositories or
+    /// longest-prefix routing. Two equally-specific matches from different
+    /// projects imply identical registered roots (a registry state the
+    /// create/bind paths forbid) and still fail closed.
     pub fn find_workspace_owner_for_path(
         &self,
         candidate_path: &str,
@@ -777,23 +781,28 @@ impl ProjectStore {
         let canonical_path =
             canonicalize_candidate_utf8(Path::new(candidate_path), "workspace candidate")?;
         let candidate = Path::new(&canonical_path);
-        let matches = self
+        let mut matches = self
             .list()?
             .into_iter()
-            .filter(|project| {
-                project.workspace_roots().any(|root| {
-                    let root = Path::new(root);
-                    candidate == root || candidate.starts_with(root)
-                })
+            .filter_map(|project| {
+                project
+                    .workspace_roots()
+                    .map(Path::new)
+                    .filter(|root| candidate == *root || candidate.starts_with(root))
+                    .map(|root| root.as_os_str().len())
+                    .max()
+                    .map(|length| (length, project))
             })
             .collect::<Vec<_>>();
-        match matches.len() {
-            0 => Ok(None),
-            1 => Ok(matches.into_iter().next()),
-            _ => Err(ProjectStoreError::Validation(format!(
-                "workspace candidate is contained by multiple project bindings: {canonical_path}"
-            ))),
+        // 最长（最内层）匹配拥有该路径。同长并列意味着两个项目注册了
+        // 完全相同的根——创建校验禁止的状态，防御性失败关闭。
+        matches.sort_by(|left, right| right.0.cmp(&left.0));
+        if matches.len() > 1 && matches[0].0 == matches[1].0 {
+            return Err(ProjectStoreError::Validation(format!(
+                "workspace candidate is contained by equally-specific project bindings: {canonical_path}"
+            )));
         }
+        Ok(matches.into_iter().next().map(|(_, project)| project))
     }
 
     pub fn find_workspace_binding(
@@ -1291,6 +1300,8 @@ fn validate_new_workspace_roots(
         .into_iter()
         .chain(incoming.iter().map(|binding| binding.path.as_str()))
         .collect::<Vec<_>>();
+    // 同一项目自己的多个根之间仍不允许重叠（含嵌套）——一个项目不该
+    // 同时声明一个目录和它的子目录。
     for (index, root) in incoming_roots.iter().enumerate() {
         for other in incoming_roots.iter().skip(index + 1) {
             if workspace_paths_overlap(root, other) {
@@ -1300,12 +1311,15 @@ fn validate_new_workspace_roots(
             }
         }
     }
+    // 跨项目：只拒绝与现有项目**完全相同**的根；祖先/子孙嵌套允许
+    // （工作区可以位于另一个项目的工作区之内），归属解析按最长匹配
+    // 选最内层项目（见 `find_workspace_owner_for_path`）。
     for root in incoming_roots {
         for project in existing_projects {
             for existing in project.workspace_roots() {
-                if workspace_paths_overlap(root, existing) {
+                if Path::new(root) == Path::new(existing) {
                     return Err(ProjectStoreError::Validation(format!(
-                        "workspace root {root} overlaps project {} root {existing}",
+                        "workspace root {root} is already registered to project {}",
                         project.id
                     )));
                 }
@@ -2222,7 +2236,7 @@ mod tests {
     }
 
     #[test]
-    fn project_path_create_and_cas_update_reject_cross_project_overlap() {
+    fn nested_cross_project_roots_are_allowed_and_resolve_to_innermost_owner() {
         let (temp, store) = store();
         let owner_root = temp.path().join("owner");
         let nested = owner_root.join("nested");
@@ -2232,33 +2246,48 @@ mod tests {
             .unwrap();
         let project_count = store.list().unwrap().len();
 
+        // 嵌套（祖先被占）现在允许：另一个项目可以把工作区落在 Owner
+        // 的工作区之内。
+        let inner = store
+            .create_with_project_path("Nested create", None, nested.to_string_lossy(), Vec::new())
+            .expect("nested workspace root is allowed");
+        assert_eq!(store.list().unwrap().len(), project_count + 1);
+
+        let target = store.create("Target", None).unwrap();
+        let nested2 = owner_root.join("nested2");
+        std::fs::create_dir_all(&nested2).unwrap();
+        store
+            .update_with_project_path(
+                &target.id,
+                target.revision,
+                nested2.to_string_lossy().as_ref(),
+                |_| Ok(()),
+            )
+            .expect("nested workspace root via update is allowed");
+
+        // 完全相同的根仍然拒绝。
         assert!(matches!(
             store.create_with_project_path(
-                "Overlapping create",
+                "Duplicate root",
                 None,
                 nested.to_string_lossy(),
                 Vec::new(),
             ),
-            Err(ProjectStoreError::Validation(message)) if message.contains("overlaps")
+            Err(ProjectStoreError::Validation(message))
+                if message.contains("already registered")
         ));
-        assert_eq!(store.list().unwrap().len(), project_count);
 
-        let target = store.create("Target", None).unwrap();
-        assert!(matches!(
-            store.update_with_project_path(
-                &target.id,
-                target.revision,
-                nested.to_string_lossy().as_ref(),
-                |_| Ok(()),
-            ),
-            Err(ProjectStoreError::Validation(message)) if message.contains("overlaps")
-        ));
-        let unchanged = store.get(&target.id).unwrap();
-        assert_eq!(unchanged.revision, target.revision);
-        assert!(unchanged.project_path.is_none());
+        // 归属按最长匹配：内层路径归内层项目，外层归外层项目。
         assert_eq!(
             store
                 .find_workspace_owner_for_path(nested.to_string_lossy().as_ref())
+                .unwrap()
+                .map(|project| project.id),
+            Some(inner.id)
+        );
+        assert_eq!(
+            store
+                .find_workspace_owner_for_path(owner_root.to_string_lossy().as_ref())
                 .unwrap()
                 .map(|project| project.id),
             Some(owner.id)
@@ -2672,7 +2701,7 @@ mod tests {
     }
 
     #[test]
-    fn outer_then_inner_cross_project_binding_is_rejected() {
+    fn outer_then_inner_cross_project_binding_resolves_innermost() {
         let (temp, store) = store();
         let project_a = store.create("A", None).unwrap();
         let project_b = store.create("B", None).unwrap();
@@ -2683,37 +2712,10 @@ mod tests {
         store
             .bind_workspace(&project_a.id, project_a.revision, binding(&outer))
             .unwrap();
-        let error = store
-            .bind_workspace(&project_b.id, project_b.revision, binding(&inner))
-            .unwrap_err();
-        assert!(
-            matches!(error, ProjectStoreError::Validation(message) if message.contains("overlaps"))
-        );
-        let owner = store
-            .find_workspace_owner_for_path(candidate.to_string_lossy().as_ref())
-            .unwrap()
-            .unwrap();
-        assert_eq!(owner.id, project_a.id);
-    }
-
-    #[test]
-    fn inner_then_outer_cross_project_binding_is_rejected() {
-        let (temp, store) = store();
-        let project_a = store.create("A", None).unwrap();
-        let project_b = store.create("B", None).unwrap();
-        let outer = temp.path().join("outer");
-        let inner = outer.join("inner");
-        let candidate = inner.join("src");
-        std::fs::create_dir_all(&candidate).unwrap();
+        // 嵌套绑定现在允许；内层路径归内层项目（最长匹配）。
         store
             .bind_workspace(&project_b.id, project_b.revision, binding(&inner))
-            .unwrap();
-        let error = store
-            .bind_workspace(&project_a.id, project_a.revision, binding(&outer))
-            .unwrap_err();
-        assert!(
-            matches!(error, ProjectStoreError::Validation(message) if message.contains("overlaps"))
-        );
+            .expect("nested cross-project binding is allowed");
         let owner = store
             .find_workspace_owner_for_path(candidate.to_string_lossy().as_ref())
             .unwrap()
@@ -2722,7 +2724,29 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_external_and_internal_binding_overlap() {
+    fn inner_then_outer_cross_project_binding_resolves_innermost() {
+        let (temp, store) = store();
+        let project_a = store.create("A", None).unwrap();
+        let project_b = store.create("B", None).unwrap();
+        let outer = temp.path().join("outer");
+        let inner = outer.join("inner");
+        let candidate = inner.join("src");
+        std::fs::create_dir_all(&candidate).unwrap();
+        store
+            .bind_workspace(&project_b.id, project_b.revision, binding(&inner))
+            .unwrap();
+        store
+            .bind_workspace(&project_a.id, project_a.revision, binding(&outer))
+            .expect("enclosing cross-project binding is allowed");
+        let owner = store
+            .find_workspace_owner_for_path(candidate.to_string_lossy().as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.id, project_b.id);
+    }
+
+    #[test]
+    fn create_allows_nested_external_binding_and_rejects_internal_overlap() {
         let (temp, store) = store();
         let outer = temp.path().join("outer");
         let inner = outer.join("inner");
@@ -2732,9 +2756,12 @@ mod tests {
             .unwrap();
         let count = store.list().unwrap().len();
 
-        assert!(store
-            .create_with_bindings("external overlap", None, vec![binding(&outer)])
-            .is_err());
+        // 跨项目嵌套（外层包住别人的内层）允许。
+        store
+            .create_with_bindings("enclosing", None, vec![binding(&outer)])
+            .expect("nested external binding is allowed");
+        assert_eq!(store.list().unwrap().len(), count + 1);
+        // 同一项目自己的根重叠仍然拒绝。
         assert!(store
             .create_with_bindings(
                 "internal overlap",
@@ -2742,7 +2769,11 @@ mod tests {
                 vec![binding(&outer), binding(&inner)],
             )
             .is_err());
-        assert_eq!(store.list().unwrap().len(), count);
+        assert_eq!(store.list().unwrap().len(), count + 1);
+        // 与现有项目完全相同的根仍然拒绝。
+        assert!(store
+            .create_with_bindings("duplicate root", None, vec![binding(&inner)])
+            .is_err());
         assert_eq!(
             store
                 .find_workspace_owner(inner.to_string_lossy().as_ref())

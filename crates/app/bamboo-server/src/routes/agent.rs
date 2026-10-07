@@ -289,6 +289,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/sessions/{session_id}/project-dream/run",
             web::post().to(agent::sessions::run_project_dream),
         )
+        .route(
+            "/sessions/{session_id}/project-dream/run/{job_id}",
+            web::get().to(agent::sessions::get_project_dream_status),
+        )
         // Message management
         .route(
             "/sessions/{session_id}/messages/truncate",

@@ -27,8 +27,9 @@ pub mod bridge;
 pub mod platform;
 pub mod platforms;
 pub mod render;
+pub mod wechat_dream;
 
-pub use bridge::{ConnectBridge, ConnectContext, SessionKey};
+pub use bridge::{ConnectBridge, ConnectContext, ConnectSessionSummary, SessionKey};
 pub use platform::{
     Button, CallbackQuery, Capabilities, Inbound, InboundMessage, MessageRef, OutboundMessage,
     Platform, PlatformError, PlatformResult, ReplyCtx,
@@ -49,9 +50,17 @@ use bamboo_llm::Config;
 /// fire-and-forget background subsystem).
 pub struct ConnectManager {
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// The shared bridge — exposed so HTTP handlers can drive connect-session
+    /// management (list/create/switch/delete) against the live routing map.
+    bridge: Arc<ConnectBridge>,
 }
 
 impl ConnectManager {
+    /// The shared bridge handle (session map, chat state, session APIs).
+    pub fn bridge(&self) -> &Arc<ConnectBridge> {
+        &self.bridge
+    }
+
     /// Builds the bridge, loads its persisted session map, and starts one
     /// long-poll + one dispatch task per recognized platform entry in
     /// `config_snapshot.connect.platforms`. An empty (or absent) `[connect]`
@@ -235,7 +244,8 @@ impl ConnectManager {
                     }
                     let platform: Arc<dyn Platform> = Arc::new(
                         platforms::wechat::WechatPlatform::new(token, base_url, state_dir, voice)
-                            .with_trust_first_sender(platform_cfg.trust_first_sender),
+                            .with_trust_first_sender(platform_cfg.trust_first_sender)
+                            .with_typing_indicator(platform_cfg.typing_indicator),
                     );
                     spawn_platform_tasks(
                         &mut tasks,
@@ -250,7 +260,7 @@ impl ConnectManager {
             }
         }
 
-        Self { tasks }
+        Self { tasks, bridge }
     }
 }
 
@@ -443,6 +453,8 @@ mod tests {
     fn platform(platform_type: &str, token: Option<&str>) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
             voice: None,
+            dream: None,
+            auto_project: None,
             voice_api_key: None,
             voice_api_key_encrypted: None,
             voice_api_key_credential_ref: None,
@@ -462,6 +474,7 @@ mod tests {
             domain: None,
             allow_from: Vec::new(),
             trust_first_sender: false,
+            typing_indicator: true,
             admin_from: Vec::new(),
         }
     }

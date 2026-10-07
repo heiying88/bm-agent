@@ -761,14 +761,28 @@ export interface PatchSessionRequest {
 
 export interface RunProjectDreamResponse {
   success: boolean;
+  status: 'running' | 'already_running';
+  job_id: string;
   session_id: string;
-  project_key: string;
-  dream_generated: boolean;
+  project_id: string;
+}
+
+/** Polling result of GET sessions/{id}/project-dream/run/{job_id}. */
+export interface ProjectDreamStatusResponse {
+  success: boolean;
+  status: 'running' | 'succeeded' | 'failed';
+  job_id: string;
+  session_id: string;
+  project_id: string;
+  started_at: string;
+  finished_at?: string;
+  dream_generated?: boolean;
   used_model?: string;
   session_count?: number;
-  note_path?: string;
+  generated_at?: string;
   notebook_chars?: number;
   message?: string;
+  error?: string;
 }
 
 /** Response from POST /api/v1/child-approval/{child_session_id}. */
@@ -1719,11 +1733,28 @@ export class AgentClient {
 
   /**
    * Manually trigger project-scoped Dream generation for a session.
+   * The run executes asynchronously server-side; poll getProjectDreamStatus
+   * with the returned job_id until it settles.
    */
-  async runProjectDream(sessionId: string): Promise<RunProjectDreamResponse> {
+  async runProjectDream(
+    sessionId: string,
+    scope?: "project" | "session",
+  ): Promise<RunProjectDreamResponse> {
     const encodedSessionId = encodeURIComponent(sessionId);
     return agentApiClient.post<RunProjectDreamResponse>(
       `sessions/${encodedSessionId}/project-dream/run`,
+      scope ? { scope } : {},
+    );
+  }
+
+  /** Poll the status of an asynchronous project Dream run. */
+  async getProjectDreamStatus(
+    sessionId: string,
+    jobId: string,
+  ): Promise<ProjectDreamStatusResponse> {
+    const encodedSessionId = encodeURIComponent(sessionId);
+    return agentApiClient.get<ProjectDreamStatusResponse>(
+      `sessions/${encodedSessionId}/project-dream/run/${encodeURIComponent(jobId)}`,
     );
   }
 

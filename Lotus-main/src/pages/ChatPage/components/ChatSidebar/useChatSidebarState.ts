@@ -1287,7 +1287,7 @@ export const useChatSidebarState = () => {
   );
 
   const handleRunProjectDream = useCallback(
-    async (sessionId: string) => {
+    async (sessionId: string, scope?: "project" | "session") => {
       if (projectDreamState[sessionId]?.status === "loading") {
         return;
       }
@@ -1298,14 +1298,46 @@ export const useChatSidebarState = () => {
       }));
 
       const hide = message.loading(t("chat.actions.runProjectDreamRunning"), 0);
+      // Dream 在服务端异步跑（POST 立即返回 job_id），这里轮询到终态。
+      // 上限 10 分钟；轮询 404 视为任务状态丢失（服务可能重启过）。
+      const POLL_INTERVAL_MS = 3000;
+      const POLL_DEADLINE_MS = 10 * 60 * 1000;
+      const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+      const agent = AgentClient.getInstance();
       try {
-        const response = await AgentClient.getInstance().runProjectDream(sessionId);
-        hide();
-
-        if (response.dream_generated) {
-          message.success(t("chat.actions.runProjectDreamSuccess"));
-        } else {
-          message.info(response.message || t("chat.actions.runProjectDreamNoChange"));
+        const startResponse = await agent.runProjectDream(sessionId, scope);
+        const deadline = Date.now() + POLL_DEADLINE_MS;
+        for (;;) {
+          let status;
+          try {
+            status = await agent.getProjectDreamStatus(sessionId, startResponse.job_id);
+          } catch {
+            hide();
+            message.warning(t("chat.actions.runProjectDreamStatusLost"));
+            return;
+          }
+          if (status.status === "succeeded") {
+            hide();
+            if (status.dream_generated) {
+              message.success(t("chat.actions.runProjectDreamSuccess"));
+            } else {
+              message.info(status.message || t("chat.actions.runProjectDreamNoChange"));
+            }
+            break;
+          }
+          if (status.status === "failed") {
+            hide();
+            message.error(
+              status.error || t("chat.actions.runProjectDreamFailed"),
+            );
+            break;
+          }
+          if (Date.now() > deadline) {
+            hide();
+            message.warning(t("chat.actions.runProjectDreamTimeout"));
+            break;
+          }
+          await sleep(POLL_INTERVAL_MS);
         }
 
         try {
@@ -1331,7 +1363,7 @@ export const useChatSidebarState = () => {
     [message, projectDreamState, refreshChats, t],
   );
 
-  // Handles "delete all sessions in this Project group" (#134) — resolves
+    // Handles "delete all sessions in this Project group" (#134) — resolves
   // session ids from the currently-rendered group, clears them from panes,
   // and bulk-deletes.
   const handleDeleteByGroup = (groupKey: string) => {

@@ -6,6 +6,8 @@ import {
   Divider,
   Flex,
   Input,
+  InputNumber,
+  Popconfirm,
   Select,
   Switch,
   Tag,
@@ -18,6 +20,7 @@ import {
   type ConnectSection,
   type ConnectSectionDraftPlatform,
   type ConnectSectionPlatform,
+  type ConnectSessionSummary,
   type ConfigSectionEnvelope,
   type CredentialStatusView,
 } from "@services/config/configSections";
@@ -49,6 +52,14 @@ interface ConnectDraft {
   wechatFileAsr: boolean;
   wechatTtsModel: string;
   wechatTtsVoice: string;
+  /** Project Dream 触发方式：off | daily | idle（缺省 daily）。 */
+  wechatDreamMode: string;
+  /** daily 模式的每日运行时刻 HH:MM（缺省 03:00）。 */
+  wechatDreamDailyAt: string;
+  /** idle 模式的闲置阈值分钟（缺省 30）。 */
+  wechatDreamIdleMinutes: number;
+  /** 微信"正在输入中"指示（缺省开启）。 */
+  wechatTypingIndicator: boolean;
 }
 
 const findPlatform = (
@@ -61,6 +72,7 @@ function draftFromConfig(connect: ConnectSection | undefined): ConnectDraft {
   const feishu = findPlatform(connect?.platforms, "feishu");
   const wechat = findPlatform(connect?.platforms, "wechat");
   const voice = wechat?.voice;
+  const dream = wechat?.dream;
   return {
     telegramEnabled: Boolean(telegram),
     telegramToken: "",
@@ -79,6 +91,10 @@ function draftFromConfig(connect: ConnectSection | undefined): ConnectDraft {
     wechatFileAsr: voice?.file_asr === "on",
     wechatTtsModel: voice?.tts_model ?? "",
     wechatTtsVoice: voice?.tts_voice ?? "",
+    wechatDreamMode: dream?.mode ?? "daily",
+    wechatDreamDailyAt: dream?.daily_at ?? "03:00",
+    wechatDreamIdleMinutes: dream?.idle_minutes ?? 30,
+    wechatTypingIndicator: wechat?.typing_indicator ?? true,
   };
 }
 
@@ -136,6 +152,10 @@ const SystemSettingsConnectTab: React.FC = () => {
   );
   const [qrError, setQrError] = useState<string | null>(null);
   const qrPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [wechatSessions, setWechatSessions] = useState<ConnectSessionSummary[] | null>(null);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [sessionsError, setSessionsError] = useState<string | null>(null);
+  const [sessionActionError, setSessionActionError] = useState<string | null>(null);
   const [showComparison, setShowComparison] = useState(false);
   const baseDraftRef = useRef<ConnectDraft | null>(null);
   const snapshot = useConfigSectionStore((state) => state.sections.connect);
@@ -291,6 +311,17 @@ const SystemSettingsConnectTab: React.FC = () => {
           ...(draft.wechatTtsModel.trim() ? { tts_model: draft.wechatTtsModel.trim() } : {}),
           ...(draft.wechatTtsVoice.trim() ? { tts_voice: draft.wechatTtsVoice.trim() } : {}),
         },
+        // `dream` 与 voice 同款整体替换语义；空值回落服务端默认。
+        dream: {
+          mode: draft.wechatDreamMode,
+          ...(draft.wechatDreamDailyAt.trim()
+            ? { daily_at: draft.wechatDreamDailyAt.trim() }
+            : {}),
+          ...(Number.isFinite(draft.wechatDreamIdleMinutes)
+            ? { idle_minutes: draft.wechatDreamIdleMinutes }
+            : {}),
+        },
+        typing_indicator: draft.wechatTypingIndicator,
         allow_from: draft.wechatAllowFrom,
         admin_from: storedWechat?.admin_from ?? [],
       });
@@ -532,6 +563,47 @@ const SystemSettingsConnectTab: React.FC = () => {
       setQrPhase("idle");
     }
   };
+
+  // ---- 微信网关会话管理（列表 / 新建 / 切换 / 删除）----
+
+  const loadWechatSessions = useCallback(async () => {
+    setSessionsLoading(true);
+    setSessionsError(null);
+    try {
+      setWechatSessions(await configSectionsService.listConnectSessions("wechat"));
+    } catch (error) {
+      setSessionsError(redactConfigError(getErrorMessage(error)));
+    } finally {
+      setSessionsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (draft.wechatEnabled) {
+      void loadWechatSessions();
+    } else {
+      setWechatSessions(null);
+    }
+  }, [draft.wechatEnabled, loadWechatSessions]);
+
+  const runSessionAction = async (action: () => Promise<void>) => {
+    setSessionActionError(null);
+    try {
+      await action();
+      await loadWechatSessions();
+    } catch (error) {
+      setSessionActionError(redactConfigError(getErrorMessage(error)));
+    }
+  };
+
+  const createSessionForRow = (row: ConnectSessionSummary) =>
+    runSessionAction(async () => {
+      await configSectionsService.createConnectSession({
+        platform: row.platform,
+        chat_id: row.chat_id,
+        user_id: row.user_id,
+      });
+    });
 
   return (
     <Card size="small" className="lotus-settings-card" loading={loading}>
@@ -872,6 +944,24 @@ const SystemSettingsConnectTab: React.FC = () => {
               ) : null}
 
               <Divider style={{ margin: `${token.marginXS}px 0` }} />
+              <Flex align="center" justify="space-between" gap={token.marginSM}>
+                <Flex vertical>
+                  <Text style={{ fontSize: token.fontSizeSM }}>
+                    {t("settings.connectTab.wechat.typingIndicator")}
+                  </Text>
+                  <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                    {t("settings.connectTab.wechat.typingIndicatorDescription")}
+                  </Text>
+                </Flex>
+                <Switch
+                  data-testid="connect-wechat-typing-indicator"
+                  checked={draft.wechatTypingIndicator}
+                  onChange={(checked) => patch({ wechatTypingIndicator: checked })}
+                  aria-label={t("settings.connectTab.wechat.typingIndicator")}
+                />
+              </Flex>
+
+              <Divider style={{ margin: `${token.marginXS}px 0` }} />
               <Text style={{ fontSize: token.fontSizeSM }}>
                 {t("settings.connectTab.wechat.voiceTitle")}
               </Text>
@@ -981,6 +1071,169 @@ const SystemSettingsConnectTab: React.FC = () => {
                   placeholder={t("settings.connectTab.wechat.ttsVoicePlaceholder")}
                 />
               </label>
+
+              <Divider style={{ margin: `${token.marginXS}px 0` }} />
+              <Text style={{ fontSize: token.fontSizeSM }}>
+                {t("settings.connectTab.wechat.dreamTitle")}
+              </Text>
+              <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                {t("settings.connectTab.wechat.dreamDescription")}
+              </Text>
+              <label>
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.dreamMode")}
+                </Text>
+                <Select<string>
+                  data-testid="connect-wechat-dream-mode"
+                  value={draft.wechatDreamMode}
+                  onChange={(value) => patch({ wechatDreamMode: value })}
+                  style={{ width: "100%" }}
+                  options={[
+                    {
+                      value: "off",
+                      label: t("settings.connectTab.wechat.dreamModeOff"),
+                    },
+                    {
+                      value: "daily",
+                      label: t("settings.connectTab.wechat.dreamModeDaily"),
+                    },
+                    {
+                      value: "idle",
+                      label: t("settings.connectTab.wechat.dreamModeIdle"),
+                    },
+                  ]}
+                />
+              </label>
+              {draft.wechatDreamMode === "daily" ? (
+                <label>
+                  <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                    {t("settings.connectTab.wechat.dreamDailyAt")}
+                  </Text>
+                  <Input
+                    data-testid="connect-wechat-dream-daily-at"
+                    value={draft.wechatDreamDailyAt}
+                    onChange={(e) => patch({ wechatDreamDailyAt: e.target.value })}
+                    placeholder="03:00"
+                  />
+                </label>
+              ) : null}
+              {draft.wechatDreamMode === "idle" ? (
+                <label>
+                  <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                    {t("settings.connectTab.wechat.dreamIdleMinutes")}
+                  </Text>
+                  <InputNumber
+                    data-testid="connect-wechat-dream-idle-minutes"
+                    value={draft.wechatDreamIdleMinutes}
+                    min={1}
+                    max={1440}
+                    onChange={(value) =>
+                      patch({ wechatDreamIdleMinutes: value ?? 30 })
+                    }
+                    style={{ width: "100%" }}
+                  />
+                </label>
+              ) : null}
+
+              <Divider style={{ margin: `${token.marginXS}px 0` }} />
+              <Flex align="center" justify="space-between" gap={token.marginSM} wrap="wrap">
+                <Text style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.sessionsTitle")}
+                </Text>
+                <Button
+                  size="small"
+                  data-testid="connect-wechat-sessions-refresh"
+                  loading={sessionsLoading}
+                  onClick={() => void loadWechatSessions()}
+                >
+                  {t("settings.connectTab.wechat.sessionsRefresh")}
+                </Button>
+              </Flex>
+              <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                {t("settings.connectTab.wechat.sessionsDescription")}
+              </Text>
+              {sessionsError ? (
+                <Alert type="error" showIcon message={sessionsError} />
+              ) : null}
+              {sessionActionError ? (
+                <Alert
+                  type="error"
+                  showIcon
+                  message={sessionActionError}
+                  closable
+                  onClose={() => setSessionActionError(null)}
+                />
+              ) : null}
+              {wechatSessions !== null && wechatSessions.length === 0 ? (
+                <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                  {t("settings.connectTab.wechat.sessionsEmpty")}
+                </Text>
+              ) : null}
+              {wechatSessions?.map((row) => (
+                <Flex
+                  key={row.session_id}
+                  vertical
+                  gap={token.marginXXS}
+                  style={{
+                    border: `1px solid ${token.colorBorderSecondary}`,
+                    borderRadius: token.borderRadius,
+                    padding: token.marginXS,
+                  }}
+                >
+                  <Flex align="center" justify="space-between" gap={token.marginXS} wrap="wrap">
+                    <Flex align="center" gap={token.marginXS} wrap="wrap">
+                      <Text style={{ fontSize: token.fontSizeSM }}>{row.title}</Text>
+                      {row.is_current ? (
+                        <Tag color="success">
+                          {t("settings.connectTab.wechat.sessionsCurrent")}
+                        </Tag>
+                      ) : null}
+                    </Flex>
+                    <Flex gap={token.marginXXS} wrap="wrap">
+                      <Button
+                        size="small"
+                        data-testid="connect-wechat-session-new"
+                        onClick={() => void createSessionForRow(row)}
+                      >
+                        {t("settings.connectTab.wechat.sessionsNew")}
+                      </Button>
+                      <Button
+                        size="small"
+                        disabled={row.is_current}
+                        onClick={() =>
+                          void runSessionAction(async () => {
+                            await configSectionsService.activateConnectSession(
+                              row.session_id,
+                              row.connect_key,
+                            );
+                          })
+                        }
+                      >
+                        {t("settings.connectTab.wechat.sessionsActivate")}
+                      </Button>
+                      <Popconfirm
+                        title={t("settings.connectTab.wechat.sessionsDeleteConfirm")}
+                        onConfirm={() =>
+                          void runSessionAction(async () => {
+                            await configSectionsService.deleteConnectSession(row.session_id);
+                          })
+                        }
+                      >
+                        <Button size="small" danger>
+                          {t("settings.connectTab.wechat.sessionsDelete")}
+                        </Button>
+                      </Popconfirm>
+                    </Flex>
+                  </Flex>
+                  <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                    {row.chat_id} · {row.message_count} ·{" "}
+                    {new Date(row.updated_at).toLocaleString()}
+                  </Text>
+                </Flex>
+              ))}
+              <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                {t("settings.connectTab.wechat.sessionsBusyHint")}
+              </Text>
             </Flex>
 
             {saveError ? <Alert type="error" showIcon message={saveError} /> : null}

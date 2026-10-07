@@ -541,6 +541,8 @@ fn redact_config_masks_configured_connect_platform_token() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
         voice: None,
+        dream: None,
+        auto_project: None,
         voice_api_key: None,
         voice_api_key_encrypted: None,
         voice_api_key_credential_ref: None,
@@ -560,6 +562,7 @@ fn redact_config_masks_configured_connect_platform_token() {
         domain: None,
         allow_from: vec!["123".to_string()],
         trust_first_sender: false,
+        typing_indicator: true,
         admin_from: Vec::new(),
     }];
 
@@ -584,6 +587,8 @@ fn redact_config_omits_unconfigured_connect_platform_token() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
         voice: None,
+        dream: None,
+        auto_project: None,
         voice_api_key: None,
         voice_api_key_encrypted: None,
         voice_api_key_credential_ref: None,
@@ -603,6 +608,7 @@ fn redact_config_omits_unconfigured_connect_platform_token() {
         domain: None,
         allow_from: Vec::new(),
         trust_first_sender: false,
+        typing_indicator: true,
         admin_from: Vec::new(),
     }];
 
@@ -642,6 +648,8 @@ fn redact_config_masks_configured_connect_platform_app_secret_but_not_app_id_or_
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
         voice: None,
+        dream: None,
+        auto_project: None,
         voice_api_key: None,
         voice_api_key_encrypted: None,
         voice_api_key_credential_ref: None,
@@ -661,6 +669,7 @@ fn redact_config_masks_configured_connect_platform_app_secret_but_not_app_id_or_
         domain: Some("lark".to_string()),
         allow_from: vec!["ou_1".to_string()],
         trust_first_sender: false,
+        typing_indicator: true,
         admin_from: Vec::new(),
     }];
 
@@ -691,6 +700,8 @@ fn redact_config_omits_unconfigured_connect_platform_app_secret() {
     let mut config = Config::default();
     config.connect.platforms = vec![bamboo_config::ConnectPlatformConfig {
         voice: None,
+        dream: None,
+        auto_project: None,
         voice_api_key: None,
         voice_api_key_encrypted: None,
         voice_api_key_credential_ref: None,
@@ -710,6 +721,7 @@ fn redact_config_omits_unconfigured_connect_platform_app_secret() {
         domain: None,
         allow_from: Vec::new(),
         trust_first_sender: false,
+        typing_indicator: true,
         admin_from: Vec::new(),
     }];
 

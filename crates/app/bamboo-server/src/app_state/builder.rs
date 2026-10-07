@@ -1123,6 +1123,7 @@ impl AppState {
                 agent.clone(),
                 tool_factory.get(crate::tools::ToolSurface::Root),
                 session_repo.clone(),
+                session_store.clone(),
                 agent_runners.clone(),
                 session_event_senders.clone(),
                 Some(account_sink.inbox()),
@@ -1135,6 +1136,22 @@ impl AppState {
             )
             .await
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?,
+        );
+
+        // 微信网关 Project Dream 计划任务（daily HH:MM 或闲置阈值触发）。
+        // 常驻但惰性：没有 wechat 条目或 dream.mode=off 时每轮空转。
+        crate::connect::wechat_dream::spawn_wechat_dream_task(
+            connect_manager.bridge().clone(),
+            bamboo_engine::auto_dream::AutoDreamContext {
+                session_store: session_store.clone(),
+                storage: storage.clone(),
+                memory: memory_store.clone(),
+                provider: provider_handle.clone(),
+                config: config.clone(),
+                provider_registry: provider_registry.clone(),
+            },
+            project_store.clone(),
+            Some(data_dir.clone()),
         );
 
         // Dedicated child-session adapter backing the guardian review spawner.

@@ -248,6 +248,23 @@ export interface ConnectPlatformConfig {
    */
   voice?: WechatVoiceConfig;
   /**
+   * WeChat gateway Project Dream schedule — the `dream` section. `daily`
+   * runs Project Dream for the gateway's project every day at `daily_at`
+   * (HH:MM, default 03:00); `idle` runs it once the gateway has been idle
+   * for `idle_minutes` minutes. Submitting replaces the whole section;
+   * absent/null preserves the stored one.
+   */
+  dream?: WechatDreamConfig;
+  /**
+   * WeChat gateway auto-project — the `auto_project` section. When enabled
+   * (default), the first inbound message find-or-creates the named Project
+   * (default "微信工作") with its workspace at the named folder under the
+   * data dir (default `work_wechat`) and assigns gateway sessions to it.
+   */
+  auto_project?: WechatAutoProjectConfig;
+  /** WeChat typing indicator ("正在输入中") while the agent runs. Default true. */
+  typing_indicator?: boolean;
+  /**
    * Platform-scoped user/open ids allowed to drive a session. An EMPTY list
    * means deny-all (every inbound message is rejected) — deliberately
    * stricter than other allow-list precedents in this app.
@@ -277,6 +294,35 @@ export interface WechatVoiceConfig {
   delivery?: string;
   asr_model?: string;
   file_asr?: string;
+}
+
+/**
+ * WeChat gateway Project Dream schedule (`dream` section of a wechat connect
+ * platform). Mirrors `bamboo_config::WechatDreamConfig` — every field
+ * optional with server-side defaults (mode=daily, daily_at="03:00",
+ * idle_minutes=30); `off` disables scheduled dreaming entirely.
+ */
+export interface WechatDreamConfig {
+  /** `"off"` | `"daily"` | `"idle"` (default `daily`). */
+  mode?: string;
+  /** daily mode's run time, `HH:MM` (default `"03:00"`). */
+  daily_at?: string;
+  /** idle mode's threshold in minutes, 1–1440 (default 30). */
+  idle_minutes?: number;
+}
+
+/**
+ * WeChat gateway auto-project (`auto_project` section of a wechat connect
+ * platform). Mirrors `bamboo_config::WechatAutoProjectConfig` — enabled by
+ * default; the first inbound message find-or-creates the Project.
+ */
+export interface WechatAutoProjectConfig {
+  /** Default true. */
+  enabled?: boolean;
+  /** Default "微信工作". */
+  name?: string;
+  /** Single folder name under the data dir; default `work_wechat`. */
+  workspace?: string;
 }
 
 export interface ConnectConfig {

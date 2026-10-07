@@ -2621,6 +2621,7 @@ async fn run_auto_dream_once_for_scope(
     project_key: Option<&str>,
     require_auto_dream_enabled: bool,
     project_resolver: Option<&ProjectContextResolver>,
+    session_filter: Option<&str>,
 ) -> Result<Option<AutoDreamRunResult>, String> {
     let scope_label = match scope {
         MemoryScope::Global => "global",
@@ -2672,6 +2673,15 @@ async fn run_auto_dream_once_for_scope(
         MemoryScope::Session => {
             return Err("session-scoped Dream generation is not supported".to_string())
         }
+    };
+    // “仅本会话”手动触发：候选来源过滤为指定会话（含其子会话，按根去重后已经至多一条）；
+    // 其余管线（既有 Dream 输入、写入位置、提取水位）与整项目 Dream 完全一致。
+    let sessions = match session_filter {
+        Some(session_id) => sessions
+            .into_iter()
+            .filter(|(entry, _)| entry.id == session_id || entry.root_session_id == session_id)
+            .collect::<Vec<_>>(),
+        None => sessions,
     };
     if sessions.is_empty() {
         tracing::info!(
@@ -2843,7 +2853,7 @@ async fn run_auto_dream_once_with_store(
     ctx: &AutoDreamContext,
     memory: &MemoryStore,
 ) -> Result<Option<AutoDreamRunResult>, String> {
-    run_auto_dream_once_for_scope(ctx, memory, MemoryScope::Global, None, true, None).await
+    run_auto_dream_once_for_scope(ctx, memory, MemoryScope::Global, None, true, None, None).await
 }
 
 pub async fn run_auto_dream_once(
@@ -2865,6 +2875,7 @@ pub async fn run_auto_dream_once_with_project_resolver(
         None,
         true,
         Some(project_resolver),
+        None,
     )
     .await
 }
@@ -2876,6 +2887,33 @@ pub async fn run_project_auto_dream_once_for_project(
 ) -> Result<Option<AutoDreamRunResult>, String> {
     let memory = memory_store_for_context(ctx).for_project(project_id);
     run_project_auto_dream_once_with_store(ctx, &memory, project_id.as_str()).await
+}
+
+/// 手动"仅本会话"触发：与 [`run_project_auto_dream_once_for_project`] 完全
+/// 相同的管线（既有项目 Dream 笔记仍是输入、写入项目记忆、同一隐私过
+/// 滤），唯一区别是候选会话来源只保留指定会话（含其子会话）。效果是把
+/// 这一个会话增量整合进项目记忆，且只消耗它的提取水位——同项目其他
+/// 会话仍留给下一次整项目 Dream。
+pub async fn run_project_auto_dream_once_for_session(
+    ctx: &AutoDreamContext,
+    project_id: &bamboo_domain::ProjectId,
+    session_id: &str,
+) -> Result<Option<AutoDreamRunResult>, String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Err("session-scoped Dream generation requires a session id".to_string());
+    }
+    let memory = memory_store_for_context(ctx).for_project(project_id);
+    run_auto_dream_once_for_scope(
+        ctx,
+        &memory,
+        MemoryScope::Project,
+        Some(project_id.as_str()),
+        false,
+        None,
+        Some(session_id),
+    )
+    .await
 }
 
 async fn run_project_auto_dream_once_with_store(
@@ -2893,6 +2931,7 @@ async fn run_project_auto_dream_once_with_store(
         MemoryScope::Project,
         Some(project_key),
         false,
+        None,
         None,
     )
     .await

@@ -7580,6 +7580,8 @@ for line in sys.stdin:
                 .platforms
                 .push(bamboo_config::ConnectPlatformConfig {
                     voice: None,
+                    dream: None,
+                    auto_project: None,
                     voice_api_key: None,
                     voice_api_key_encrypted: None,
                     voice_api_key_credential_ref: None,
@@ -7599,6 +7601,7 @@ for line in sys.stdin:
                     domain: None,
                     allow_from: Vec::new(),
                     trust_first_sender: false,
+                    typing_indicator: true,
                     admin_from: Vec::new(),
                 });
             live.providers_mut().openai = Some(bamboo_config::OpenAIConfig {

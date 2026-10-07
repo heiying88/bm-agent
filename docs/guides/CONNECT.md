@@ -198,10 +198,13 @@ iLink 的 token 有效期未公开，实测错误码 `ret=-14` 表示会话过�
   建立后 `/new`、`/stop`、`/status` 等通道命令才可用。
 - **会话级运行覆盖命令**（所有平台通用，对正在运行的当前轮不生效，
   下一条消息起生效；`/new` 开新会话后回到配置默认）：
-  - `/think` 查询当前智能度；`/think high` 切换（none/low/medium/high/
+  - `/think` 查询当前智能度；`/think high` 切换（`/switch_think` 为
+    同义别名；命令里的全角斜杠／与全角空格也按半角识别，
+    全角数字序号同样可用）；档位 none/low/medium/high/
     xhigh/max，中文别名 关/低/中/高/超高/最大 也认）；`/think reset` 恢复默认；
   - `/models` 列出配置里已配好的模型（各 provider 实例的主/快速/视觉模型）；
-  - `/model` 查询当前模型；`/model glm-5.3-flash` 切换（支持唯一部分匹配，
+  - `/model` 查询当前模型；`/model glm-5.3-flash` 切换（`/switch_model` 为同义
+    别名，避免与会话切换的 `/switch` 混淆；支持唯一部分匹配，
     如 flash）；`/model reset` 恢复默认。切换会同时路由到该模型所属的
     provider 实例；若该模型后来从配置中移除，自动回配置默认并告警。
   - **自然语言切换**：直接说"换个便宜点的模型""用心想想"等任何说法，
@@ -210,6 +213,45 @@ iLink 的 token 有效期未公开，实测错误码 `ret=-14` 表示会话过�
   - **审批模式自然语言切换**：说"别再逐条确认了""以后自动同意"等，模型附
     [SET_PERMISSION: auto/default] 标记（不显示）实现同等切换，语义与
     回复"都允许/恢复确认"相同。
+
+- **会话管理命令**（所有平台通用；即时应答，不进忙队列）：
+  - `/new` 丢弃当前会话映射，下一条消息自动开新会话；
+  - `/sessions`（或 `/list`）列出本聊天的全部历史会话（按更新时间倒序，
+    当前会话带 ✅ 标记）；
+  - `/switch <序号>`（别名 `/session <序号>`）切回 `/sessions` 列表里的某个
+    历史会话，下一条消息继续它；
+  - `/del <序号>`（或 `/delete <序号>`）删除列表里的某个会话；删的是当前
+    会话时，下一条消息会自动创建新会话。聊天有任务运行中时切换/删除会被
+    拒绝（先 `/stop`）。
+
+## 4a. 微信网关专属：自动项目、会话面板与 Project Dream 计划
+
+- **自动项目（auto_project）**：微信条目未显式配置 `project_id` 时，收到
+  第一条消息会自动创建（或复用同名活跃项目）「微信工作」项目，工作区指向
+  数据目录下的 `work_wechat` 文件夹（不存在则创建），此后该网关的所有新
+  会话都归属这个项目。`connect.platforms[type=wechat].auto_project` 可调：
+  `enabled`（默认 true）、`name`（默认「微信工作」）、`workspace`（默认
+  `work_wechat`；也可以是绝对路径，如 `D:\work_wechat`）。
+  工作区可以**嵌套**在现有项目的工作区之内（如某项目把整个用户主
+  目录声明为工作区也不影响）；路径归属按最长匹配解析到最内层项目。
+  只有与现有项目根**完全相同**时才递增编号：`work_wechat`、
+  `work_wechat_1`、…，全部位于数据目录下；全部候选失败时记录明确的
+  配置指引，会话继续在无项目归属下工作。
+- **Project Dream 计划（dream）**：对微信网关所属项目自动运行 Project Dream
+  （项目记忆整理）。`connect.platforms[type=wechat].dream` 段可配：
+  - `mode`：`daily`（默认，每天定时）| `idle`（闲置触发，即"项目休息时间"）
+    | `off`（关闭）；
+  - `daily_at`：daily 模式的每日运行时刻，`HH:MM`（默认 `03:00`，本地时区）；
+  - `idle_minutes`：idle 模式的闲置阈值分钟数 1–1440（默认 30）——网关
+    连续这么多分钟没有新消息后自动跑一次，新消息会重置计时。
+  - 运行状态（当日已跑标记 / 上次 dream 时间）持久化在
+    `connect_wechat_dream_state.json`，重启不重复跑当日份额。
+- **Web 会话面板**：设置页「连接 → 微信」区块可直接管理网关会话——列出
+  该网关的全部会话（标题、聊天、消息数、更新时间、当前标记），一键
+  新建会话、把某聊天切回历史会话、或删除会话。对应 HTTP API：
+  `GET/POST /api/v1/bamboo/connect/sessions`、
+  `POST /api/v1/bamboo/connect/sessions/{id}/activate`、
+  `DELETE /api/v1/bamboo/connect/sessions/{id}`。
 
 ## 5. 多平台 / 多 bot
 

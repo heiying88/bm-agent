@@ -23,8 +23,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::{Mutex as StdMutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -348,6 +348,24 @@ impl RateLimiter {
 // ---------------------------------------------------------------------------
 // iLink 线格式（只声明本适配器用到的字段；serde 默认忽略未知字段）
 // ---------------------------------------------------------------------------
+
+/// getconfig 响应（typing_ticket 在顶层；线格式对齐官方插件 GetConfigResp）。
+#[derive(Debug, serde::Deserialize)]
+struct GetConfigResponse {
+    #[serde(default)]
+    ret: i64,
+    #[serde(default)]
+    errmsg: Option<String>,
+    #[serde(default)]
+    typing_ticket: Option<String>,
+}
+
+/// typing_ticket 缓存有效期（官方 ~24h，保守取 12h，失败即刷新）。
+const TYPING_TICKET_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+
+/// sendtyping 的 status 取值（官方 TypingStatus）：1=开始输入，2=取消。
+const TYPING_STATUS_TYPING: i64 = 1;
+const TYPING_STATUS_CANCEL: i64 = 2;
 
 /// `getupdates` 响应。
 #[derive(Debug, serde::Deserialize)]
@@ -699,6 +717,11 @@ pub struct WechatPlatform {
     state_dir: Option<PathBuf>,
     /// "信任首个发信人"开关（v0.0.4；扫码登录端点默认开启）。
     trust_first_sender: bool,
+    /// "正在输入中"指示开关（iLink sendtyping；默认开启）。
+    typing_indicator: bool,
+    /// 每用户 typing_ticket 缓存（getconfig 获取，12h TTL；std 锁只在
+    /// 读取/写入时短暂持有，从不跨 `.await`）。
+    typing_tickets: StdMutex<HashMap<String, (String, std::time::Instant)>>,
     /// 已记录的首信人（配置加载或首条消息写入；持久化在
     /// `{state_dir}/first_sender.json`）。
     first_sender: RwLock<Option<String>>,
@@ -750,6 +773,8 @@ impl WechatPlatform {
             token: RwLock::new(token),
             state_dir,
             trust_first_sender: false,
+            typing_indicator: true,
+            typing_tickets: StdMutex::new(HashMap::new()),
             first_sender: RwLock::new(None),
             voice,
             observed_voice_encode_type: AtomicI64::new(0),
@@ -765,6 +790,127 @@ impl WechatPlatform {
     fn with_cdn_base(mut self, cdn_base_url: String) -> Self {
         self.cdn_base_url = cdn_base_url;
         self
+    }
+
+    /// 设置"正在输入中"指示开关（默认开启）。
+    pub(crate) fn with_typing_indicator(mut self, enabled: bool) -> Self {
+        self.typing_indicator = enabled;
+        self
+    }
+
+    /// 取（或经 getconfig 获取并缓存）指定用户的 typing_ticket。票据
+    /// 失效/被网关拒绝时由 send 侧删除缓存条目，下一轮自然重取。
+    async fn typing_ticket_for(
+        &self,
+        to_user_id: &str,
+        context_token: &str,
+    ) -> PlatformResult<String> {
+        {
+            let tickets = self.typing_tickets.lock().expect("typing tickets lock");
+            if let Some((ticket, fetched_at)) = tickets.get(to_user_id) {
+                if fetched_at.elapsed() < TYPING_TICKET_TTL && !ticket.is_empty() {
+                    return Ok(ticket.clone());
+                }
+            }
+        }
+        let url = format!("{}/ilink/bot/getconfig", self.base_url());
+        let body = serde_json::json!({
+            "ilink_user_id": to_user_id,
+            "context_token": context_token,
+            "base_info": { "channel_version": CHANNEL_VERSION },
+        });
+        let response = self
+            .ilink_request(reqwest::Method::POST, &url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                PlatformError::other(format!(
+                    "getconfig request failed: {}",
+                    self.sanitize_error(error)
+                ))
+            })?;
+        let parsed: GetConfigResponse = response.json().await.map_err(|error| {
+            PlatformError::other(format!(
+                "getconfig response parse failed: {}",
+                self.sanitize_error(error)
+            ))
+        })?;
+        if parsed.ret != 0 {
+            return Err(ret_error("getconfig", parsed.ret, parsed.errmsg));
+        }
+        let ticket = parsed
+            .typing_ticket
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlatformError::other("getconfig returned no typing_ticket"))?;
+        tracing::info!("connect: wechat getconfig typing_ticket cached for {to_user_id}");
+        self.typing_tickets
+            .lock()
+            .expect("typing tickets lock")
+            .insert(
+                to_user_id.to_string(),
+                (ticket.clone(), std::time::Instant::now()),
+            );
+        Ok(ticket)
+    }
+
+    /// 发送一次 sendtyping（status：1=typing / 2=cancel）。票据相关失败
+    /// 时顺带失效缓存，下一轮 typing 自然重取。
+    async fn send_typing_request(
+        &self,
+        to_user_id: &str,
+        ticket: &str,
+        status: i64,
+    ) -> PlatformResult<()> {
+        let url = format!("{}/ilink/bot/sendtyping", self.base_url());
+        let body = serde_json::json!({
+            "ilink_user_id": to_user_id,
+            "typing_ticket": ticket,
+            "status": status,
+            "base_info": { "channel_version": CHANNEL_VERSION },
+        });
+        let response = self
+            .ilink_request(reqwest::Method::POST, &url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                PlatformError::other(format!(
+                    "sendtyping request failed: {}",
+                    self.sanitize_error(error)
+                ))
+            })?;
+        let parsed: SendResponse = response.json().await.map_err(|error| {
+            PlatformError::other(format!(
+                "sendtyping response parse failed: {}",
+                self.sanitize_error(error)
+            ))
+        })?;
+        tracing::info!(
+            "connect: wechat sendtyping to={to_user_id} status={status} ret={} errcode={} errmsg={:?}",
+            parsed.ret,
+            parsed.errcode,
+            parsed.errmsg,
+        );
+        if parsed.ret != 0 || parsed.errcode != 0 {
+            if parsed
+                .errmsg
+                .as_deref()
+                .is_some_and(|message| message.contains("ticket"))
+            {
+                self.typing_tickets
+                    .lock()
+                    .expect("typing tickets lock")
+                    .remove(to_user_id);
+            }
+            return Err(ret_error_full(
+                "sendtyping",
+                parsed.ret,
+                parsed.errcode,
+                parsed.errmsg.clone(),
+            ));
+        }
+        Ok(())
     }
 
     /// 开启"信任首个发信人"闩锁（v0.0.4；扫码登录端点默认开启）。
@@ -2125,6 +2271,63 @@ impl Platform for WechatPlatform {
                     }
                 }
             }
+        }
+    }
+
+    /// "正在输入中"指示（iLink `sendtyping`，线格式对齐官方
+    /// @tencent-weixin/openclaw-weixin 的 SendTypingReq：
+    /// `{ilink_user_id, typing_ticket, status, base_info}`，status 1=typing。
+    /// `typing_ticket` 经 `getconfig`（`{ilink_user_id, context_token,
+    /// base_info}`，响应顶层 `typing_ticket`）按用户获取并缓存（~24h 内
+    /// 有效，官方按 5s keepalive 重发）。best-effort：失败只记日志，绝不
+    /// 影响运行本身。
+    async fn send_typing(&self, ctx: &ReplyCtx) -> PlatformResult<()> {
+        if !self.typing_indicator {
+            return Ok(());
+        }
+        let to_user_id = ctx
+            .0
+            .get("to_user_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlatformError::other("reply_ctx is missing to_user_id"))?
+            .to_string();
+        let context_token = ctx
+            .0
+            .get("context_token")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlatformError::other("reply_ctx is missing context_token"))?
+            .to_string();
+
+        let ticket = self.typing_ticket_for(&to_user_id, &context_token).await?;
+        self.send_typing_request(&to_user_id, &ticket, TYPING_STATUS_TYPING)
+            .await
+    }
+
+    /// 停止"正在输入中"（status=2 cancel）。仅在已有票据时发送；无票据
+    /// 说明从未开始过，直接成功。
+    async fn stop_typing(&self, ctx: &ReplyCtx) -> PlatformResult<()> {
+        if !self.typing_indicator {
+            return Ok(());
+        }
+        let to_user_id = ctx
+            .0
+            .get("to_user_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| PlatformError::other("reply_ctx is missing to_user_id"))?
+            .to_string();
+        let cached = {
+            let tickets = self.typing_tickets.lock().expect("typing tickets lock");
+            tickets.get(&to_user_id).map(|(ticket, _)| ticket.clone())
+        };
+        match cached {
+            Some(ticket) => {
+                self.send_typing_request(&to_user_id, &ticket, TYPING_STATUS_CANCEL)
+                    .await
+            }
+            None => Ok(()),
         }
     }
 

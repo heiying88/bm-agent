@@ -12,6 +12,37 @@
 而非 SemVer 点版本。nightly 之间的变更记录在 git 历史与已合并 PR（事实源）中；
 下面的 SemVer 小节仅为历史上的 `0.x` 版本保留。
 
+- 手动"仅本会话"梦境整合：POST project-dream/run 新增可选 body
+  {"scope":"session"}（默认 project），只把触发会话增量整合进项目记忆、
+  只消耗它的提取水位，同项目其他会话留给下一次整项目 Dream；前端会话
+  菜单新增"运行梦境（仅本会话）"。
+- 微信「正在输入中」指示（iLink sendtyping，picoclaw/openclaw 同款）：
+  机器人后台思考期间每 8 秒发一次 typing 状态，发出首条回复即停；
+  connect.platforms[type=wechat].typing_indicator 可关（默认开启），设置
+  页微信区块有开关。
+### Added
+
+- 微信网关会话管理补全：聊天内 `/sessions`、`/switch <序号>`、
+  `/del <序号>` 命令（模型切换另有显式 `/switch_model` 别名）与 Web 端（设置 → 连接 → 微信）会话面板（列表 /
+  新建 / 切换 / 删除；`GET/POST /api/v1/bamboo/connect/sessions` 等）。
+- 项目工作区支持嵌套：创建校验只拒绝与现有项目完全相同的根，归属
+  解析按最长匹配选最内层项目；自动项目工作区冲突时在数据目录内
+  递增编号（work_wechat、work_wechat_1、…），`auto_project.workspace`
+  支持绝对路径显式指定。
+- 微信网关首条消息自动创建「微信工作」项目（工作区为数据目录下
+  `work_wechat`，不存在则创建）并把网关会话归属该项目；
+  `auto_project` 段可调（enabled/name/workspace）。
+- 微信网关 Project Dream 自动运行计划：`dream` 段支持 `daily`（每天
+  `daily_at` 时刻，默认 03:00）与 `idle`（闲置 `idle_minutes` 分钟后触发，
+  默认 30）两种模式，设置页微信区块可配；运行状态持久化防重启重跑。
+
+- 手动 Project Dream 接口异步化：POST /sessions/{id}/project-dream/run
+  立即返回 job_id（202），新增 GET .../project-dream/run/{job_id} 轮询
+  状态与结果；同项目同时只跑一场，完结结果保留 30 分钟。前端"运行
+ 梦境"改为轮询展示，不再受 frp 等反向代理 30 秒网关超时影响。
+- 聊天命令识别归一化：全角斜杠／、全角空格、全角数字序号均按半角
+  识别（中文输入法下命令不再漏进模型）；新增 /switch_think 与
+  /switch_model 对称的智能度切换别名。
 ### Changed
 
 - 将最低支持的 Rust 版本从 1.84 提升到 1.95，以匹配锁定的依赖图，

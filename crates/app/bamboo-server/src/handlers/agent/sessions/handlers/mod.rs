@@ -9,4 +9,6 @@ pub use crud::{
     list_sessions, patch_session, recover_root_mode, regenerate_session_title,
     running_sessions_snapshot, select_root_mode,
 };
-pub use maintenance::{cleanup_sessions, clear_session, run_project_dream};
+pub use maintenance::{
+    cleanup_sessions, clear_session, get_project_dream_status, run_project_dream,
+};

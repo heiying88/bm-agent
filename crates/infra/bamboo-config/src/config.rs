@@ -1202,14 +1202,186 @@ pub struct WechatVoiceConfig {
     pub file_asr: Option<String>,
 }
 
+/// 微信网关的 Project Dream 自动运行计划（`[[connect.platforms]]` 里
+/// type=wechat 条目的 `dream` 段）。两种触发模式：`daily` 每天在
+/// `daily_at`（HH:MM，默认 03:00）对本网关所属项目跑一次 Project Dream；
+/// `idle` 在网关闲置 `idle_minutes`（默认 30）后自动跑一次，新消息会
+/// 重置闲置计时。整段缺省时按默认值启用 daily 03:00（`mode: "off"`
+/// 显式关闭）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WechatDreamConfig {
+    /// `off` | `daily` | `idle`（缺省 `daily`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// daily 模式的每日运行时刻，`HH:MM`（缺省 `"03:00"`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_at: Option<String>,
+    /// idle 模式的闲置阈值分钟数（缺省 30；1–1440）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_minutes: Option<u64>,
+}
+
+impl WechatDreamConfig {
+    /// 生效模式（缺省 `daily`；未知值按 `daily` 处理并由设置端校验拒绝）。
+    pub fn effective_mode(&self) -> &str {
+        match self.mode.as_deref().map(str::trim) {
+            Some("off") => "off",
+            Some("idle") => "idle",
+            _ => "daily",
+        }
+    }
+
+    /// 生效的每日运行时刻（缺省 03:00）。
+    pub fn effective_daily_at(&self) -> &str {
+        self.daily_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("03:00")
+    }
+
+    /// 生效的闲置阈值分钟（缺省 30，钳制到 1–1440）。
+    pub fn effective_idle_minutes(&self) -> u64 {
+        self.idle_minutes.unwrap_or(30).clamp(1, 1440)
+    }
+
+    /// 校验字段取值（设置写入路径调用）；返回人类可读的错误信息。
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(mode) = self
+            .mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            if !matches!(mode, "off" | "daily" | "idle") {
+                return Err(format!(
+                    "wechat dream mode must be off/daily/idle, got '{mode}'"
+                ));
+            }
+        }
+        if let Some(daily_at) = self
+            .daily_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            let parts = daily_at.split(':').collect::<Vec<_>>();
+            let valid = parts.len() == 2
+                && parts[0].len() == 2
+                && parts[1].len() == 2
+                && parts[0].parse::<u32>().is_ok_and(|h| h < 24)
+                && parts[1].parse::<u32>().is_ok_and(|m| m < 60);
+            if !valid {
+                return Err(format!(
+                    "wechat dream daily_at must be HH:MM (e.g. \"03:00\"), got '{daily_at}'"
+                ));
+            }
+        }
+        if let Some(idle) = self.idle_minutes {
+            if !(1..=1440).contains(&idle) {
+                return Err(format!(
+                    "wechat dream idle_minutes must be within 1..=1440, got {idle}"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 微信网关的自动项目配置（`[[connect.platforms]]` 里 type=wechat 条目的
+/// `auto_project` 段）：收到第一条消息时自动创建（或复用同名活跃项目）
+/// 并把网关会话归属到它。工作区指向数据目录下的 `workspace` 文件夹
+/// （缺省 `work_wechat`），不存在则创建。整段缺省 = 按默认值启用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WechatAutoProjectConfig {
+    /// 是否启用（缺省 true）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// 项目名（缺省「微信工作」）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 工作区位置：相对名单段 = 数据目录下的文件夹（缺省 `work_wechat`）；
+    /// 也可以是绝对路径（默认位置被现有项目占住时显式指定别处）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+}
+
+impl WechatAutoProjectConfig {
+    pub fn effective_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn effective_name(&self) -> &str {
+        self.name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("微信工作")
+    }
+
+    pub fn effective_workspace(&self) -> &str {
+        self.workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("work_wechat")
+    }
+
+    /// 校验字段取值（设置写入路径调用）。
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(name) = self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            if name.len() > 64 {
+                return Err("wechat auto_project name must be at most 64 chars".to_string());
+            }
+        }
+        if let Some(workspace) = self
+            .workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            // 相对名单段（数据目录下的文件夹名）或绝对路径（如
+            // `D:\work_wechat` / `/srv/work_wechat`——默认位置被现有项目
+            // 的工作区占住时，可用绝对路径显式指定别处）。
+            let looks_absolute = workspace.starts_with('\\')
+                || workspace.starts_with('/')
+                || workspace
+                    .get(0..2)
+                    .is_some_and(|prefix| prefix.ends_with(':'));
+            let is_single_segment = !workspace.contains('/')
+                && !workspace.contains('\\')
+                && workspace != "."
+                && workspace != "..";
+            if !(is_single_segment || looks_absolute) {
+                return Err(format!(
+                    "wechat auto_project workspace must be a single folder name under the data \
+                     dir (e.g. \"work_wechat\") or an absolute path, got '{workspace}'"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One IM-platform bridge configured under `[[connect.platforms]]` —
-/// bamboo-connect (issue #452 / epic #447): drives a bamboo session from an
-/// external chat platform (Telegram first).
+/// bamboo-connect (issue #452 / epic #447): drives a bamboo session from
+/// an external chat platform (Telegram first).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConnectPlatformConfig {
     /// 微信适配器语音能力（非秘密部分，见 [`WechatVoiceConfig`]）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<WechatVoiceConfig>,
+    /// 微信网关 Project Dream 自动运行计划（见 [`WechatDreamConfig`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dream: Option<WechatDreamConfig>,
+    /// 微信网关首条消息自动创建项目（见 [`WechatAutoProjectConfig`]）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_project: Option<WechatAutoProjectConfig>,
     /// 微信语音能力的硅基流动 API key（`token` 同款加密管道：落盘为
     /// `voice_api_key_encrypted` / 凭据库引用，本明文字段仅在内存中）。
     #[serde(default, skip_serializing)]
@@ -1297,6 +1469,10 @@ pub struct ConnectPlatformConfig {
     /// startup warning is logged when a platform has no allowed users.
     #[serde(default)]
     pub allow_from: Vec<String>,
+    /// 微信"正在输入中"指示（iLink sendtyping）：机器人后台思考期间让
+    /// 聊天窗口显示 typing 状态（picoclaw/openclaw 同款）。缺省开启。
+    #[serde(default = "typing_indicator_default")]
+    pub typing_indicator: bool,
     /// 一次性"信任首个发信人"：为 true 且 allow_from 为空时，第一条入站
     /// 消息的发送者会被自动加入 allow_from 并落库，随后本开关自动关闭
     /// （闩锁语义）。扫码登录端点默认把它设为 true——扫码本身即操作者
@@ -1317,6 +1493,10 @@ pub struct ConnectPlatformConfig {
 pub struct ConnectConfig {
     #[serde(default)]
     pub platforms: Vec<ConnectPlatformConfig>,
+}
+
+fn typing_indicator_default() -> bool {
+    true
 }
 
 fn connect_config_is_empty(config: &ConnectConfig) -> bool {
@@ -7509,6 +7689,8 @@ mod tests {
     ) -> ConnectPlatformConfig {
         ConnectPlatformConfig {
             voice: None,
+            dream: None,
+            auto_project: None,
             voice_api_key: None,
             voice_api_key_encrypted: None,
             voice_api_key_credential_ref: None,
@@ -7527,6 +7709,8 @@ mod tests {
             app_secret_configured: false,
             domain: None,
             allow_from: vec!["user-1".to_string()],
+            trust_first_sender: false,
+            typing_indicator: true,
             admin_from: Vec::new(),
         }
     }
@@ -8254,6 +8438,8 @@ mod tests {
         let mut config = Config::create_default();
         config.connect.platforms = vec![ConnectPlatformConfig {
             voice: None,
+            dream: None,
+            auto_project: None,
             voice_api_key: None,
             voice_api_key_encrypted: None,
             voice_api_key_credential_ref: None,
@@ -8272,6 +8458,8 @@ mod tests {
             app_secret_configured: false,
             domain: Some("lark".to_string()),
             allow_from: vec!["ou_1".to_string()],
+            trust_first_sender: false,
+            typing_indicator: true,
             admin_from: Vec::new(),
         }];
 
@@ -8305,6 +8493,8 @@ mod tests {
         let mut config = Config::create_default();
         config.connect.platforms = vec![ConnectPlatformConfig {
             voice: None,
+            dream: None,
+            auto_project: None,
             voice_api_key: None,
             voice_api_key_encrypted: None,
             voice_api_key_credential_ref: None,
@@ -8323,6 +8513,8 @@ mod tests {
             app_secret_configured: false,
             domain: Some("lark".to_string()),
             allow_from: vec!["ou_1".to_string()],
+            trust_first_sender: false,
+            typing_indicator: true,
             admin_from: Vec::new(),
         }];
         config

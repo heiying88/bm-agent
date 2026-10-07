@@ -46,6 +46,69 @@ impl SessionKey {
     }
 }
 
+/// connect 会话管理（HTTP API/聊天命令）用的一行会话摘要。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConnectSessionSummary {
+    pub session_id: String,
+    pub connect_key: String,
+    pub platform: String,
+    pub chat_id: String,
+    pub user_id: String,
+    pub title: String,
+    pub project_id: Option<String>,
+    pub workspace_path: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub message_count: usize,
+    /// 是否是该聊天键当前映射的会话。
+    pub is_current: bool,
+}
+
+/// `platform:chat_id:user_id` -> 三段（尽力而为；平台名内不含冒号）。
+fn split_connect_key(key: &str) -> (String, String, String) {
+    let mut parts = key.splitn(3, ':');
+    (
+        parts.next().unwrap_or_default().to_string(),
+        parts.next().unwrap_or_default().to_string(),
+        parts.next().unwrap_or_default().to_string(),
+    )
+}
+
+/// 遗留 connect 会话（索引尚无 `created_by_connect_key` 镜像时）从固定
+/// 标题 `Connect: <key>` 反解出聊天键。
+fn legacy_connect_title_key(title: &str) -> Option<String> {
+    title
+        .strip_prefix("Connect: ")
+        .map(str::to_string)
+        .filter(|key| key.split(':').count() >= 3)
+}
+
+/// `/switch <n>` / `/del <n>` 的序号参数 -> 0 基下标（1 基输入）。
+fn parse_session_index_arg(arg: Option<&str>) -> Option<usize> {
+    let arg = arg?.trim();
+    if arg.is_empty() {
+        return None;
+    }
+    // 全角数字（１２３…，中文输入法）归一为半角再解析。
+    let normalized: String = arg
+        .chars()
+        .map(|c| match c {
+            '０'..='９' => char::from(b'0' + (c as u32 - '０' as u32) as u8),
+            other => other,
+        })
+        .collect();
+    normalized
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+}
+
+/// 剥掉 Windows verbatim 路径前缀 `\\?\`（项目清单里的工作区根是
+/// canonicalize 后的 verbatim 形态，比较前统一成普通形态）。
+fn strip_verbatim_prefix(value: &str) -> &str {
+    value.strip_prefix(r"\\?\").unwrap_or(value)
+}
+
 /// Max entries [`BoundedSeenSet`] retains before evicting the oldest
 /// (issue #454 follow-up). This is defense-in-depth dedup, layered on top
 /// of each adapter's own transport-level dedup (e.g. Telegram's offset
@@ -106,6 +169,9 @@ pub struct ConnectContext {
     pub agent: Arc<bamboo_engine::Agent>,
     pub tools: Arc<dyn ToolExecutor>,
     pub session_repo: SessionRepository,
+    /// Session index access for connect-session listing (bridge's
+    /// `created_by_connect_key` queries) without loading each session.json.
+    pub session_store: std::sync::Arc<bamboo_storage::SessionStoreV2>,
     pub agent_runners: Arc<TokioRwLock<HashMap<String, AgentRunner>>>,
     pub session_event_senders: Arc<TokioRwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     pub account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
@@ -254,6 +320,19 @@ fn strip_command_suffix(text: &str) -> &str {
     text.split('@').next().unwrap_or(text)
 }
 
+/// 命令识别专用归一化：trim → 去 Telegram `@后缀` → 全角斜杠（／，
+/// U+FF0F）归半角 → 全角空格（U+3000）归半角 → 再 trim。中文输入法
+/// 下 `/think 高` 常以全角形态发出，不归一就整条漏进模型当提示词。
+/// **只用于命令匹配**，发往模型的正文永远用原始 `msg.text`。
+fn normalize_command_text(text: &str) -> String {
+    let stripped = strip_command_suffix(text.trim());
+    stripped
+        .replace('\u{FF0F}', "/")
+        .replace('\u{3000}', " ")
+        .trim()
+        .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // 会话级运行覆盖（/think 智能度、/model 模型切换；网关聊天命令写入，
 // run_prompt 每次发消息前读取并覆盖配置解析结果——"下一条消息生效"）
@@ -319,6 +398,9 @@ struct MarkerPlatform {
     bridge: Arc<ConnectBridge>,
     key: String,
     inner: Arc<dyn Platform>,
+    /// 首条出站回复发出后停掉"正在输入中"（token.cancel 幂等；仅第一个
+    /// 装饰器实例携带，None = 该运行不需要 typing 控制）。
+    typing_cancel: Option<CancellationToken>,
 }
 
 #[async_trait::async_trait]
@@ -344,6 +426,17 @@ impl Platform for MarkerPlatform {
         ctx: &ReplyCtx,
         msg: OutboundMessage,
     ) -> super::platform::PlatformResult<super::platform::MessageRef> {
+        // 首条出站回复：停掉"正在输入中"（token 幂等，后续回复直接跳过）。
+        if let Some(token) = &self.typing_cancel {
+            if !token.is_cancelled() {
+                token.cancel();
+                if let Err(error) = self.inner.stop_typing(ctx).await {
+                    tracing::debug!(
+                        "connect: typing cancel on first reply failed (ignored): {error}"
+                    );
+                }
+            }
+        }
         if ![SET_MODEL_MARKER, SET_THINK_MARKER, SET_PERMISSION_MARKER]
             .iter()
             .any(|marker| msg.text.contains(marker))
@@ -604,6 +697,13 @@ pub struct ConnectBridge {
     /// The resolution seam (issue #458): `submit_pending_response` +
     /// `resume_session_execution`, or a fake in tests.
     responder: Arc<dyn Responder>,
+    /// `platform -> 最后一条已放行入站消息的时间`（UTC）。connect 侧的
+    /// "项目休息时间"（闲置后自动 Project Dream）用它做闲置判定；std 锁
+    /// 只在单次 insert 读取时短暂持有，从不满跨 `.await`。
+    last_activity: StdMutex<HashMap<String, DateTime<Utc>>>,
+    /// 微信网关自动项目的解析缓存（配置的项目名 -> ProjectId）。首条
+    /// 消息时 find-or-create 一次，此后直接复用；名字变化时重新解析。
+    wechat_project_cache: StdMutex<Option<(String, bamboo_domain::ProjectId)>>,
 }
 
 impl ConnectBridge {
@@ -631,6 +731,8 @@ impl ConnectBridge {
             seen_message_ids: StdMutex::new(BoundedSeenSet::new(DEDUP_CAPACITY)),
             process_start: Utc::now(),
             responder,
+            last_activity: StdMutex::new(HashMap::new()),
+            wechat_project_cache: StdMutex::new(None),
         }
     }
 
@@ -857,6 +959,16 @@ impl ConnectBridge {
             return;
         }
 
+        // 记录平台活动时间（闲置 Dream 的计时基准）。放在 allow/sent_at
+        // 检查之后：被拒绝或过期的消息不算活动。
+        {
+            let mut activity = self.last_activity.lock().unwrap();
+            let entry = activity.entry(msg.platform.clone()).or_insert(msg.sent_at);
+            if msg.sent_at > *entry {
+                *entry = msg.sent_at;
+            }
+        }
+
         let dedup_key = format!("{}:{}", msg.platform, msg.message_id);
         {
             let mut seen = self.seen_message_ids.lock().unwrap();
@@ -877,7 +989,7 @@ impl ConnectBridge {
         }
         .as_string();
 
-        let command = strip_command_suffix(msg.text.trim());
+        let command = normalize_command_text(&msg.text);
         if command.eq_ignore_ascii_case("/stop") {
             self.handle_stop(&key, &platform, &msg.reply_ctx).await;
             return;
@@ -890,22 +1002,53 @@ impl ConnectBridge {
         // /models（查询已配置模型）。控制路径：busy/挂起审批时不阻塞，
         // 对"正在跑的当前轮"不生效，下一条消息起生效。命令头大小写
         // 不敏感（/THINK 高 也认）；参数保留原大小写（模型名敏感）。
+        // `command` 已经过 normalize_command_text（全角斜杠/空格归半角），
+        // 只影响命令识别，不改动发往模型的正文。
         let (command_head, command_arg) = match command.split_once(' ') {
             Some((head, rest)) => (head, Some(rest.trim())),
-            None => (command, None),
+            None => (command.as_str(), None),
         };
         if command_head.eq_ignore_ascii_case("/models") {
             self.handle_model_command(&key, &platform, &msg.reply_ctx, None, true)
                 .await;
             return;
         }
-        if command_head.eq_ignore_ascii_case("/model") {
+        if command_head.eq_ignore_ascii_case("/model")
+            || command_head.eq_ignore_ascii_case("/switch_model")
+        {
             self.handle_model_command(&key, &platform, &msg.reply_ctx, command_arg, false)
                 .await;
             return;
         }
-        if command_head.eq_ignore_ascii_case("/think") {
+        if command_head.eq_ignore_ascii_case("/think")
+            || command_head.eq_ignore_ascii_case("/switch_think")
+        {
             self.handle_think_command(&key, &platform, &msg.reply_ctx, command_arg)
+                .await;
+            return;
+        }
+        // 会话管理命令：/sessions（列出本聊天的历史会话）、/switch <序号>
+        // （切换回某个历史会话，别名 /session <序号>）、/del <序号>（删除
+        // 某个历史会话）。与 /new 同族——即时应答，不进忙队列、不进模型。
+        // 模型切换有自己的显式命令 /switch_model（/model 的别名），与会话
+        // 切换互不混淆。
+        if command_head.eq_ignore_ascii_case("/sessions")
+            || command_head.eq_ignore_ascii_case("/list")
+        {
+            self.handle_sessions_command(&key, &platform, &msg.reply_ctx)
+                .await;
+            return;
+        }
+        if command_head.eq_ignore_ascii_case("/switch")
+            || command_head.eq_ignore_ascii_case("/session")
+        {
+            self.handle_switch_command(&key, &platform, &msg.reply_ctx, command_arg)
+                .await;
+            return;
+        }
+        if command_head.eq_ignore_ascii_case("/del") || command_head.eq_ignore_ascii_case("/delete")
+        {
+            self.handle_delete_session_command(&key, &platform, &msg.reply_ctx, command_arg)
                 .await;
             return;
         }
@@ -1112,7 +1255,7 @@ impl ConnectBridge {
         platform: Arc<dyn Platform>,
         msg: InboundMessage,
     ) {
-        let command = strip_command_suffix(msg.text.trim());
+        let command = normalize_command_text(&msg.text);
         if command.eq_ignore_ascii_case("/new") {
             self.rotate_session(key).await;
             reply_text(&platform, &msg.reply_ctx, "Started a new session.").await;
@@ -1184,8 +1327,9 @@ impl ConnectBridge {
         reply_text(platform, reply_ctx, text).await;
     }
 
-    /// `/think [档位|reset]`：查看/切换本会话的智能度（reasoning effort）。
-    /// 覆盖值存会话元数据，run_prompt 下一条消息生效；`/new` 回配置默认。
+    /// `/think [档位|reset]`（别名 `/switch_think`）：查看/切换本会话的
+    /// 智能度（reasoning effort）。覆盖值存会话元数据，run_prompt 下一条
+    /// 消息生效；`/new` 回配置默认。
     async fn handle_think_command(
         &self,
         key: &str,
@@ -1201,7 +1345,7 @@ impl ConnectBridge {
             let override_effort = self.load_session_override(key).await.1;
             let effective = override_effort.or(config.get_reasoning_effort());
             let text = format!(
-                "当前智能度：{}（{}）\n{VALID}\n/think <值> 切换；/think reset 恢复配置默认",
+                "当前智能度：{}（{}）\n{VALID}\n/think 或 /switch_think <值> 切换；/think reset 恢复配置默认",
                 effective.map(|effort| effort.as_str()).unwrap_or("未设置"),
                 if override_effort.is_some() {
                     "会话手动档"
@@ -1277,7 +1421,7 @@ impl ConnectBridge {
                 .or_else(|| config.get_model())
                 .unwrap_or_else(|| "（未配置）".to_string());
             let text = format!(
-                "当前模型：{current}\n已配置的模型：\n{}\n/model <名称> 切换（支持部分匹配）；/model reset 恢复默认",
+                "当前模型：{current}\n已配置的模型：\n{}\n/model 或 /switch_model <名称> 切换（支持部分匹配）；/model reset 恢复默认",
                 if choices.is_empty() {
                     "（配置里没有找到模型）".to_string()
                 } else {
@@ -1422,8 +1566,14 @@ impl ConnectBridge {
     ) -> Result<Session, String> {
         let model = resolved.model_roster.model.clone().unwrap_or_default();
         let platform = key.split(':').next().unwrap_or_default();
-        let project_id = self.ctx.project_ids_by_platform.get(platform);
-        if let Some(project_id) = project_id {
+        // 项目归属：平台条目显式配置的 project_id 优先；微信网关在未配置
+        // 时落到自动项目（首条消息 find-or-create「微信工作」，工作区为
+        // 数据目录下的 work_wechat）。
+        let project_id = match self.ctx.project_ids_by_platform.get(platform) {
+            Some(project_id) => Some(project_id.clone()),
+            None => self.auto_project_for_platform(platform).await,
+        };
+        if let Some(project_id) = project_id.as_ref() {
             match self.ctx.project_store.get(project_id) {
                 Ok(project) if project.status == bamboo_domain::ProjectStatus::Active => {}
                 Ok(_) => {
@@ -1440,7 +1590,7 @@ impl ConnectBridge {
         }
         let final_workspace = crate::project_context::validate_workspace_assignment_with_resolver(
             &self.ctx.project_store,
-            project_id,
+            project_id.as_ref(),
             project_id
                 .is_none()
                 .then_some(resolved.workspace_path.as_deref())
@@ -1450,7 +1600,7 @@ impl ConnectBridge {
         .map_err(|error| {
             format!("Connect workspace is unavailable; no session was created: {error}")
         })?;
-        let binding_status = match (project_id, final_workspace.as_deref()) {
+        let binding_status = match (project_id.as_ref(), final_workspace.as_deref()) {
             (Some(project_id), Some(workspace)) => {
                 let workspace = bamboo_config::paths::path_to_display_string(workspace);
                 if self
@@ -1458,7 +1608,7 @@ impl ConnectBridge {
                     .project_store
                     .find_workspace_owner_for_path(&workspace)
                     .map_err(|error| format!("resolve Connect workspace owner: {error}"))?
-                    .is_some_and(|owner| owner.id == *project_id)
+                    .is_some_and(|owner| &owner.id == project_id)
                 {
                     bamboo_engine::project_context::WorkspaceBindingStatus::Registered
                 } else {
@@ -1484,7 +1634,7 @@ impl ConnectBridge {
                     binding_status,
                 }
             }),
-            project_id,
+            project_id.as_ref(),
             resolved.reasoning_effort,
             self.ctx
                 .permission_checker
@@ -1495,6 +1645,531 @@ impl ConnectBridge {
         );
         self.set_session_id_for_key(key, &session.id).await;
         Ok(session)
+    }
+
+    // ------------------------------------------------------------------
+    // 微信自动项目（首条消息 find-or-create「微信工作」）
+    // ------------------------------------------------------------------
+
+    /// 平台的自动项目归属（当前仅微信）。读取 wechat 条目的
+    /// `auto_project` 配置（缺省启用），find-or-create 同名活跃项目。
+    /// config 的 tokio 锁先读完再进 std 锁，互斥锁从不跨 `.await`；
+    /// 项目查找/创建/建目录都是短同步操作。
+    async fn auto_project_for_platform(&self, platform: &str) -> Option<bamboo_domain::ProjectId> {
+        if platform != "wechat" {
+            return None;
+        }
+        let settings = {
+            let config = self.ctx.config.read().await;
+            config
+                .connect
+                .platforms
+                .iter()
+                .find(|entry| entry.platform_type == "wechat")
+                .and_then(|entry| entry.auto_project.clone())
+                .unwrap_or_default()
+        };
+        if !settings.effective_enabled() {
+            return None;
+        }
+        let name = settings.effective_name().to_string();
+        {
+            let cache = self.wechat_project_cache.lock().unwrap();
+            if let Some((cached_name, project_id)) = cache.as_ref() {
+                if cached_name == &name {
+                    return Some(project_id.clone());
+                }
+            }
+        }
+        let resolved = self.resolve_or_create_wechat_project(&settings);
+        if let Some(project_id) = resolved.as_ref() {
+            *self.wechat_project_cache.lock().unwrap() = Some((name, project_id.clone()));
+        }
+        resolved
+    }
+
+    /// find-or-create：先按名字复用活跃项目；没有则在**数据目录下**依次
+    /// 尝试候选工作区（见 [`Self::wechat_workspace_candidates`]）。祖先目录
+    /// 被现有项目占住不再是障碍（ProjectStore 允许嵌套、归属按最长匹配
+    /// 解析到本项目的内层根）；只有与现有项目**完全相同**的根才冲突，
+    /// 此时换下一个编号（`work_wechat` → `work_wechat_1` → …），全程不
+    /// 离开数据目录、不改动既有项目。全部候选失败时给出明确的配置指引。
+    fn resolve_or_create_wechat_project(
+        &self,
+        settings: &bamboo_config::WechatAutoProjectConfig,
+    ) -> Option<bamboo_domain::ProjectId> {
+        let name = settings.effective_name();
+        let find_active = |store: &bamboo_projects::ProjectStore| {
+            store
+                .list()
+                .ok()
+                .and_then(|projects| {
+                    projects.into_iter().find(|project| {
+                        project.name == name
+                            && project.status == bamboo_domain::ProjectStatus::Active
+                    })
+                })
+                .map(|project| project.id)
+        };
+        if let Some(project_id) = find_active(&self.ctx.project_store) {
+            return Some(project_id);
+        }
+        let candidates = self.wechat_workspace_candidates(settings);
+        let mut last_error = String::new();
+        for candidate in &candidates {
+            if self.workspace_root_already_registered(candidate) {
+                tracing::debug!(
+                    workspace = %candidate.display(),
+                    "connect: wechat auto-project workspace root already registered to another \
+                     project; trying the next numbered candidate"
+                );
+                continue;
+            }
+            if let Err(error) = std::fs::create_dir_all(candidate) {
+                tracing::warn!(
+                    workspace = %candidate.display(),
+                    "connect: failed to create wechat auto-project workspace: {error}"
+                );
+                last_error = error.to_string();
+                continue;
+            }
+            match self.ctx.project_store.create_with_project_path(
+                name.to_string(),
+                Some("微信网关首条消息自动创建的项目".to_string()),
+                bamboo_config::paths::path_to_display_string(candidate),
+                Vec::new(),
+            ) {
+                Ok(manifest) => {
+                    tracing::info!(
+                        project_id = %manifest.id,
+                        workspace = %candidate.display(),
+                        "connect: created wechat auto-project '{}'", manifest.name
+                    );
+                    return Some(manifest.id);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        workspace = %candidate.display(),
+                        "connect: wechat auto-project creation rejected ({error}); trying the \
+                         next numbered candidate"
+                    );
+                    last_error = error.to_string();
+                }
+            }
+        }
+        let last_error_note = if last_error.is_empty() {
+            String::new()
+        } else {
+            format!(", last error: {last_error}")
+        };
+        tracing::error!(
+            "connect: wechat auto-project '{name}' could not be created (tried {} \
+             candidate(s){last_error_note}); sessions continue WITHOUT a project — set \
+             connect.platforms[type=wechat].auto_project.workspace to a free folder name or \
+             an absolute path",
+            candidates.len(),
+        );
+        // 并发竞态兜底：另一个聊天可能刚好创建成功。
+        find_active(&self.ctx.project_store)
+    }
+
+    /// 微信自动项目的工作区候选位置（依次尝试）：
+    /// 1. 配置的 `workspace`——相对名单段 = 数据目录下（缺省
+    ///    `work_wechat`）；**绝对路径原样使用且不再编号**（显式指定即
+    ///    意图）；
+    /// 2. 相对名时，与现有项目根完全冲突则编号递增：
+    ///    `work_wechat`、`work_wechat_1`、…、`work_wechat_9`，全部位于
+    ///    数据目录下，绝不跳出。
+    fn wechat_workspace_candidates(
+        &self,
+        settings: &bamboo_config::WechatAutoProjectConfig,
+    ) -> Vec<PathBuf> {
+        let folder = settings.effective_workspace();
+        let configured = std::path::Path::new(folder);
+        if configured.is_absolute() {
+            return vec![configured.to_path_buf()];
+        }
+        let data_dir = self.ctx.project_store.paths().data_dir();
+        (0..10_u32)
+            .map(|index| {
+                let name = if index == 0 {
+                    folder.to_string()
+                } else {
+                    format!("{folder}_{index}")
+                };
+                data_dir.join(name)
+            })
+            .collect()
+    }
+
+    /// 候选工作区根是否与某个现有项目的根**完全相同**（编号递增的判定
+    /// 依据；清单里的 verbatim `\\?\` 前缀在比较前剥掉，两侧统一普通
+    /// 形态）。
+    fn workspace_root_already_registered(&self, candidate: &std::path::Path) -> bool {
+        let Ok(projects) = self.ctx.project_store.list() else {
+            return false;
+        };
+        let candidate_display = candidate.to_string_lossy().into_owned();
+        let candidate = strip_verbatim_prefix(&candidate_display);
+        projects.iter().any(|project| {
+            project
+                .workspace_roots()
+                .any(|root| strip_verbatim_prefix(root) == candidate)
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // connect 会话管理：列表 / 新建 / 切换 / 删除（HTTP API + 聊天命令共用）
+    // ------------------------------------------------------------------
+
+    /// 列出 connect 桥接创建的会话（可选按平台过滤），按 updated_at 降序。
+    /// 新会话靠索引镜像 `created_by_connect_key` 匹配；遗留会话（镜像
+    /// 引入前创建、未被重新写入索引的）回退到固定标题 `Connect: <key>`。
+    pub async fn list_connect_sessions(
+        &self,
+        platform: Option<&str>,
+    ) -> Vec<ConnectSessionSummary> {
+        let current = self.session_map.read().await.clone();
+        let prefix = platform.map(|platform| format!("{platform}:"));
+        let mut summaries = Vec::new();
+        for entry in self.ctx.session_store.list_index_entries().await {
+            if !matches!(entry.kind, bamboo_agent_core::SessionKind::Root) {
+                continue;
+            }
+            let key = entry
+                .created_by_connect_key
+                .clone()
+                .filter(|key| !key.trim().is_empty())
+                .or_else(|| legacy_connect_title_key(&entry.title));
+            let Some(key) = key else {
+                continue;
+            };
+            if let Some(prefix) = &prefix {
+                if !key.starts_with(prefix.as_str()) {
+                    continue;
+                }
+            }
+            let (key_platform, chat_id, user_id) = split_connect_key(&key);
+            summaries.push(ConnectSessionSummary {
+                session_id: entry.id.clone(),
+                is_current: current.get(&key).is_some_and(|id| id == &entry.id),
+                connect_key: key,
+                platform: key_platform,
+                chat_id,
+                user_id,
+                title: entry.title,
+                project_id: entry.project_id,
+                workspace_path: entry.workspace_path,
+                created_at: entry.created_at,
+                updated_at: entry.updated_at,
+                message_count: entry.message_count,
+            });
+        }
+        summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        summaries
+    }
+
+    /// 本聊天键的全部 connect 会话（供 `/sessions` 编号展示），按
+    /// updated_at 降序。
+    async fn connect_sessions_for_key(&self, key: &str) -> Vec<bamboo_storage::SessionIndexEntry> {
+        let title = format!("Connect: {key}");
+        let mut matched: Vec<_> = self
+            .ctx
+            .session_store
+            .list_index_entries()
+            .await
+            .into_iter()
+            .filter(|entry| {
+                matches!(entry.kind, bamboo_agent_core::SessionKind::Root)
+                    && (entry.created_by_connect_key.as_deref() == Some(key)
+                        || entry.title == title)
+            })
+            .collect();
+        matched.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        matched
+    }
+
+    async fn chat_is_busy(&self, key: &str) -> bool {
+        self.chat_state
+            .lock()
+            .await
+            .get(key)
+            .is_some_and(|state| state.busy)
+    }
+
+    /// 为聊天键立即新建一个会话（`/new` 的"马上创建"版本，HTTP 新建
+    /// 会话走这里）。聊天忙时拒绝，避免运行中的回合被换轨。创建后立即
+    /// 落盘（run_prompt 只在首条消息后保存——不先存，映射会指向一个
+    /// 不存在的会话）。
+    pub async fn create_session_for_key(&self, key: &str) -> Result<Session, String> {
+        if self.chat_is_busy(key).await {
+            return Err("该聊天当前有任务在运行，稍后再试（或先发送 /stop）".to_string());
+        }
+        self.invalidate_pending_ask(key).await;
+        let config_snapshot = self.ctx.config.read().await.clone();
+        let resolved = resolve_connect_run_config(&config_snapshot, &self.ctx.provider_registry);
+        if resolved
+            .model_roster
+            .model
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Err("No model is configured for this bamboo instance".to_string());
+        }
+        let mut session = self.create_and_register_session(key, &resolved).await?;
+        self.ctx.session_repo.save_and_cache(&mut session).await;
+        Ok(session)
+    }
+
+    /// 把聊天键切回一个历史 connect 会话（聊天命令 `/session` 与 HTTP 切换
+    /// 共用）。只允许同一聊天键内的会话互切。
+    pub async fn activate_session_for_key(
+        &self,
+        key: &str,
+        session_id: &str,
+    ) -> Result<(), String> {
+        if self.chat_is_busy(key).await {
+            return Err("该聊天当前有任务在运行，稍后再试（或先发送 /stop）".to_string());
+        }
+        let session = self
+            .ctx
+            .session_repo
+            .load_merged(session_id)
+            .await
+            .ok_or_else(|| "会话不存在或已失效".to_string())?;
+        let belongs = session
+            .metadata
+            .get("created_by_connect_key")
+            .is_some_and(|value| value == key);
+        if !belongs {
+            return Err(format!("会话 {session_id} 不属于聊天 {key}"));
+        }
+        self.invalidate_pending_ask(key).await;
+        self.set_session_id_for_key(key, session_id).await;
+        Ok(())
+    }
+
+    /// 摘除一个 connect 会话的桥接状态：清挂起问题/取消令牌、移除指向
+    /// 它的映射并落盘。返回它所属的聊天键（会话已不可读时仍会清扫映射，
+    /// 返回 None）。真正的存储删除由调用方选择：聊天命令走
+    /// [`Self::delete_connect_session`]，HTTP 路径先 detach 再复用通用
+    /// 删除处理器（技能激活释放/浏览器清理等全量逻辑）。
+    pub async fn detach_connect_session(&self, session_id: &str) -> Option<String> {
+        let key = self
+            .ctx
+            .session_repo
+            .load_merged(session_id)
+            .await
+            .and_then(|session| {
+                session
+                    .metadata
+                    .get("created_by_connect_key")
+                    .cloned()
+                    .filter(|key| !key.trim().is_empty())
+            });
+        if let Some(key) = &key {
+            self.invalidate_pending_ask(key).await;
+            if let Some(token) = self
+                .chat_state
+                .lock()
+                .await
+                .get(key)
+                .and_then(|state| state.cancel_token.clone())
+            {
+                token.cancel();
+            }
+        }
+        {
+            let mut map = self.session_map.write().await;
+            map.retain(|_, mapped| mapped != session_id);
+        }
+        self.persist_session_map().await;
+        key
+    }
+
+    /// 删除一个 connect 会话（聊天命令 `/del` 走这里）：忙时拒绝，detach
+    /// 后删除存储与缓存，并向账户事件流尽力广播 `SessionDeleted`。返回
+    /// 是否真的删除了（会话本就不存在时 false）。
+    pub async fn delete_connect_session(&self, session_id: &str) -> Result<bool, String> {
+        let key = self
+            .ctx
+            .session_repo
+            .load_merged(session_id)
+            .await
+            .and_then(|session| {
+                session
+                    .metadata
+                    .get("created_by_connect_key")
+                    .cloned()
+                    .filter(|key| !key.trim().is_empty())
+            });
+        if let Some(key) = &key {
+            if self.chat_is_busy(key).await {
+                return Err("该聊天当前有任务在运行，稍后再试（或先发送 /stop）".to_string());
+            }
+        }
+        self.detach_connect_session(session_id).await;
+        let deleted = self
+            .ctx
+            .session_repo
+            .storage()
+            .delete_session(session_id)
+            .await
+            .map_err(|error| format!("删除会话失败：{error}"))?;
+        self.ctx.session_repo.cache().remove(session_id);
+        if deleted {
+            if let Some(inbox) = &self.ctx.account_feed_inbox {
+                let _ = inbox.try_send((
+                    Some(session_id.to_string()),
+                    bamboo_agent_core::AgentEvent::SessionDeleted {
+                        session_id: session_id.to_string(),
+                    },
+                ));
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// dream 闲置判定用：平台最近一次已放行入站消息的时间（UTC）。
+    pub fn platform_last_activity(&self, platform: &str) -> Option<DateTime<Utc>> {
+        self.last_activity.lock().unwrap().get(platform).cloned()
+    }
+
+    /// `/sessions`：列出本聊天的全部 connect 会话（当前会话带标记）。
+    async fn handle_sessions_command(
+        &self,
+        key: &str,
+        platform: &Arc<dyn Platform>,
+        reply_ctx: &ReplyCtx,
+    ) {
+        let sessions = self.connect_sessions_for_key(key).await;
+        let current_id = self.session_id_for_key(key).await;
+        if sessions.is_empty() {
+            reply_text(
+                platform,
+                reply_ctx,
+                "本聊天还没有会话。发送任意消息开始一个；/new 可随时新开。",
+            )
+            .await;
+            return;
+        }
+        let mut lines = String::from("本聊天的会话（按更新时间倒序）：\n");
+        for (index, entry) in sessions.iter().enumerate() {
+            let marker = if current_id.as_deref() == Some(entry.id.as_str()) {
+                " ✅当前"
+            } else {
+                ""
+            };
+            let updated = entry
+                .updated_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M");
+            lines.push_str(&format!(
+                "{}. {}（{} 条消息，更新 {updated}）{marker}\n",
+                index + 1,
+                entry.title,
+                entry.message_count
+            ));
+        }
+        lines.push_str("\n/switch <序号> 切换；/del <序号> 删除；/new 新开。");
+        reply_text(platform, reply_ctx, lines).await;
+    }
+
+    /// `/switch <序号>`（别名 `/session <序号>`）：切换回 `/sessions` 列表里的某个历史会话。
+    async fn handle_switch_command(
+        &self,
+        key: &str,
+        platform: &Arc<dyn Platform>,
+        reply_ctx: &ReplyCtx,
+        arg: Option<&str>,
+    ) {
+        let Some(index) = parse_session_index_arg(arg) else {
+            reply_text(
+                platform,
+                reply_ctx,
+                "用法：/switch <序号>（或 /session <序号>；先发 /sessions 查看序号）",
+            )
+            .await;
+            return;
+        };
+        let sessions = self.connect_sessions_for_key(key).await;
+        let Some(entry) = sessions.get(index) else {
+            reply_text(
+                platform,
+                reply_ctx,
+                format!(
+                    "序号超出范围（1–{}）。先发 /sessions 查看最新列表。",
+                    sessions.len()
+                ),
+            )
+            .await;
+            return;
+        };
+        let session_id = entry.id.clone();
+        let title = entry.title.clone();
+        match self.activate_session_for_key(key, &session_id).await {
+            Ok(()) => {
+                reply_text(
+                    platform,
+                    reply_ctx,
+                    format!("✅ 已切换到：{title}\n下一条消息将继续这个会话。"),
+                )
+                .await;
+            }
+            Err(error) => reply_text(platform, reply_ctx, format!("切换失败：{error}")).await,
+        }
+    }
+
+    /// `/del <序号>`：删除 `/sessions` 列表里的某个会话。删除的是当前
+    /// 会话时，映射一并移除——下一条消息会自动创建新会话。
+    async fn handle_delete_session_command(
+        &self,
+        key: &str,
+        platform: &Arc<dyn Platform>,
+        reply_ctx: &ReplyCtx,
+        arg: Option<&str>,
+    ) {
+        let Some(index) = parse_session_index_arg(arg) else {
+            reply_text(
+                platform,
+                reply_ctx,
+                "用法：/del <序号>（先发 /sessions 查看序号）",
+            )
+            .await;
+            return;
+        };
+        let sessions = self.connect_sessions_for_key(key).await;
+        let Some(entry) = sessions.get(index) else {
+            reply_text(
+                platform,
+                reply_ctx,
+                format!(
+                    "序号超出范围（1–{}）。先发 /sessions 查看最新列表。",
+                    sessions.len()
+                ),
+            )
+            .await;
+            return;
+        };
+        let session_id = entry.id.clone();
+        let was_current =
+            self.session_id_for_key(key).await.as_deref() == Some(session_id.as_str());
+        match self.delete_connect_session(&session_id).await {
+            Ok(true) => {
+                let suffix = if was_current {
+                    "当前会话已删除，下一条消息将自动创建新会话。"
+                } else {
+                    ""
+                };
+                reply_text(platform, reply_ctx, format!("🗑️ 已删除会话。{suffix}")).await;
+            }
+            Ok(false) => {
+                reply_text(platform, reply_ctx, "会话已不存在（可能已被删除）。").await;
+            }
+            Err(error) => reply_text(platform, reply_ctx, format!("删除失败：{error}")).await,
+        }
     }
 
     /// Runs `text` as a prompt for `key`'s session, through the canonical
@@ -1680,6 +2355,33 @@ impl ConnectBridge {
             summarization_model_provider: aux_summarization_provider.clone(),
         });
 
+        // "正在输入中"指示（picoclaw/openclaw 同款体验）：运行期间按官方
+        // 插件的 5 秒 keepalive 周期重发 typing（票据经 getconfig 缓存，
+        // 见 wechat 适配器），首条出站回复（MarkerPlatform）或运行收尾时
+        // 取消并显式 CANCEL（status=2）；单次运行最多维持 15 分钟。指示是
+        // best-effort——失败只记日志，绝不影响运行。
+        let typing_cancel = CancellationToken::new();
+        {
+            let typing_platform = platform.clone();
+            let typing_ctx = reply_ctx.clone();
+            let typing_task_cancel = typing_cancel.clone();
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(900);
+                loop {
+                    if typing_task_cancel.is_cancelled() || tokio::time::Instant::now() >= deadline
+                    {
+                        break;
+                    }
+                    if let Err(error) = typing_platform.send_typing(&typing_ctx).await {
+                        tracing::debug!("connect: typing indicator failed (ignored): {error}");
+                    }
+                    tokio::select! {
+                        _ = typing_task_cancel.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    }
+                }
+            });
+        }
         spawn_session_execution(SessionExecutionArgs {
             agent: self.ctx.agent.clone(),
             session_id: session_id.clone(),
@@ -1720,9 +2422,22 @@ impl ConnectBridge {
         });
 
         self.clone()
-            .render_until_settled(key, platform, reply_ctx.clone(), &session_id, rx)
+            .render_until_settled(
+                key,
+                platform.clone(),
+                reply_ctx.clone(),
+                &session_id,
+                rx,
+                typing_cancel.clone(),
+            )
             .await;
 
+        // 运行收尾：停掉 typing 循环并显式发送 CANCEL（status=2，无出站
+        // 回复的终态也覆盖；首条回复时 MarkerPlatform 已取消过，幂等）。
+        typing_cancel.cancel();
+        if let Err(error) = platform.stop_typing(&reply_ctx).await {
+            tracing::debug!("connect: typing cancel failed (ignored): {error}");
+        }
         self.clear_cancel_token(key).await;
     }
 
@@ -1748,13 +2463,16 @@ impl ConnectBridge {
         reply_ctx: ReplyCtx,
         session_id: &str,
         mut rx: broadcast::Receiver<AgentEvent>,
+        typing_cancel: CancellationToken,
     ) {
         // 回复出口包一层切换标记装饰器：模型生成的文本经它解析
         // [SET_MODEL]/[SET_THINK] 并应用到会话覆盖（下一条消息生效）。
+        // 装饰器同时持有 typing 取消口：首条出站回复发出即停"正在输入中"。
         let platform: Arc<dyn Platform> = Arc::new(MarkerPlatform {
             bridge: self.clone(),
             key: key.to_string(),
             inner: platform,
+            typing_cancel: Some(typing_cancel),
         });
         let mut stream_state: Option<Box<render::StreamState>> = None;
         'stream: loop {
@@ -2352,6 +3070,7 @@ mod tests {
             agent: state.agent.clone(),
             tools: state.tools_for(ToolSurface::Root),
             session_repo: state.session_repo.clone(),
+            session_store: state.session_store.clone(),
             agent_runners: state.agent_runners.clone(),
             session_event_senders: state.session_event_senders.clone(),
             account_feed_inbox: None,
@@ -2395,6 +3114,140 @@ mod tests {
             user_id: "7".to_string(),
         };
         assert_eq!(key.as_string(), "telegram:42:7");
+    }
+
+    #[test]
+    fn command_text_and_index_normalization_handle_fullwidth_forms() {
+        // 全角斜杠/空格归一（命令识别专用，正文不受影响）。
+        assert_eq!(normalize_command_text("／think　high"), "/think high");
+        assert_eq!(normalize_command_text("　/stop　"), "/stop");
+        assert_eq!(normalize_command_text("/stop@MyBot"), "/stop");
+        // 全角数字序号。
+        assert_eq!(parse_session_index_arg(Some("１")), Some(0));
+        assert_eq!(parse_session_index_arg(Some("３")), Some(2));
+        assert_eq!(parse_session_index_arg(Some("１０")), Some(9));
+        assert_eq!(parse_session_index_arg(Some("２０")), Some(19));
+        assert_eq!(parse_session_index_arg(Some("abc")), None);
+        assert_eq!(parse_session_index_arg(Some("0")), None);
+        assert_eq!(parse_session_index_arg(None), None);
+    }
+
+    /// 会话管理 API 全流程：新建（立即落盘）→ 列表（含当前标记）→
+    /// 切换 → 删除当前（映射一并移除）。
+    #[tokio::test]
+    async fn connect_session_management_lifecycle() {
+        let (ctx, _dir) = test_context().await;
+        let bridge = Arc::new(ConnectBridge::new(ctx, None));
+        let key = key_for("chat-1", "user-1");
+
+        let first = bridge
+            .create_session_for_key(&key)
+            .await
+            .expect("first session created");
+        assert_eq!(
+            first
+                .metadata
+                .get("created_by_connect_key")
+                .map(String::as_str),
+            Some(key.as_str())
+        );
+        let listed = bridge.list_connect_sessions(Some("fake")).await;
+        assert_eq!(listed.len(), 1, "one session listed: {listed:?}");
+        assert_eq!(listed[0].session_id, first.id);
+        assert!(listed[0].is_current);
+
+        let second = bridge
+            .create_session_for_key(&key)
+            .await
+            .expect("second session created");
+        assert_ne!(second.id, first.id);
+        let listed = bridge.list_connect_sessions(Some("fake")).await;
+        assert_eq!(listed.len(), 2);
+        assert!(listed
+            .iter()
+            .any(|summary| summary.session_id == second.id && summary.is_current));
+        assert!(listed
+            .iter()
+            .any(|summary| summary.session_id == first.id && !summary.is_current));
+
+        bridge
+            .activate_session_for_key(&key, &first.id)
+            .await
+            .expect("switch back to first");
+        assert_eq!(
+            bridge.session_id_for_key(&key).await.as_deref(),
+            Some(first.id.as_str())
+        );
+
+        assert!(bridge
+            .delete_connect_session(&first.id)
+            .await
+            .expect("delete current session"));
+        assert_eq!(bridge.session_id_for_key(&key).await, None);
+        let listed = bridge.list_connect_sessions(Some("fake")).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, second.id);
+
+        // 平台过滤：另一个平台的会话不混入。
+        let other_key = SessionKey {
+            platform: "other".to_string(),
+            chat_id: "chat-1".to_string(),
+            user_id: "user-1".to_string(),
+        }
+        .as_string();
+        assert!(bridge.create_session_for_key(&other_key).await.is_ok());
+        assert_eq!(bridge.list_connect_sessions(Some("fake")).await.len(), 1);
+        assert_eq!(bridge.list_connect_sessions(None).await.len(), 2);
+    }
+
+    /// 自动项目工作区候选：默认在数据目录下；祖先被现有项目占住不算
+    /// 冲突（嵌套允许）；与现有项目根**完全相同**才递增编号；绝对路径
+    /// 配置原样使用、不编号。
+    #[tokio::test]
+    async fn wechat_auto_project_workspace_candidates_numbered_under_data_dir() {
+        let (ctx, _dir) = test_context().await;
+        let bridge = ConnectBridge::new(ctx.clone(), None);
+        let settings = bamboo_config::WechatAutoProjectConfig::default();
+        let data_dir = ctx.project_store.paths().data_dir().to_path_buf();
+
+        let candidates = bridge.wechat_workspace_candidates(&settings);
+        assert_eq!(candidates.first().unwrap(), &data_dir.join("work_wechat"));
+        assert_eq!(candidates.get(1).unwrap(), &data_dir.join("work_wechat_1"));
+        assert_eq!(candidates.get(9).unwrap(), &data_dir.join("work_wechat_9"));
+
+        // 祖先被占（项目圈住整个数据目录）：默认候选不算已注册，可用。
+        ctx.project_store
+            .create_with_project_path(
+                "Blocking Ancestor".to_string(),
+                None,
+                data_dir.to_string_lossy().into_owned(),
+                Vec::new(),
+            )
+            .expect("blocking ancestor project");
+        assert!(!bridge.workspace_root_already_registered(&candidates[0]));
+
+        // 与现有项目根完全相同：该编号被占，下一个可用。
+        std::fs::create_dir_all(data_dir.join("work_wechat")).unwrap();
+        ctx.project_store
+            .create_with_project_path(
+                "Exact Owner".to_string(),
+                None,
+                data_dir.join("work_wechat").to_string_lossy().into_owned(),
+                Vec::new(),
+            )
+            .expect("exact-root project");
+        assert!(bridge.workspace_root_already_registered(&candidates[0]));
+        assert!(!bridge.workspace_root_already_registered(&candidates[1]));
+
+        // 绝对路径：单个候选原样返回、不编号。
+        let absolute = bamboo_config::WechatAutoProjectConfig {
+            workspace: Some(r"D:\work_wechat".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            bridge.wechat_workspace_candidates(&absolute),
+            vec![PathBuf::from(r"D:\work_wechat")]
+        );
     }
 
     // ---- Issue #454 follow-up: bounded dedup set ----
@@ -2602,7 +3455,13 @@ mod tests {
         );
         assert_eq!(
             session.workspace_path_meta().as_deref(),
-            project.project_path.as_deref()
+            project
+                .project_path
+                .as_deref()
+                .map(
+                    |path| bamboo_config::paths::path_to_display_string(std::path::Path::new(path))
+                )
+                .as_deref()
         );
         assert_eq!(
             session
@@ -2622,16 +3481,20 @@ mod tests {
             bamboo_agent_core::workspace_state::get_workspace(&session.id)
                 .as_deref()
                 .map(bamboo_config::paths::path_to_display_string),
-            project.project_path.clone()
+            project.project_path.clone().map(|path| {
+                bamboo_config::paths::path_to_display_string(std::path::Path::new(&path))
+            })
         );
-        let project_path_display = project.project_path.as_deref().expect("Project path");
+        let project_path_display = bamboo_config::paths::path_to_display_string(
+            std::path::Path::new(project.project_path.as_deref().expect("Project path")),
+        );
         let system_prompt = session
             .messages
             .iter()
             .find(|message| matches!(message.role, bamboo_agent_core::Role::System))
             .expect("Connect system prompt");
         assert_eq!(system_prompt.content, resolved.system_prompt);
-        assert!(!system_prompt.content.contains(project_path_display));
+        assert!(!system_prompt.content.contains(&project_path_display));
         assert!(!system_prompt
             .content
             .contains("BAMBOO_WORKSPACE_CONTEXT_START"));
@@ -2643,10 +3506,10 @@ mod tests {
         assert!(snapshot
             .workspace_context
             .as_deref()
-            .is_some_and(|value| value.contains(project_path_display)));
+            .is_some_and(|value| value.contains(&project_path_display)));
         assert!(!snapshot
             .effective_system_prompt
-            .contains(project_path_display));
+            .contains(&project_path_display));
         assert!(!snapshot
             .effective_system_prompt
             .contains("BAMBOO_WORKSPACE_CONTEXT_START"));
@@ -2768,7 +3631,13 @@ mod tests {
         );
         assert_eq!(
             session.workspace_path_meta().as_deref(),
-            connect_project.project_path.as_deref()
+            connect_project
+                .project_path
+                .as_deref()
+                .map(
+                    |path| bamboo_config::paths::path_to_display_string(std::path::Path::new(path))
+                )
+                .as_deref()
         );
     }
 
@@ -3071,7 +3940,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -3183,7 +4059,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-legacy", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-legacy",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -3263,6 +4146,7 @@ mod tests {
                 reply_ctx,
                 "sess-external",
                 rx,
+                Default::default(),
             ),
         )
         .await
@@ -3324,7 +4208,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-retry", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-retry",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -3435,7 +4326,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -3498,7 +4396,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -3597,6 +4502,54 @@ mod tests {
         assert_eq!(think, Some(bamboo_domain::reasoning::ReasoningEffort::High));
         let sent = platform.sent.lock().await.clone();
         assert!(sent.iter().any(|text| text.contains("智能度已切换为 high")));
+
+        // /switch_think 别名 + 全角空格（中文输入法）也要被识别为命令。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-alias", "/switch_think\u{3000}medium"),
+        )
+        .await;
+        let (_, think) = bridge.load_session_override(&key).await;
+        assert_eq!(
+            think,
+            Some(bamboo_domain::reasoning::ReasoningEffort::Medium),
+            "/switch_think with an ideographic space must switch the effort"
+        );
+
+        // 恢复 high 供后续断言。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-alias-2", "/think high"),
+        )
+        .await;
+
+        // 全角斜杠 + 全角空格（中文输入法整句全角）同样要命中命令。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-fullwidth", "／THINK　low"),
+        )
+        .await;
+        let (_, think) = bridge.load_session_override(&key).await;
+        assert_eq!(
+            think,
+            Some(bamboo_domain::reasoning::ReasoningEffort::Low),
+            "full-width slash + ideographic space must still be a command"
+        );
+
+        // 恢复 high 供后续断言。
+        ConnectBridge::handle_inbound(
+            bridge.clone(),
+            platform.clone(),
+            vec!["u1".to_string()],
+            inbound("chat1", "u1", "ov-fullwidth-2", "/think high"),
+        )
+        .await;
 
         // /think 查询显示会话手动档。
         ConnectBridge::handle_inbound(
@@ -3724,6 +4677,7 @@ mod tests {
         }
 
         let wrapped: Arc<dyn Platform> = Arc::new(MarkerPlatform {
+            typing_cancel: None,
             bridge: bridge.clone(),
             key: key.clone(),
             inner: inner.clone(),
@@ -3937,7 +4891,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -4008,7 +4969,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -4083,7 +5051,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -4134,7 +5109,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -4203,7 +5185,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -4335,7 +5324,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };
@@ -4397,7 +5393,14 @@ mod tests {
             let key = key.clone();
             tokio::spawn(async move {
                 bridge
-                    .render_until_settled(&key, platform, reply_ctx, "sess-1", rx)
+                    .render_until_settled(
+                        &key,
+                        platform,
+                        reply_ctx,
+                        "sess-1",
+                        rx,
+                        Default::default(),
+                    )
                     .await;
             })
         };

@@ -577,6 +577,7 @@ pub async fn build_connect_manager(
     agent: Arc<Agent>,
     tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>,
     session_repo: bamboo_engine::SessionRepository,
+    session_store: Arc<SessionStoreV2>,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     session_event_senders: Arc<RwLock<HashMap<String, broadcast::Sender<AgentEvent>>>>,
     account_feed_inbox: Option<bamboo_engine::execution::AccountFeedInbox>,
@@ -639,6 +640,7 @@ pub async fn build_connect_manager(
         agent,
         tools,
         session_repo,
+        session_store,
         agent_runners,
         session_event_senders,
         account_feed_inbox,
@@ -663,6 +665,8 @@ mod connect_project_mapping_tests {
     ) -> bamboo_config::ConnectPlatformConfig {
         bamboo_config::ConnectPlatformConfig {
             voice: None,
+            dream: None,
+            auto_project: None,
             voice_api_key: None,
             voice_api_key_encrypted: None,
             voice_api_key_credential_ref: None,
@@ -682,6 +686,7 @@ mod connect_project_mapping_tests {
             domain: None,
             allow_from: vec!["allowed".to_string()],
             trust_first_sender: false,
+            typing_indicator: true,
             admin_from: Vec::new(),
         }
     }

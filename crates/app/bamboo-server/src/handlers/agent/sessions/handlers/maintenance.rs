@@ -2,7 +2,10 @@ use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
 use bamboo_agent_core::{Session, Storage};
-use bamboo_engine::auto_dream::{run_project_auto_dream_once_for_project, AutoDreamContext};
+use bamboo_engine::auto_dream::{
+    run_project_auto_dream_once_for_project, run_project_auto_dream_once_for_session,
+    AutoDreamContext,
+};
 use bamboo_engine::project_context::ProjectContextResolver;
 use bamboo_memory::memory_store::MemoryStore;
 use bamboo_storage::{CleanupMode, CleanupResult};
@@ -98,10 +101,103 @@ fn dream_memory_store(state: &AppState) -> MemoryStore {
     state.memory_store.clone()
 }
 
-/// `POST /api/v1/sessions/{session_id}/project-dream/run`
+// ---------------------------------------------------------------------------
+// 手动 Project Dream 的任务注册表：进程内存态（与扫码登录的
+// `QR_CONFIRMED_TOKENS` 同款取舍）。服务重启后未完成的 job 查询返回
+// 404，前端据此提示；同一项目同时只允许一场在跑（防手动+定时叠加）。
+// 已完结的 job 保留 30 分钟供查询，总量封顶防泄漏。
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+enum ProjectDreamJobStatus {
+    Running,
+    Succeeded {
+        dream_generated: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        used_model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_count: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        generated_at: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_generation: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        notebook_chars: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    Failed {
+        error: String,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ProjectDreamJob {
+    job_id: String,
+    session_id: String,
+    /// `project`（整合项目全部候选会话）| `session`（仅触发会话本身）。
+    scope: String,
+    project_id: bamboo_domain::ProjectId,
+    started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    state: ProjectDreamJobStatus,
+}
+
+/// 已完结 job 的保留窗口；过期条目在下一次插入/查询时清扫。
+const PROJECT_DREAM_JOB_RETENTION: chrono::TimeDelta = chrono::TimeDelta::minutes(30);
+/// 注册表总量上限（到达后优先丢弃最旧的已完结条目）。
+const PROJECT_DREAM_JOB_CAP: usize = 200;
+
+fn project_dream_jobs(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, ProjectDreamJob>> {
+    static JOBS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, ProjectDreamJob>>,
+    > = std::sync::OnceLock::new();
+    JOBS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 清扫过期/超量的已完结 job（调用方持有锁时调用）。
+fn prune_project_dream_jobs(jobs: &mut std::collections::HashMap<String, ProjectDreamJob>) {
+    let now = chrono::Utc::now();
+    jobs.retain(|_, job| match job.finished_at {
+        None => true,
+        Some(finished_at) => now.signed_duration_since(finished_at) < PROJECT_DREAM_JOB_RETENTION,
+    });
+    while jobs.len() > PROJECT_DREAM_JOB_CAP {
+        let oldest = jobs
+            .iter()
+            .filter(|(_, job)| job.finished_at.is_some())
+            .min_by_key(|(_, job)| job.finished_at)
+            .map(|(id, _)| id.clone());
+        match oldest {
+            Some(id) => {
+                jobs.remove(&id);
+            }
+            None => break,
+        }
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProjectDreamRunRequest {
+    /// `project`（默认）整合项目全部候选会话；`session` 仅整合触发会话
+    /// 本身（含其子会话），其余会话留给下一次整项目 Dream。
+    #[serde(default)]
+    scope: String,
+}
+
+/// `POST /api/v1/sessions/{session_id}/project-dream/run` — 启动一场
+/// Project Dream 并立即返回（202 + job_id）；结果通过
+/// `GET .../project-dream/run/{job_id}` 轮询。一场 Dream 要加载项目会话、
+/// 拼提示词、流式跑完整 LLM 生成再写快照——模型慢或会话多时轻松超过
+/// 反向代理（frp 等）的网关超时，所以不在请求内 await。
 pub async fn run_project_dream(
     state: web::Data<AppState>,
     path: web::Path<String>,
+    payload: Option<web::Json<ProjectDreamRunRequest>>,
 ) -> Result<HttpResponse> {
     let session_id = path.into_inner();
     let Some(session) = load_session_from_state_or_storage(&state, &session_id).await? else {
@@ -109,6 +205,25 @@ pub async fn run_project_dream(
             "error": crate::error::error_value("Session not found"),
             "session_id": session_id
         })));
+    };
+
+    let scope = payload
+        .map(|body| body.into_inner().scope)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(scope.as_str(), "" | "project" | "session") {
+        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+            "error": crate::error::error_value(
+                "scope must be \"project\" or \"session\"",
+            ),
+            "session_id": session_id
+        })));
+    }
+    let scope = if scope.is_empty() {
+        "project".to_string()
+    } else {
+        scope
     };
 
     let project_id = match ProjectContextResolver::session_project_identity(&session) {
@@ -139,36 +254,145 @@ pub async fn run_project_dream(
         config: state.config.clone(),
         provider_registry: state.provider_registry.clone(),
     };
-    let result = run_project_auto_dream_once_for_project(&ctx, &project_id)
-        .await
-        .map_err(|error| {
-            crate::error::json_internal_server_error(format!(
-                "Failed to run project Dream generation: {error}"
-            ))
-        })?;
 
-    let response = match result {
-        Some(result) => serde_json::json!({
-            "success": true,
-            "session_id": session_id,
-            "project_id": project_id,
-            "dream_generated": true,
-            "used_model": result.used_model,
-            "session_count": result.session_count,
-            "generated_at": result.generated_at,
-            "source_generation": result.source_generation,
-            "notebook_chars": result.notebook_chars,
-        }),
-        None => serde_json::json!({
-            "success": true,
-            "session_id": session_id,
-            "project_id": project_id,
-            "dream_generated": false,
-            "message": "No project Dream update was needed"
-        }),
-    };
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let started_at = chrono::Utc::now();
+    {
+        let mut jobs = project_dream_jobs()
+            .lock()
+            .expect("project dream jobs lock");
+        prune_project_dream_jobs(&mut jobs);
+        // 同项目单飞：已有在跑的场次（手动或定时触发）就直接复用它。
+        if let Some(running) = jobs.values().find(|job| {
+            job.project_id == project_id && matches!(job.state, ProjectDreamJobStatus::Running)
+        }) {
+            return Ok(HttpResponse::Accepted().json(serde_json::json!({
+                "success": true,
+                "status": "already_running",
+                "job_id": running.job_id,
+                "session_id": running.session_id,
+                "project_id": running.project_id,
+                "started_at": running.started_at,
+            })));
+        }
+        jobs.insert(
+            job_id.clone(),
+            ProjectDreamJob {
+                job_id: job_id.clone(),
+                session_id: session_id.clone(),
+                scope: scope.clone(),
+                project_id: project_id.clone(),
+                started_at,
+                finished_at: None,
+                state: ProjectDreamJobStatus::Running,
+            },
+        );
+    }
 
-    Ok(HttpResponse::Ok().json(response))
+    tracing::info!(
+        target: "bamboo.memory",
+        job_id = %job_id,
+        project_id = %project_id,
+        "project dream run accepted (async)"
+    );
+    let task_job_id = job_id.clone();
+    let task_project_id = project_id.clone();
+    let task_scope = scope.clone();
+    let task_session_id = session_id.clone();
+    tokio::spawn(async move {
+        let outcome = if task_scope == "session" {
+            run_project_auto_dream_once_for_session(&ctx, &task_project_id, &task_session_id).await
+        } else {
+            run_project_auto_dream_once_for_project(&ctx, &task_project_id).await
+        };
+        let finished_at = chrono::Utc::now();
+        let state = match outcome {
+            Ok(Some(result)) => ProjectDreamJobStatus::Succeeded {
+                dream_generated: true,
+                used_model: Some(result.used_model),
+                session_count: Some(result.session_count),
+                generated_at: Some(result.generated_at),
+                source_generation: Some(result.source_generation),
+                notebook_chars: Some(result.notebook_chars),
+                message: None,
+            },
+            Ok(None) => ProjectDreamJobStatus::Succeeded {
+                dream_generated: false,
+                used_model: None,
+                session_count: None,
+                generated_at: None,
+                source_generation: None,
+                notebook_chars: None,
+                message: Some("No project Dream update was needed".to_string()),
+            },
+            Err(error) => {
+                tracing::warn!(
+                    target: "bamboo.memory",
+                    job_id = %task_job_id,
+                    project_id = %task_project_id,
+                    "project dream run failed: {error}"
+                );
+                ProjectDreamJobStatus::Failed {
+                    error: error.to_string(),
+                }
+            }
+        };
+        let mut jobs = project_dream_jobs()
+            .lock()
+            .expect("project dream jobs lock");
+        prune_project_dream_jobs(&mut jobs);
+        if let Some(job) = jobs.get_mut(&task_job_id) {
+            job.finished_at = Some(finished_at);
+            job.state = state;
+        }
+    });
+
+    Ok(HttpResponse::Accepted().json(serde_json::json!({
+        "success": true,
+        "status": "running",
+        "job_id": job_id,
+        "session_id": session_id,
+        "project_id": project_id,
+    })))
+}
+
+/// `GET /api/v1/sessions/{session_id}/project-dream/run/{job_id}` — 查询
+/// 一场 Project Dream 的执行状态（`running` / `succeeded` / `failed`），
+/// 完成时带出与旧同步响应同名的结果字段。
+pub async fn get_project_dream_status(
+    _state: web::Data<AppState>,
+    path: web::Path<(String, String)>,
+) -> Result<HttpResponse> {
+    let (_session_id, job_id) = path.into_inner();
+    let jobs = project_dream_jobs()
+        .lock()
+        .expect("project dream jobs lock");
+    match jobs.get(&job_id) {
+        Some(job) => {
+            let mut body = serde_json::json!({
+                "success": true,
+                "job_id": job.job_id,
+                "session_id": job.session_id,
+                "project_id": job.project_id,
+                "scope": job.scope,
+                "started_at": job.started_at,
+            });
+            if let Some(finished_at) = job.finished_at {
+                body["finished_at"] = serde_json::json!(finished_at);
+            }
+            // tagged 状态体（"status" + 各分支字段）摊平进响应顶层。
+            if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(&job.state) {
+                for (key, value) in fields {
+                    body[key] = value;
+                }
+            }
+            Ok(HttpResponse::Ok().json(body))
+        }
+        None => Ok(HttpResponse::NotFound().json(serde_json::json!({
+            "error": crate::error::error_value("Project Dream job not found"),
+            "job_id": job_id
+        }))),
+    }
 }
 
 /// `POST /api/v1/sessions/cleanup`
@@ -363,19 +587,43 @@ mod tests {
             .await
             .expect("save session");
 
+        // 同项目的第二个会话：scope=session 只应整合触发会话一个来源。
+        let mut second = bamboo_agent_core::Session::new("session-http-project-dream-2", "model");
+        second.title = "HTTP Project Dream 2".to_string();
+        second.set_project_id_meta(project.id.to_string());
+        second.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+        second.conversation_summary = Some(ConversationSummary::new(
+            "Second project-scoped session that scope=session must skip.",
+            3,
+            120,
+        ));
+        second.add_message(Message::user("Second session content."));
+        app_state
+            .storage
+            .save_session(&second)
+            .await
+            .expect("save second session");
         let app = test::init_service(
             App::new()
                 .app_data(app_state.clone())
                 .configure(configure_routes),
         )
         .await;
+        // 新语义：POST 立即 202 + job_id，后台跑完后由状态端点给出结果。
         let req = test::TestRequest::post()
             .uri("/api/v1/sessions/session-http-project-dream/project-dream/run")
+            .set_json(serde_json::json!({ "scope": "session" }))
             .to_request();
         let resp = test::call_service(&app, req).await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body.get("success").and_then(Value::as_bool), Some(true));
+        assert_eq!(body.get("status").and_then(Value::as_str), Some("running"));
+        let job_id = body
+            .get("job_id")
+            .and_then(Value::as_str)
+            .expect("job_id")
+            .to_string();
         assert_eq!(
             body.get("session_id").and_then(Value::as_str),
             Some("session-http-project-dream")
@@ -383,6 +631,32 @@ mod tests {
         assert_eq!(
             body.get("project_id").and_then(Value::as_str),
             Some(project.id.as_str())
+        );
+
+        // 轮询状态端点直到终态（后台任务很快：SequenceProvider 即时返回）。
+        let status_uri =
+            format!("/api/v1/sessions/session-http-project-dream/project-dream/run/{job_id}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let body = loop {
+            let poll =
+                test::call_service(&app, test::TestRequest::get().uri(&status_uri).to_request())
+                    .await;
+            assert_eq!(poll.status(), StatusCode::OK);
+            let body: Value = test::read_body_json(poll).await;
+            match body.get("status").and_then(Value::as_str) {
+                Some("succeeded") | Some("failed") => break body,
+                _ => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "project dream job never settled"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+        assert_eq!(
+            body.get("status").and_then(Value::as_str),
+            Some("succeeded")
         );
         assert_eq!(
             body.get("dream_generated").and_then(Value::as_bool),

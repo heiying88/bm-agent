@@ -193,6 +193,20 @@ pub trait Platform: Send + Sync {
         Ok(())
     }
 
+    /// "正在输入中"指示（picoclaw/openclaw 同款体验）：机器人在后台思考
+    /// 期间让聊天窗口显示 typing 状态。bridge 在一次运行期间周期性调用，
+    /// 发出首条回复后停止。默认 no-op——只有支持该指示的适配器（微信
+    /// iLink `sendtyping`）实现它；失败只记日志，绝不影响运行本身。
+    async fn send_typing(&self, _ctx: &ReplyCtx) -> PlatformResult<()> {
+        Ok(())
+    }
+
+    /// 主动停止"正在输入中"指示（如微信 sendtyping 的 status=2 cancel）。
+    /// 默认 no-op；不支持或未开始过指示的平台直接成功。
+    async fn stop_typing(&self, _ctx: &ReplyCtx) -> PlatformResult<()> {
+        Ok(())
+    }
+
     /// "信任首个发信人"闩锁（v0.0.4）：配置开启且尚未记录首信人时为 true。
     /// bridge 据此放行第一条入站消息并记录其发送者，而不是拒绝它。
     fn wants_first_sender_trust(&self) -> bool {

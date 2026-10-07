@@ -29,15 +29,17 @@ pub use access_control::{
     PairingCodeEntry, PairingCodeGuard, RootPasswordGuard,
 };
 pub use bamboo_config::{
-    clear_credential, confirm_config_recovery, detect_codex_cli, get_bamboo_config,
-    get_bamboo_tools, get_config_recovery_status, get_connect_config, get_credential_status,
-    get_live_config_health, get_mcp_section, get_model_limit_defaults, get_notification_config,
-    get_provider_section, get_provider_settings_section, get_proxy_auth_status, get_typed_section,
-    list_credentials, post_wechat_qr_apply, post_wechat_qr_start, post_wechat_qr_status,
-    put_connect_config, put_mcp_section, put_notification_config, put_provider_section,
-    put_provider_settings_section, put_typed_section, replace_credential, reset_bamboo_config,
-    reset_credentials, reset_typed_section, set_bamboo_config, set_proxy_auth,
-    validate_bamboo_config_patch, ProxyAuthPayload,
+    clear_credential, confirm_config_recovery, delete_connect_session, detect_codex_cli,
+    get_bamboo_config, get_bamboo_tools, get_config_recovery_status, get_connect_config,
+    get_connect_sessions, get_credential_status, get_live_config_health, get_mcp_section,
+    get_model_limit_defaults, get_notification_config, get_provider_section,
+    get_provider_settings_section, get_proxy_auth_status, get_typed_section, list_credentials,
+    post_connect_session, post_connect_session_activate, post_wechat_qr_apply,
+    post_wechat_qr_start, post_wechat_qr_status, put_connect_config, put_mcp_section,
+    put_notification_config, put_provider_section, put_provider_settings_section,
+    put_typed_section, replace_credential, reset_bamboo_config, reset_credentials,
+    reset_typed_section, set_bamboo_config, set_proxy_auth, validate_bamboo_config_patch,
+    ProxyAuthPayload,
 };
 pub use cluster_fabric::{
     create_cluster, create_node, delete_cluster, delete_node, get_node, list_nodes, node_deploy,

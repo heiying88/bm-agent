@@ -36,7 +36,7 @@ interface ChatItemProps {
   onUnpin: (sessionId: string) => void;
   onEdit?: (sessionId: string, newTitle: string) => void;
   onGenerateTitle?: (sessionId: string) => void;
-  onRunProjectDream?: (sessionId: string) => void;
+  onRunProjectDream?: (sessionId: string, scope?: "project" | "session") => void;
   onScheduleThis?: (sessionId: string) => void;
   onCopy?: (sessionId: string) => void;
   isGeneratingTitle?: boolean;
@@ -174,6 +174,16 @@ const ChatItemComponent: React.FC<ChatItemProps> = ({
             onClick: ({ domEvent }: { domEvent: React.MouseEvent | React.KeyboardEvent }) => {
               domEvent.stopPropagation();
               onRunProjectDream(chat.id);
+            },
+          },
+          {
+            key: "run-project-dream-session",
+            icon: isRunningProjectDream ? <LoadingOutlined /> : <CloudSyncOutlined />,
+            label: t("chat.actions.runProjectDreamSessionOnly"),
+            disabled: isRunningProjectDream,
+            onClick: ({ domEvent }: { domEvent: React.MouseEvent | React.KeyboardEvent }) => {
+              domEvent.stopPropagation();
+              onRunProjectDream(chat.id, "session");
             },
           },
         ]

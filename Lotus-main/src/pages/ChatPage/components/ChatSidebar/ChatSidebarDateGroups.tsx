@@ -105,7 +105,7 @@ type ChatSidebarDateGroupsProps = {
   onUnpinChat: (sessionId: string) => void;
   onEditTitle: (sessionId: string, title: string) => void;
   onGenerateTitle: (sessionId: string) => void;
-  onRunProjectDream: (sessionId: string) => void;
+  onRunProjectDream: (sessionId: string, scope?: "project" | "session") => void;
   onScheduleThis: (sessionId: string) => void;
   onCopy?: (sessionId: string) => void;
   titleGenerationState: Record<string, { status: "loading" | "error" | "idle"; error?: string }>;

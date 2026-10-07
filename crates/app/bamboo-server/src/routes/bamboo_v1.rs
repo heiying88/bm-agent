@@ -222,6 +222,22 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(settings::post_wechat_qr_apply),
         )
         .route(
+            "/bamboo/connect/sessions",
+            web::get().to(settings::get_connect_sessions),
+        )
+        .route(
+            "/bamboo/connect/sessions",
+            web::post().to(settings::post_connect_session),
+        )
+        .route(
+            "/bamboo/connect/sessions/{session_id}/activate",
+            web::post().to(settings::post_connect_session_activate),
+        )
+        .route(
+            "/bamboo/connect/sessions/{session_id}",
+            web::delete().to(settings::delete_connect_session),
+        )
+        .route(
             "/bamboo/proxy-auth",
             web::post().to(settings::set_proxy_auth),
         )

@@ -1498,6 +1498,7 @@ mod tests {
             agent: state.agent.clone(),
             tools: state.tools_for(crate::tools::ToolSurface::Root),
             session_repo: state.session_repo.clone(),
+            session_store: state.session_store.clone(),
             agent_runners: state.agent_runners.clone(),
             session_event_senders: state.session_event_senders.clone(),
             account_feed_inbox: None,

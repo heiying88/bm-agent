@@ -211,6 +211,30 @@ export interface WechatQrApplyPayload {
   voice_api_key_change?: CredentialAction;
 }
 
+/** One connect-bridged session row (`GET /bamboo/connect/sessions`). */
+export interface ConnectSessionSummary {
+  session_id: string;
+  connect_key: string;
+  platform: string;
+  chat_id: string;
+  user_id: string;
+  title: string;
+  project_id?: string | null;
+  workspace_path?: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+  is_current: boolean;
+}
+
+/** `POST /bamboo/connect/sessions` result. */
+export interface ConnectSessionCreated {
+  session_id: string;
+  connect_key: string;
+  title: string;
+  project_id?: string | null;
+}
+
 export type ClusterNodeStatus =
   | "not_deployed"
   | "deploying"
@@ -921,6 +945,39 @@ class ConfigSectionsService {
     } catch (error) {
       return mapConflict(error, payload.expected_revision);
     }
+  }
+
+  // ---- connect 会话管理（设置页微信连接区块的会话面板）----
+
+  /** List connect-bridged sessions, optionally filtered by platform. */
+  async listConnectSessions(platform?: string): Promise<ConnectSessionSummary[]> {
+    const query = platform ? `?platform=${encodeURIComponent(platform)}` : "";
+    const response = await apiClient.get<{ sessions: ConnectSessionSummary[] }>(
+      `/bamboo/connect/sessions${query}`,
+    );
+    return response.sessions ?? [];
+  }
+
+  /** Create a fresh session for a connect chat (`/new`, immediately). */
+  async createConnectSession(payload: {
+    platform: string;
+    chat_id: string;
+    user_id?: string;
+  }): Promise<ConnectSessionCreated> {
+    return apiClient.post<ConnectSessionCreated>("/bamboo/connect/sessions", payload);
+  }
+
+  /** Switch a chat's current session back to a past connect session. */
+  async activateConnectSession(sessionId: string, connectKey: string): Promise<void> {
+    await apiClient.post(
+      `/bamboo/connect/sessions/${encodeURIComponent(sessionId)}/activate`,
+      { connect_key: connectKey },
+    );
+  }
+
+  /** Delete a connect session (bridge mapping is detached first server-side). */
+  async deleteConnectSession(sessionId: string): Promise<void> {
+    await apiClient.delete(`/bamboo/connect/sessions/${encodeURIComponent(sessionId)}`);
   }
 
   async upsertEnvVar(

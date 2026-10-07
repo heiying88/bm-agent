@@ -1595,6 +1595,8 @@ mod tests {
     fn connect_platform(platform_type: &str, token: &str) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
             voice: None,
+            dream: None,
+            auto_project: None,
             voice_api_key: None,
             voice_api_key_encrypted: None,
             voice_api_key_credential_ref: None,
@@ -1613,6 +1615,8 @@ mod tests {
             app_secret_configured: false,
             domain: None,
             allow_from: Vec::new(),
+            trust_first_sender: false,
+            typing_indicator: true,
             admin_from: Vec::new(),
         }
     }
@@ -1624,6 +1628,8 @@ mod tests {
     ) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
             voice: None,
+            dream: None,
+            auto_project: None,
             voice_api_key: None,
             voice_api_key_encrypted: None,
             voice_api_key_credential_ref: None,
@@ -2019,6 +2025,8 @@ mod tests {
     fn feishu_platform(app_secret: &str) -> crate::ConnectPlatformConfig {
         crate::ConnectPlatformConfig {
             voice: None,
+            dream: None,
+            auto_project: None,
             voice_api_key: None,
             voice_api_key_encrypted: None,
             voice_api_key_credential_ref: None,
@@ -2037,6 +2045,8 @@ mod tests {
             app_secret_configured: false,
             domain: Some("lark".to_string()),
             allow_from: Vec::new(),
+            trust_first_sender: false,
+            typing_indicator: true,
             admin_from: Vec::new(),
         }
     }
