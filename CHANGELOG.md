@@ -12,6 +12,12 @@
 而非 SemVer 点版本。nightly 之间的变更记录在 git 历史与已合并 PR（事实源）中；
 下面的 SemVer 小节仅为历史上的 `0.x` 版本保留。
 
+- 修复 Web 前端权限确认 409（Permission interactions require the typed
+  decision endpoint）：实时 need_clarification SSE 事件不携带权限契约（引擎
+  事件无权限字段），前端误走旧版 respond 提交被服务端拒绝。现事件到达时
+  若无 typed 权限信号，自动经 GET pending-question 补水权限契约并改走
+  /permission-decisions typed 端点（会话在事件发射前已持久化，无竞态）；
+  微信网关审批路径不受影响（走桥接自有流）。
 - 默认系统提示词全面中文化 + 能力自认知：服务端 DEFAULT_BASE_PROMPT 与前端默认提示词
   改为中文（nana 身份、运行时能力说明：持久记忆/Dream 整理/隐私脱敏/渠道，
   [REDACTED] 处理约定），并要求内部推理（reasoning）也使用简体中文；

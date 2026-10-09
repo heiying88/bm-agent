@@ -60,6 +60,9 @@ vi.mock("@shared/store/appStore", () => {
   const selectChildren = (sessionId: string | null) => (state: any) => {
     return state.executionBySession?.[sessionId!]?.children?.byId ?? {};
   };
+  const selectPendingQuestion = (sessionId: string | null) => (state: any) => {
+    return state.executionBySession?.[sessionId!]?.interaction?.pendingQuestion ?? null;
+  };
   const selectPendingChildApproval = (sessionId: string | null) => (state: any) => {
     return state.executionBySession?.[sessionId!]?.interaction?.pendingChildApprovals?.[0] ?? null;
   };
@@ -69,6 +72,7 @@ vi.mock("@shared/store/appStore", () => {
     selectGeneration,
     selectChildren,
     selectPendingChildApproval,
+    selectPendingQuestion,
   };
 });
 
@@ -85,10 +89,13 @@ vi.mock("@services/chat/AgentService", () => {
   // SSE subscriptions are long-lived; default to a never-resolving promise so the hook
   // doesn't interpret the stream as "ended" and attempt to reconnect in tests.
   const mockSubscribeToEvents = vi.fn().mockImplementation(() => new Promise<void>(() => {}));
+  const mockGetPendingQuestion = vi.fn().mockResolvedValue(null);
   return {
     AgentClient: class MockAgentClient {
       subscribeToEvents = mockSubscribeToEvents;
+      getPendingQuestion = mockGetPendingQuestion;
     },
+    __mockGetPendingQuestion: mockGetPendingQuestion,
   };
 });
 
@@ -1447,6 +1454,84 @@ describe("useAgentEventSubscription", () => {
     expect(mockState.clearPendingQuestion).not.toHaveBeenCalled();
     expect(mockState.loadChatHistory).not.toHaveBeenCalled();
     expect(mockState.refreshChatsNow).not.toHaveBeenCalled();
+  });
+
+  it("hydrates typed permission metadata the live need_clarification event cannot carry", async () => {
+    let needClarificationHandler: ((event: any) => void) | undefined;
+
+    mockSubscribeToEvents.mockImplementation((_sessionId: string, handlers: any) => {
+      needClarificationHandler = handlers.onNeedClarification;
+      return new Promise<void>(() => {});
+    });
+
+    const client = new AgentClient();
+    const mockGetPendingQuestion = client.getPendingQuestion as ReturnType<typeof vi.fn>;
+    mockGetPendingQuestion.mockResolvedValueOnce({
+      has_pending_question: true,
+      question: "Approve command?",
+      options: ["Approve", "Deny"],
+      allow_custom: false,
+      tool_call_id: "call-perm-1",
+      permission_request: {
+        request_id: "call-perm-1",
+        session_id: "session-1",
+        reason_code: "configured_always_ask",
+        effective_mode: "default",
+        allowed_decisions: ["allow_once", "deny_once"],
+        suggested_matchers: [{ id: "exact_resource", kind: "exact_resource", value: "npm install" }],
+      },
+    });
+
+    mockState.executionBySession = {
+      "session-1": createBusyExecutionEntry({
+        interaction: {
+          pendingQuestion: {
+            question: "Approve command?",
+            options: ["Approve", "Deny"],
+            allowCustom: false,
+            toolCallId: "call-perm-1",
+            permissionRequest: undefined,
+          },
+          respondMode: null,
+          pendingApproval: null,
+        },
+      }),
+    };
+    mockStore.getState.mockReturnValue(mockState);
+
+    renderHook(() => useAgentEventSubscription());
+
+    await waitFor(() => {
+      expect(mockSubscribeToEvents).toHaveBeenCalled();
+    });
+
+    act(() => {
+      // The engine event carries no permission fields for a permission ask.
+      needClarificationHandler?.({
+        type: "need_clarification",
+        session_id: "session-1",
+        question: "Approve command?",
+        options: ["Approve", "Deny"],
+        allow_custom: false,
+        tool_call_id: "call-perm-1",
+      });
+    });
+
+    await waitFor(() => {
+      expect(mockState.setPendingQuestion).toHaveBeenLastCalledWith(
+        "session-1",
+        expect.objectContaining({
+          toolCallId: "call-perm-1",
+          allowCustom: false,
+          options: ["allow_once", "deny_once"],
+          permissionRequest: expect.objectContaining({
+            requestId: "call-perm-1",
+            reasonCode: "configured_always_ask",
+          }),
+        }),
+      );
+    });
+    expect(mockGetPendingQuestion).toHaveBeenCalledWith("session-1");
   });
 
   it("handles cancelled terminal events", async () => {

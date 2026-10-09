@@ -1,5 +1,5 @@
 import { AgentEvent } from "@services/chat/AgentService";
-import { useAppStore, selectShouldObserve, selectGeneration } from "@shared/store/appStore";
+import { useAppStore, selectShouldObserve, selectGeneration, selectPendingQuestion } from "@shared/store/appStore";
 import { streamingMessageBus } from "../utils/streamingMessageBus";
 import {
   clearAssistantStreamingState,
@@ -610,6 +610,51 @@ export function startAgentSubscription(sessionId: string, ctx: SubscriptionConte
             toolCallId: event.tool_call_id ?? null,
             permissionRequest: typedPermission ?? undefined,
           });
+          if (!typedPermission && event.tool_call_id) {
+            // The live `need_clarification` event cannot carry the typed
+            // permission contract (the engine event has no permission fields),
+            // but the server classifies persisted permission prompts as
+            // permission interactions and rejects legacy respond submissions
+            // with 409. Hydrate the authoritative contract from the REST
+            // pending-question endpoint — the session is persisted BEFORE the
+            // event is emitted, so the GET observes at least this question.
+            const hydrateToolCallId = event.tool_call_id;
+            void (async () => {
+              try {
+                const pending = await agentClientRef.current?.getPendingQuestion(targetSessionId);
+                if (!pending?.has_pending_question) return;
+                if (pending.tool_call_id !== hydrateToolCallId) return;
+                const hydrated = normalizePermissionRequest(pending);
+                if (!hydrated?.requestId) return;
+                const current = selectPendingQuestion(targetSessionId)(useAppStore.getState());
+                if (
+                  !current ||
+                  current.toolCallId !== hydrateToolCallId ||
+                  current.permissionRequest
+                ) {
+                  return;
+                }
+                setPendingQuestion(targetSessionId, {
+                  question: current.question,
+                  options: supportedPermissionDecisionIds(hydrated),
+                  allowCustom: false,
+                  toolCallId: current.toolCallId,
+                  permissionRequest: hydrated,
+                });
+                debugSse("event.needClarification:hydratedPermission", {
+                  sessionId,
+                  targetSessionId,
+                  toolCallId: hydrateToolCallId,
+                });
+              } catch (error) {
+                debugSse("event.needClarification:hydrateFailed", {
+                  sessionId,
+                  targetSessionId,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+            })();
+          }
           // Desktop notification (if any) is delivered by the backend via the
           // `notification` event handled in onNotification below.
         },
