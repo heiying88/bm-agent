@@ -217,6 +217,8 @@ CLIProxyAPI 文档标注默认值为 `0`（禁用）。使用它或其他兼容�
 | `memory_active_capacity` | `0` (unbounded/off) | "活跃"记忆数量的上限，超过后较旧的记忆转入归档。 |
 | `capacity_max_archivals_per_run` | `50` | 单次容量执行遍的上限。 |
 | `granularity_freshness_gardener_enabled` | `true` | 后台的过期/粒度整理遍。 |
+| `dream_privacy_mode` | `"strict"` | Dream 提取源隐私策略：`strict`（默认，命中敏感值即整体剥离该来源）；`redact`（仅把命中片段替换为 `[REDACTED]`，其余内容正常进入整理，持久化候选门禁保持启用）；`off`（不做剥离，敏感内容可能出站到模型服务商，需自担风险）。每次 Dream 运行开始时热加载；非法值回退 strict 并打 WARN。 |
+| `dream_privacy_off_keep_durable_gate` | `true` | 仅 `off` 模式生效：是否仍拒绝把疑似密钥的候选写入持久记忆（最后防线）。strict/redact 下门禁恒为启用。 |
 
 自动会话压缩总是先对有界的来源分块做 map，再对其摘要做 reduce，即使选中的来源本来可以装进一次模型请求。大型终端结果会被归约为多个有界的分段；持久化的摘要保持单一的整体 `summary_target_ratio` 预算。
 
@@ -322,7 +324,7 @@ Codex 的配置、计费影响、隔离细节以及按次运行的 Bamboo token 
 
 ## `connect`——IM 桥接
 
-通过 IM 平台（Telegram、Feishu/Lark）驱动 session。**尽管 `Config` 有一个类型化的 `connect` 字段，它并不存储在 `config.json` 中**——而是存放在自己的同级文件 `${data_dir}/connect.json` 里，由 `Config::merge_connect_config` 加载/合并、由 `Config::save_connect_config` 保存（两者均在 `config.rs` 中）。一份旁边没有 `connect.json` 且没有旧版内联 `connect` 键的 `config.json` 会启动**零**个后台任务——默认完全惰性。
+通过 IM 平台（Telegram、Feishu/Lark、微信）驱动 session。**尽管 `Config` 有一个类型化的 `connect` 字段，它并不存储在 `config.json` 中**——而是存放在自己的同级文件 `${data_dir}/connect.json` 里，由 `Config::merge_connect_config` 加载/合并、由 `Config::save_connect_config` 保存（两者均在 `config.rs` 中）。一份旁边没有 `connect.json` 且没有旧版内联 `connect` 键的 `config.json` 会启动**零**个后台任务——默认完全惰性。
 
 ```json
 {
@@ -338,7 +340,18 @@ Codex 的配置、计费影响、隔离细节以及按次运行的 Bamboo token 
 }
 ```
 
-字段（`ConnectPlatformConfig`）：`id`（稳定的 UUID，保存时自动回填——千万不要假设手写条目里一定有它）、`type`（`"telegram"` \| `"feishu"`；无法识别的值会被跳过并给出启动警告，而不是硬失败）、`token`/`token_encrypted`（bot token，Telegram）、`app_id`（Feishu，非密钥）、`app_secret`/`app_secret_encrypted`（Feishu）、`domain`（仅 Feishu——`None`/`"feishu"` → `open.feishu.cn`，`"lark"` → `open.larksuite.com`，或自托管部署的显式 `https://` 基地址）、`allow_from`（**为空 = 全部拒绝**——有意比本代码库中其他白名单更严格，因为 IM 桥接天然面向互联网）、`admin_from`（会解析，目前未使用）。
+字段（`ConnectPlatformConfig`）：`id`（稳定的 UUID，保存时自动回填——千万不要假设手写条目里一定有它）、`type`（`"telegram"` \| `"feishu"` \| `"wechat"`；无法识别的值会被跳过并给出启动警告，而不是硬失败）、`token`/`token_encrypted`（bot token，Telegram）、`app_id`（Feishu，非密钥）、`app_secret`/`app_secret_encrypted`（Feishu）、`domain`（仅 Feishu——`None`/`"feishu"` → `open.feishu.cn`，`"lark"` → `open.larksuite.com`，或自托管部署的显式 `https://` 基地址）、`allow_from`（**为空 = 全部拒绝**——有意比本代码库中其他白名单更严格，因为 IM 桥接天然面向互联网）、`admin_from`（会解析，目前未使用）。
+
+### 微信平台（`type: "wechat"`）附加字段
+
+- `project_id`：网关会话归属的显式项目；缺省时按 `auto_project` 的项目名解析活跃项目（不自动创建之外的项目）。
+- `auto_project`：首条入站消息自动创建/归属的「微信工作」项目。`enabled`（默认 `true`）、`name`（默认 `"微信工作"`）、`workspace`（默认数据目录下 `work_wechat`；支持绝对路径，拒绝带分隔符的相对路径）。
+- `dream`：微信渠道的 Project Dream 自动运行计划（**独立于 `memory.auto_dream_enabled`**——那个开关只管原生后台 dream 遍）：
+  - `mode`：`"daily"`（默认，每天 `daily_at` 时刻跑一次）| `"idle"`（闲置 `idle_minutes` 分钟后触发，新入站消息重置计时）| `"off"`（关闭）。
+  - `daily_at`：`HH:MM`，默认 `"03:00"`（本地时区）。
+  - `idle_minutes`：1–1440，默认 `30`。
+  - 运行状态持久化在 `${data_dir}/connect_wechat_dream_state.json`，重启不重复跑当日份额。网页设置（连接 → 微信）可配。
+- `typing_indicator`：机器人后台思考期间的「正在输入中」指示，默认开启。
 
 如果 `config.json` 内发现旧版内联 `connect` 键（拆分之前遗留的），下次加载时会自动迁移：收编进 `connect.json`，然后从 `config.json` 中剥离。损坏的 `connect.json` 会被隔离为 `connect.json.bak` 并视为空（故障安全——绝不会静默回退到过期的内联副本）。
 

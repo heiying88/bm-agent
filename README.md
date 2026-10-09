@@ -32,7 +32,7 @@ nana（原名 Bamboo）是运行在你自己机器上的 AI 助手"大脑"。它
 
 | 能力 | 作用 |
 |---|---|
-| 🧠 **记忆系统** | 会话笔记、由 Jiandu 持有的派生 Dream 快照，以及跨会话的持久记忆，配合自动 Dream 与后台 Gardener 维护 |
+| 🧠 **记忆系统** | 会话笔记、由 Jiandu 持有的派生 Dream 快照，以及跨会话的持久记忆，配合自动 Dream 与后台 Gardener 维护；Dream 整理前的隐私策略可配（strict / redact / off，默认 strict，见 docs/config-reference.md） |
 | 🗜️ **上下文压缩** | 混合压缩：滚动摘要 + 最近窗口保留，自动裁剪超长工具输出，按模型上下文窗口预算执行 |
 | 🛠️ **内置工具** | 19 个内置工具：文件、图像、搜索、Shell、Web 抓取、任务、权限请求等 |
 | 🎯 **Skill** | 可选/可发现的 skill，基于请求提示做轻量选择，内置 docx / pdf / pptx / xlsx / skill-creator |

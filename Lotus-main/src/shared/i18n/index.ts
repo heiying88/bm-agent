@@ -1086,7 +1086,7 @@ const buildJaTranslation = (enTranslation: EnTranslation) => ({
         completedFallback: "バックグラウンドタスクが完了しました",
       },
       clarification: {
-        title: "Bodhi AI が回答を待っています",
+        title: "nana AI が回答を待っています",
         fallbackBody: "エージェントが質問への回答を待っています",
       },
       conversationSummarized:
@@ -1128,9 +1128,9 @@ const buildJaTranslation = (enTranslation: EnTranslation) => ({
   },
   setup: {
     welcome: {
-      heading: "Bodhi へようこそ",
+      heading: "nana へようこそ",
       description:
-        "Bodhi は AI 駆動の開発アシスタントです。AI プロバイダーを設定して開始するか、そのまま進んでください。",
+        "nana は AI 駆動の開発アシスタントです。AI プロバイダーを設定して開始するか、そのまま進んでください。",
       providerHint:
         "チャットを開始するには、AI プロバイダー（例: OpenAI、Anthropic）を API キーで設定する必要があります。",
       proxyHint:
@@ -1150,8 +1150,8 @@ const buildJaTranslation = (enTranslation: EnTranslation) => ({
   },
   onboarding: {
     welcome: {
-      title: "Bodhi へようこそ！",
-      description: "Bodhi は AI 駆動の開発アシスタントです。簡単に操作をご紹介します。",
+      title: "nana へようこそ！",
+      description: "nana は AI 駆動の開発アシスタントです。簡単に操作をご紹介します。",
     },
     newSession: {
       title: "新しいセッション",
@@ -1267,7 +1267,7 @@ const buildJaTranslation = (enTranslation: EnTranslation) => ({
     },
     streaming: {
       ...enTranslation.chat.streaming,
-      assistant: "Bodhi",
+      assistant: "nana",
       requestCancelled: "リクエストがキャンセルされました",
       sendFailed: "メッセージの送信に失敗しました",
       retryFailed: "再試行に失敗しました",
@@ -2333,9 +2333,9 @@ const buildHiTranslation = (enTranslation: EnTranslation) => ({
   },
   setup: {
     welcome: {
-      heading: "Bodhi में आपका स्वागत है",
+      heading: "nana में आपका स्वागत है",
       description:
-        "Bodhi आपका AI-संचालित विकास सहायक है। एक AI प्रोवाइडर कॉन्फ़िगर करें और शुरू करें, या सीधे आगे बढ़ें।",
+        "nana आपका AI-संचालित विकास सहायक है। एक AI प्रोवाइडर कॉन्फ़िगर करें और शुरू करें, या सीधे आगे बढ़ें।",
       providerHint:
         "चैट शुरू करने के लिए, आपको एक AI प्रोवाइडर (जैसे OpenAI, Anthropic) को API कुंजी के साथ कॉन्फ़िगर करना होगा।",
       proxyHint:
@@ -2355,8 +2355,8 @@ const buildHiTranslation = (enTranslation: EnTranslation) => ({
   },
   onboarding: {
     welcome: {
-      title: "Bodhi में आपका स्वागत है!",
-      description: "Bodhi आपका AI-संचालित विकास सहायक है। आइए जल्दी से परिचित होते हैं।",
+      title: "nana में आपका स्वागत है!",
+      description: "nana आपका AI-संचालित विकास सहायक है। आइए जल्दी से परिचित होते हैं।",
     },
     newSession: {
       title: "नया सत्र",
@@ -2491,7 +2491,7 @@ const buildFrFullTranslation = (enTranslation: EnTranslation) => {
       },
       streaming: {
         ...enTranslation.chat.streaming,
-        assistant: "Bodhi",
+        assistant: "nana",
         requestCancelled: "Requête annulée",
         sendFailed: "Échec de l'envoi du message",
         retryFailed: "Échec de la nouvelle tentative",
@@ -2924,7 +2924,7 @@ const buildHiFullTranslation = (enTranslation: EnTranslation) => {
       },
       streaming: {
         ...enTranslation.chat.streaming,
-        assistant: "Bodhi",
+        assistant: "nana",
         requestCancelled: "अनुरोध रद्द किया गया",
         sendFailed: "संदेश भेजने में विफल",
         retryFailed: "पुनः प्रयास विफल",
@@ -3292,7 +3292,7 @@ const buildZhTwTranslation = (zhCnTranslation: ZhCnBaseTranslation) => ({
         completedFallback: "後台任務已完成",
       },
       clarification: {
-        title: "Bodhi AI 需要您的回覆",
+        title: "nana AI 需要您的回覆",
         fallbackBody: "代理需要您回答一個問題",
       },
       conversationSummarized: "對話已摘要：壓縮了 {{messages}} 條訊息，節省了 {{tokens}} 個 token",
@@ -3334,8 +3334,8 @@ const buildZhTwTranslation = (zhCnTranslation: ZhCnBaseTranslation) => ({
   },
   setup: {
     welcome: {
-      heading: "歡迎使用 Bodhi",
-      description: "Bodhi 是您的 AI 驅動開發助手。配置一個 AI 供應商即可開始，或直接進入應用。",
+      heading: "歡迎使用 nana",
+      description: "nana 是您的 AI 驅動開發助手。配置一個 AI 供應商即可開始，或直接進入應用。",
       providerHint: "要開始對話，您需要配置一個 AI 供應商（如 OpenAI、Anthropic）並提供 API 金鑰。",
       proxyHint: "在公司代理後面？您可以稍後在系統設定 > 網路中配置代理。",
     },
@@ -3353,8 +3353,8 @@ const buildZhTwTranslation = (zhCnTranslation: ZhCnBaseTranslation) => ({
   },
   onboarding: {
     welcome: {
-      title: "歡迎使用 Bodhi！",
-      description: "Bodhi 是您的 AI 驅動開發助手。讓我們快速了解一下介面。",
+      title: "歡迎使用 nana！",
+      description: "nana 是您的 AI 驅動開發助手。讓我們快速了解一下介面。",
     },
     newSession: {
       title: "新建會話",

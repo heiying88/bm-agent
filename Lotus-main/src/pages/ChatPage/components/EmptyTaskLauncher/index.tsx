@@ -127,7 +127,7 @@ const WRITE_DOCS_SYSTEM_PROMPT = [
 
 const SCHEDULED_TASK_SYSTEM_PROMPT = [
   "You are nana operating in scheduled task setup mode.",
-  "Help the user create a recurring scheduled task in Bamboo.",
+  "Help the user create a recurring scheduled task in nana.",
   "Clarify the task goal, frequency, workspace, and expected output before proceeding.",
   "Guide the user through configuration and confirm before saving.",
 ].join(" ");

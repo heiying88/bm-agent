@@ -12,6 +12,15 @@
 而非 SemVer 点版本。nightly 之间的变更记录在 git 历史与已合并 PR（事实源）中；
 下面的 SemVer 小节仅为历史上的 `0.x` 版本保留。
 
+- 默认系统提示词全面中文化 + 能力自认知：服务端 DEFAULT_BASE_PROMPT 与前端默认提示词
+  改为中文（nana 身份、运行时能力说明：持久记忆/Dream 整理/隐私脱敏/渠道，
+  [REDACTED] 处理约定），并要求内部推理（reasoning）也使用简体中文；
+  环境变量注入说明、默认提示词预设名同步中文化/nana 品牌。派生语言包
+  （fr/ja/hi/zh-TW）品牌统一为 nana。
+- 文档对齐当前版本：docs/config-reference.md 新增 dream_privacy_mode /
+  dream_privacy_off_keep_durable_gate 字段说明与微信平台 connect 文档
+  （dream 计划 off/daily/idle、auto_project、typing_indicator）；README
+  记忆系统能力表补充隐私策略；嵌入前端包随之重建。
 - 梦境脱敏机制改造（`dream_privacy_mode`）：`memory.json` 新增
   `dream_privacy_mode: "strict" | "redact" | "off"`（默认 strict，现状行为）
   与 `dream_privacy_off_keep_durable_gate`（仅 off 模式生效，默认 true）。

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub(super) const DEFAULT_PRESET_ID: &str = "general_assistant";
-pub(super) const DEFAULT_PRESET_NAME: &str = "Bodhi";
-pub(super) const DEFAULT_PRESET_DESCRIPTION: &str = "System prompt configured in Bamboo backend.";
+pub(super) const DEFAULT_PRESET_NAME: &str = "nana";
+pub(super) const DEFAULT_PRESET_DESCRIPTION: &str = "System prompt configured in the nana backend.";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct StoredPromptPreset {

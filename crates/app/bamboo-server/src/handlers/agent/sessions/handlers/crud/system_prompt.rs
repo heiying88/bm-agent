@@ -434,13 +434,11 @@ mod tests {
         assert!(snapshot
             .env_context
             .as_deref()
-            .is_some_and(|value| value.contains(
-                "environment variables were explicitly configured by the user inside Bodhi"
-            )));
+            .is_some_and(|value| value.contains("这些环境变量是用户在 nana 内显式配置的")));
         assert!(snapshot
             .env_context
             .as_deref()
-            .is_some_and(|value| value.contains("Bash/tool processes launched by Bodhi")));
+            .is_some_and(|value| value.contains("已对 nana 启动的 Bash/工具进程可用")));
         assert!(snapshot
             .skill_context
             .as_deref()

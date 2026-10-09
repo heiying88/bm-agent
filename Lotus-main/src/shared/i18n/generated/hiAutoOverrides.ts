@@ -34,7 +34,7 @@ export const hiAutoOverrides = {
         completedFallback: "बैकग्राउंड टास्क पूरा हुआ",
       },
       clarification: {
-        title: "Bodhi AI आपका जवाब दे रहा है",
+        title: "nana AI आपका जवाब दे रहा है",
         fallbackBody: "एजेंट एक सवाल का जवाब दे रहा है",
       },
       conversationSummarized:

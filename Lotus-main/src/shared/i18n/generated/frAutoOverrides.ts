@@ -34,7 +34,7 @@ export const frAutoOverrides = {
         completedFallback: "Une tâche en arrière-plan est terminée",
       },
       clarification: {
-        title: "Bodhi AI attend votre réponse",
+        title: "nana AI attend votre réponse",
         fallbackBody: "L'agent attend une réponse à une question",
       },
       conversationSummarized:
@@ -76,9 +76,9 @@ export const frAutoOverrides = {
   },
   setup: {
     welcome: {
-      heading: "Bienvenue dans Bodhi",
+      heading: "Bienvenue dans nana",
       description:
-        "Bodhi est votre assistant de développement alimenté par l'IA. Configurez un fournisseur IA pour commencer, ou lancez-vous directement.",
+        "nana est votre assistant de développement alimenté par l'IA. Configurez un fournisseur IA pour commencer, ou lancez-vous directement.",
       providerHint:
         "Pour commencer à discuter, vous devez configurer un fournisseur IA (ex. OpenAI, Anthropic) avec une clé API.",
       proxyHint:
@@ -98,9 +98,9 @@ export const frAutoOverrides = {
   },
   onboarding: {
     welcome: {
-      title: "Bienvenue dans Bodhi !",
+      title: "Bienvenue dans nana !",
       description:
-        "Bodhi est votre assistant de développement alimenté par l'IA. Faisons un rapide tour d'horizon.",
+        "nana est votre assistant de développement alimenté par l'IA. Faisons un rapide tour d'horizon.",
     },
     newSession: {
       title: "Nouvelle session",
