@@ -36,9 +36,10 @@ use bamboo_storage::{
 };
 
 use crate::auto_dream_privacy::{
-    durable_candidate_is_secret_safe, extraction_sources_are_secret_safe,
-    ledger_candidate_is_secret_safe, sanitize_extraction_source, sanitize_extraction_source_pair,
-    REDACTED_EXTRACTION_SOURCE,
+    current_dream_privacy_mode, durable_candidate_is_secret_safe,
+    extraction_sources_are_secret_safe, ledger_candidate_is_secret_safe,
+    sanitize_extraction_source, sanitize_extraction_source_pair, sync_dream_privacy_from_config,
+    DreamPrivacyMode, REDACTED_EXTRACTION_SOURCE,
 };
 use crate::project_context::ProjectContextResolver;
 
@@ -118,6 +119,25 @@ fn to_consolidation_sessions(
                 sources.push(summary);
             }
             if !extraction_sources_are_secret_safe(&sources) {
+                // [LOCAL PATCH] dream-privacy-config
+                if current_dream_privacy_mode() == DreamPrivacyMode::Redact {
+                    // Keep the row with fragment-level masking instead of
+                    // dropping the whole session from consolidation.
+                    let (title, summary) =
+                        sanitize_title_and_optional_source(&entry.title, summary.as_deref());
+                    return ConsolidationSessionInfo {
+                        id: provider_session_alias(index),
+                        title,
+                        kind: format!("{:?}", entry.kind),
+                        updated_at: entry.updated_at.to_rfc3339(),
+                        message_count: entry.message_count,
+                        last_run_status: entry
+                            .last_run_status
+                            .as_deref()
+                            .map(sanitize_extraction_source),
+                        summary,
+                    };
+                }
                 return ConsolidationSessionInfo {
                     id: provider_session_alias(index),
                     title: REDACTED_EXTRACTION_SOURCE.to_string(),
@@ -219,7 +239,68 @@ fn task_list_is_secret_safe(task_list: &bamboo_domain::TaskList) -> bool {
     extraction_sources_are_secret_safe(&sources)
 }
 
+fn redact_task_list_values(task_list: &mut bamboo_domain::TaskList) {
+    // [LOCAL PATCH] dream-privacy-config
+    // Redact-mode: mask secret fragments inside every task-list string field
+    // (titles/notes/labels) instead of dropping the outline wholesale. Round-
+    // trips through serde so per-value redaction fail-closes exactly like the
+    // single-field path; a value that cannot be localized is replaced by the
+    // whole-field marker, never leaked.
+    let Ok(mut serialized) = serde_json::to_value(&*task_list) else {
+        return;
+    };
+    fn redact_json_string_values(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => {
+                *text = sanitize_extraction_source(text);
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    redact_json_string_values(value);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for (_, value) in values {
+                    redact_json_string_values(value);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+    }
+    redact_json_string_values(&mut serialized);
+    if let Ok(redacted) = serde_json::from_value::<bamboo_domain::TaskList>(serialized) {
+        *task_list = redacted;
+    }
+}
+
 fn derive_sanitized_session_outline(session: &bamboo_agent_core::Session) -> Option<String> {
+    // [LOCAL PATCH] dream-privacy-config
+    match current_dream_privacy_mode() {
+        DreamPrivacyMode::Off => {
+            // No extraction-source stripping in off mode: the outline is
+            // derived from the raw session (outbound exposure is the admin's
+            // explicit choice; keyword masking remains the backstop).
+            return derive_session_outline(session);
+        }
+        DreamPrivacyMode::Redact => {
+            let mut sanitized = session.clone();
+            if let Some(task_list) = sanitized.task_list.as_mut() {
+                if !task_list.items.is_empty() {
+                    redact_task_list_values(task_list);
+                }
+            }
+            for message in &mut sanitized.messages {
+                message.content = sanitize_extraction_source(&message.content);
+            }
+            // Per-value redaction already guarantees each field passes the
+            // strict predicate, so the derived (then truncated) outline cannot
+            // carry an undetected credential prefix.
+            return derive_session_outline(&sanitized);
+        }
+        DreamPrivacyMode::Strict => {}
+    }
+
     // Inspect every complete task-list field, including ordered field pairs,
     // before TaskList::format_for_prompt truncates them. If the serialized
     // shape ever becomes unreadable, fail closed rather than send task data.
@@ -277,14 +358,21 @@ fn sanitized_extraction_candidate_info(
         sources.push(content);
     }
     if !extraction_sources_are_secret_safe(&sources) {
-        return DreamCandidateInfo {
-            session_id: provider_session_id,
-            title: REDACTED_EXTRACTION_SOURCE.to_string(),
-            project_key: provider_project_key.clone(),
-            updated_at,
-            summary: None,
-            topics: Vec::new(),
-        };
+        // [LOCAL PATCH] dream-privacy-config
+        if current_dream_privacy_mode() == DreamPrivacyMode::Redact {
+            // Fall through to the field-local sanitizers below: they mask only
+            // the matched fragments (and drop split-credential value sides),
+            // so the session stays in the extraction set.
+        } else {
+            return DreamCandidateInfo {
+                session_id: provider_session_id,
+                title: REDACTED_EXTRACTION_SOURCE.to_string(),
+                project_key: provider_project_key.clone(),
+                updated_at,
+                summary: None,
+                topics: Vec::new(),
+            };
+        }
     }
 
     let (title, summary) =
@@ -466,6 +554,19 @@ fn sanitized_session_note_result(
 fn sanitize_retrieval_extraction_sources(
     eligible_messages: &mut [(usize, &Message, &'static str, String)],
 ) {
+    // [LOCAL PATCH] dream-privacy-config
+    match current_dream_privacy_mode() {
+        DreamPrivacyMode::Off => return,
+        DreamPrivacyMode::Redact => {
+            // Fragment-level masking first; the strict joint analysis below
+            // still runs so split credentials across messages are localized.
+            for (_, _, _, content) in eligible_messages.iter_mut() {
+                *content = sanitize_extraction_source(content);
+            }
+        }
+        DreamPrivacyMode::Strict => {}
+    }
+
     let selected_sources = eligible_messages
         .iter()
         .map(|(_, _, _, content)| content.as_str())
@@ -2631,6 +2732,15 @@ async fn run_auto_dream_once_for_scope(
 
     let config_snapshot = ctx.config.read().await.clone();
     let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
+    // [LOCAL PATCH] dream-privacy-config
+    // Refresh the process-wide Dream privacy policy from the live memory
+    // section before any extraction-source sanitization runs, so settings
+    // updates hot-reload without a restart. Invalid values warn and fall back
+    // to strict inside the sync helper.
+    sync_dream_privacy_from_config(
+        &memory_cfg.dream_privacy_mode,
+        memory_cfg.dream_privacy_off_keep_durable_gate,
+    );
     if require_auto_dream_enabled && !memory_cfg.auto_dream_enabled {
         tracing::info!(
             target: DREAM_TRACING_TARGET,
@@ -2735,6 +2845,7 @@ async fn run_auto_dream_once_for_scope(
         existing_dream_present = existing.is_some(),
         force_full_rebuild = force_full_rebuild,
         require_auto_dream_enabled = require_auto_dream_enabled,
+        dream_privacy_mode = current_dream_privacy_mode().as_str(),
         "Starting Dream generation run"
     );
 
@@ -4300,6 +4411,172 @@ mod tests {
             .expect("list Ledger records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record.title, "Renew passport");
+    }
+
+    // [LOCAL PATCH] dream-privacy-config
+    // Acceptance: in redact mode a session carrying `api_key=sk-test123`
+    // still reaches consolidation with the fragment masked, the surrounding
+    // facts survive, and the durable gate keeps rejecting secret candidates.
+    #[tokio::test]
+    async fn redact_privacy_mode_keeps_session_facts_and_masks_fragments() {
+        let _privacy =
+            crate::auto_dream_privacy::override_dream_privacy_for_tests(
+                crate::auto_dream_privacy::DreamPrivacyMode::Redact,
+                true,
+            );
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+
+        let mut session = bamboo_agent_core::Session::new("session-redact-mode", "model");
+        session.title = "Deployment notes".to_string();
+        session.add_message(Message::user(
+            "We deployed two services behind the new gateway today.",
+        ));
+        session.add_message(Message::assistant(
+            "Done. The deploy used api_key=sk-test123 and finished cleanly.",
+            None,
+        ));
+        storage.save_session(&session).await.expect("save session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": [],
+            "source_exhausted": true
+        })
+        .to_string()]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+
+        let contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(contexts.len(), 1);
+        let source = contexts[0].summary.as_deref().expect("redact keeps a source");
+        assert!(
+            !source.contains("sk-test123"),
+            "secret value must not reach the provider prompt: {source}"
+        );
+        assert!(
+            source.contains("api_key=[REDACTED]"),
+            "the masked fragment should carry the label: {source}"
+        );
+        assert!(
+            source.contains("deployed two services"),
+            "safe session facts must survive redaction: {source}"
+        );
+
+        // The consolidation row also survives with its title intact.
+        let entries = vec![(contexts[0].entry.clone(), contexts[0].summary.clone())];
+        let consolidated = to_consolidation_sessions(&entries);
+        assert_eq!(consolidated.len(), 1);
+        assert_eq!(consolidated[0].title, "Deployment notes");
+
+        // The durable gate still rejects candidates containing the secret,
+        // even though extraction sources are only fragment-masked (R4).
+        let secret_candidate = DurableExtractionCandidate {
+            title: "deploy credential".to_string(),
+            kind: "reference".to_string(),
+            content: "The deploy used api_key=sk-test123.".to_string(),
+            scope: None,
+            tags: Vec::new(),
+            session_id: None,
+            confidence: None,
+        };
+        assert!(crate::auto_dream_privacy::durable_privacy_gate_enabled());
+        assert!(!crate::auto_dream_privacy::durable_candidate_is_secret_safe(
+            &secret_candidate
+        ));
+    }
+
+    // [LOCAL PATCH] dream-privacy-config
+    // Acceptance: off mode forwards extraction sources verbatim while the
+    // separately-configurable durable gate remains enforceable.
+    #[tokio::test]
+    async fn off_privacy_mode_forwards_sources_and_gates_durable_candidates() {
+        let _privacy =
+            crate::auto_dream_privacy::override_dream_privacy_for_tests(
+                crate::auto_dream_privacy::DreamPrivacyMode::Off,
+                true,
+            );
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
+        let session_store = Arc::new(
+            SessionStoreV2::new(temp_dir.path().to_path_buf())
+                .await
+                .expect("session store"),
+        );
+        let storage: Arc<dyn Storage> = session_store.clone();
+
+        let mut session = bamboo_agent_core::Session::new("session-off-mode", "model");
+        session.title = "Raw forwarding".to_string();
+        session.add_message(Message::assistant(
+            "The deploy used api_key=sk-test123 and finished cleanly.",
+            None,
+        ));
+        storage.save_session(&session).await.expect("save session");
+
+        let memory = MemoryStore::new(temp_dir.path());
+        let sequence_provider = Arc::new(SequenceProvider::new(vec![serde_json::json!({
+            "candidates": [],
+            "ledger_candidates": [],
+            "source_exhausted": true
+        })
+        .to_string()]));
+        let provider: Arc<dyn LLMProvider> = sequence_provider.clone();
+        let context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: provider.clone(),
+            config: Arc::new(RwLock::new(Config::default())),
+            provider_registry: test_registry(),
+        };
+
+        let contexts = collect_candidate_session_contexts(
+            &context,
+            &memory,
+            Utc::now() - chrono::Duration::hours(24),
+        )
+        .await;
+        assert_eq!(contexts.len(), 1);
+        let source = contexts[0].summary.as_deref().expect("off keeps the raw source");
+        assert!(
+            source.contains("api_key=sk-test123"),
+            "off mode forwards sources verbatim: {source}"
+        );
+
+        let secret_candidate = DurableExtractionCandidate {
+            title: "deploy credential".to_string(),
+            kind: "reference".to_string(),
+            content: "The deploy used api_key=sk-test123.".to_string(),
+            scope: None,
+            tags: Vec::new(),
+            session_id: None,
+            confidence: None,
+        };
+        assert!(crate::auto_dream_privacy::durable_privacy_gate_enabled());
+        assert!(!crate::auto_dream_privacy::durable_candidate_is_secret_safe(
+            &secret_candidate
+        ));
     }
 
     #[tokio::test]

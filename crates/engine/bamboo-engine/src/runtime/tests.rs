@@ -847,6 +847,7 @@ async fn direct_execute_observes_normal_completed_tool_trace_after_checkpoint() 
             skills_dir,
             project_dir: None,
             active_mode: None,
+            limits: None,
         },
         bamboo_skills::ReuseDraftConfig {
             repetition_threshold: 1,
@@ -910,6 +911,7 @@ async fn direct_execute_does_not_observe_tool_trace_when_final_checkpoint_fails(
             skills_dir,
             project_dir: None,
             active_mode: None,
+            limits: None,
         },
         bamboo_skills::ReuseDraftConfig {
             repetition_threshold: 1,

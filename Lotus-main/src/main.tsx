@@ -6,7 +6,7 @@ import { i18nReady } from "@shared/i18n";
 const rootElement = document.getElementById("root");
 
 if (!rootElement) {
-  throw new Error("Missing #root element for Bodhi app bootstrap");
+  throw new Error("Missing #root element for nana app bootstrap");
 }
 
 const root = ReactDOM.createRoot(rootElement as HTMLElement);
@@ -49,7 +49,7 @@ const renderBootstrapError = (error: unknown) => {
       ? `${error.name}: ${error.message}`
       : String(error || "Unknown startup error");
 
-  console.error("[Bodhi] Failed to bootstrap app:", error);
+  console.error("[nana] Failed to bootstrap app:", error);
 
   // NOTE: i18n is not yet initialized at this point (bootstrap failed before
   // i18nReady resolved), so these strings remain hardcoded in English.
@@ -68,7 +68,7 @@ const renderBootstrapError = (error: unknown) => {
         }}
       >
         <div style={{ maxWidth: 720, textAlign: "left" }}>
-          <h2 style={{ margin: "0 0 12px" }}>Bodhi UI failed to start</h2>
+          <h2 style={{ margin: "0 0 12px" }}>nana UI failed to start</h2>
           <p style={{ margin: 0, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{message}</p>
         </div>
       </div>

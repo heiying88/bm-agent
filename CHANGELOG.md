@@ -12,6 +12,24 @@
 而非 SemVer 点版本。nightly 之间的变更记录在 git 历史与已合并 PR（事实源）中；
 下面的 SemVer 小节仅为历史上的 `0.x` 版本保留。
 
+- 梦境脱敏机制改造（`dream_privacy_mode`）：`memory.json` 新增
+  `dream_privacy_mode: "strict" | "redact" | "off"`（默认 strict，现状行为）
+  与 `dream_privacy_off_keep_durable_gate`（仅 off 模式生效，默认 true）。
+  strict 保持"命中敏感即整体剥离"不变；redact 仅把命中片段替换为
+  `[REDACTED]`（赋值类只打码值、整行兜底、无法定位时整字段兜底，输出保证
+  不含敏感值），持久化候选门禁在 strict/redact 下恒启用；off 不做提取源
+  剥离、门禁可独立关断。设置页（系统 → 配置 → Memory 与 Auto Dream）新增
+  下拉与开关，走 memory 分节 API 热加载（每次 Dream 运行刷新，无需重启）；
+  非法配置值读取时回退 strict 并 WARN，写入时被 `validate_memory` 拒绝。
+  `bamboo.auto_dream` 的 run_start 事件新增 `dream_privacy_mode` 字段。
+- 项目品牌更名为 nana：前端展示名（页面标题、欢迎页、助手名、
+  桌面通知文案、各设置页描述）与 README 更名；代码层标识（crate 名
+  bamboo-*、二进制名、`BAMBOO_*` 环境变量、`/data` 目录、日志 target、
+  bodhi provider 名称）保持不变以兼容既有部署。
+- 重建嵌入前端包 `lotus-frontend.zip`：补齐 v0.0.7 的微信梦境计划控件
+  （关闭/每天定时/闲置触发 + 时刻与分钟数）在嵌入包中的缺失，并携带
+  dream_privacy_mode 与品牌更名；新增 `scripts/frontend-package-node.cjs`
+  供无 7z/zip 的 Windows 工作站打包（与 cjs 版同 hash/清单规则）。
 - 手动"仅本会话"梦境整合：POST project-dream/run 新增可选 body
   {"scope":"session"}（默认 project），只把触发会话增量整合进项目记忆、
   只消耗它的提取水位，同项目其他会话留给下一次整项目 Dream；前端会话

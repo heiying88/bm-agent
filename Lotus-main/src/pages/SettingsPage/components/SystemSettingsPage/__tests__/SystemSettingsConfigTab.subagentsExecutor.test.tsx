@@ -162,7 +162,7 @@ describe("SystemSettingsConfigTab sub-agent executor settings", () => {
     await screen.findByTestId("claude-code-binary");
 
     fireEvent.mouseDown(within(executorSelect).getByRole("combobox"));
-    fireEvent.click(await screen.findByTitle("Built-in (Bamboo agent loop)"));
+    fireEvent.click(await screen.findByTitle("Built-in (nana agent loop)"));
 
     fireEvent.click(screen.getByTestId("save-subagent-settings"));
 

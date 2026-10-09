@@ -1,7 +1,7 @@
 /**
  * Desktop notification service for Tauri environment.
  *
- * Sends OS-level notifications via the Bodhi Rust backend. The decision of
+ * Sends OS-level notifications via the nana Rust backend. The decision of
  * *whether* to notify — category, priority, preference gating, and dedup — is
  * made server-side in `bamboo-notification` and delivered as a single
  * `notification` SSE event. The frontend only applies the local window-focus
@@ -31,7 +31,7 @@ async function isMainWindowFocused(): Promise<boolean> {
 }
 
 /**
- * Invoke the Bodhi Rust backend to show a native desktop notification.
+ * Invoke the nana Rust backend to show a native desktop notification.
  */
 async function invokeShowNotification(title: string, body: string): Promise<void> {
   const tauriInternals = (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ as
@@ -50,7 +50,7 @@ async function invokeShowNotification(title: string, body: string): Promise<void
  */
 export async function sendTestNotification(
   title = "Test Notification",
-  body = "Bodhi notifications are working!",
+  body = "nana notifications are working!",
 ): Promise<void> {
   if (!isTauriEnvironment()) {
     return;

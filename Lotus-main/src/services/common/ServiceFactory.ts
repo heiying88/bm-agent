@@ -112,6 +112,10 @@ export interface WorkflowStorageLimits {
 export interface BambooMemoryConfig {
   background_model?: string;
   auto_dream_enabled?: boolean;
+  /** Dream extraction-source privacy policy: "strict" (default) | "redact" | "off". */
+  dream_privacy_mode?: string;
+  /** off-mode only: keep the durable-candidate secret gate enabled (default true). */
+  dream_privacy_off_keep_durable_gate?: boolean;
 }
 
 /** Sub-agent execution settings (mirrors the backend's typed `subagents` section).

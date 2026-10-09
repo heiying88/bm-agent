@@ -6,6 +6,7 @@
 //! durable sink sees it. This module never logs the rejected value.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 use bamboo_memory::auto_dream::{DurableExtractionCandidate, LedgerExtractionCandidate};
@@ -13,6 +14,139 @@ use regex::Regex;
 
 pub(crate) const REDACTED_EXTRACTION_SOURCE: &str =
     "[sensitive content omitted before durable-memory extraction]";
+
+// [LOCAL PATCH] dream-privacy-config
+// Configurable Dream privacy policy (`memory.json` → MemoryConfig):
+//   strict (default) — current behaviour: a source containing a credential-like
+//                      value is replaced as a whole before provider dispatch.
+//   redact           — only the matched secret fragments are replaced with
+//                      `[REDACTED]`; the remaining content flows through. The
+//                      durable-candidate gate stays fully enabled.
+//   off              — extraction sources are not stripped at all (secrets may
+//                      reach the provider; combine with model-policy keyword
+//                      masking for an outbound backstop). The durable gate can
+//                      be kept via a separate field (default: kept).
+//
+// The policy is process-wide and refreshed from the live memory section at the
+// start of every Dream run (`auto_dream::run_auto_dream_once_for_scope`), so
+// settings updates hot-reload without a restart. Invalid configured values warn
+// and fall back to strict — the safe default never regresses (R2).
+pub(crate) const REDACTED_SECRET_FRAGMENT: &str = "[REDACTED]";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DreamPrivacyMode {
+    #[default]
+    Strict,
+    Redact,
+    Off,
+}
+
+impl DreamPrivacyMode {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "strict" => Some(Self::Strict),
+            "redact" => Some(Self::Redact),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Redact => "redact",
+            Self::Off => "off",
+        }
+    }
+}
+
+static DREAM_PRIVACY_MODE: AtomicU8 = AtomicU8::new(DreamPrivacyMode::Strict as u8);
+static DREAM_PRIVACY_OFF_KEEP_DURABLE_GATE: AtomicBool = AtomicBool::new(true);
+
+thread_local! {
+    // Test-only per-thread override. Cargo runs tests in parallel on worker
+    // threads; a policy pinned here is invisible to every other thread, so
+    // mode-specific tests cannot race the default-strict assumptions of
+    // unrelated tests. Production never sets it (async tasks may also migrate
+    // threads between awaits, so only the process-wide atomics are real).
+    static THREAD_DREAM_PRIVACY_OVERRIDE: std::cell::Cell<Option<(DreamPrivacyMode, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn resolved_privacy_policy() -> (DreamPrivacyMode, bool) {
+    if let Some(policy) = THREAD_DREAM_PRIVACY_OVERRIDE.with(|slot| slot.get()) {
+        return policy;
+    }
+    (
+        match DREAM_PRIVACY_MODE.load(Ordering::Relaxed) {
+            1 => DreamPrivacyMode::Redact,
+            2 => DreamPrivacyMode::Off,
+            _ => DreamPrivacyMode::Strict,
+        },
+        DREAM_PRIVACY_OFF_KEEP_DURABLE_GATE.load(Ordering::Relaxed),
+    )
+}
+
+/// Pure resolver for the configured policy: invalid mode strings warn and fall
+/// back to strict (the safe default never regresses).
+pub(crate) fn resolve_dream_privacy_from_config(
+    raw_mode: &str,
+    off_keep_durable_gate: bool,
+) -> (DreamPrivacyMode, bool) {
+    let mode = DreamPrivacyMode::parse(raw_mode).unwrap_or_else(|| {
+        tracing::warn!(
+            target: "bamboo.auto_dream",
+            "auto_dream privacy: invalid dream_privacy_mode {:?}; falling back to strict",
+            raw_mode
+        );
+        DreamPrivacyMode::Strict
+    });
+    (mode, off_keep_durable_gate)
+}
+
+/// Refresh the process-wide Dream privacy policy from the live memory config.
+pub(crate) fn sync_dream_privacy_from_config(raw_mode: &str, off_keep_durable_gate: bool) {
+    let (mode, gate) = resolve_dream_privacy_from_config(raw_mode, off_keep_durable_gate);
+    DREAM_PRIVACY_MODE.store(mode as u8, Ordering::Relaxed);
+    DREAM_PRIVACY_OFF_KEEP_DURABLE_GATE.store(gate, Ordering::Relaxed);
+}
+
+pub(crate) fn current_dream_privacy_mode() -> DreamPrivacyMode {
+    resolved_privacy_policy().0
+}
+
+/// Whether the durable-candidate secret gate is active. Enabled in strict and
+/// redact modes regardless of configuration (last line of defense, R4); in off
+/// mode it honours the separate `dream_privacy_off_keep_durable_gate` field.
+pub(crate) fn durable_privacy_gate_enabled() -> bool {
+    match current_dream_privacy_mode() {
+        DreamPrivacyMode::Strict | DreamPrivacyMode::Redact => true,
+        DreamPrivacyMode::Off => resolved_privacy_policy().1,
+    }
+}
+
+/// Test-only guard that pins a privacy policy for the current thread and
+/// clears the pin on drop, so mode-specific tests stay invisible to parallel
+/// tests running on other threads.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct DreamPrivacyModeGuard;
+
+#[cfg(test)]
+pub(crate) fn override_dream_privacy_for_tests(
+    mode: DreamPrivacyMode,
+    off_keep_durable_gate: bool,
+) -> DreamPrivacyModeGuard {
+    THREAD_DREAM_PRIVACY_OVERRIDE.with(|slot| slot.set(Some((mode, off_keep_durable_gate))));
+    DreamPrivacyModeGuard
+}
+
+#[cfg(test)]
+impl Drop for DreamPrivacyModeGuard {
+    fn drop(&mut self) {
+        THREAD_DREAM_PRIVACY_OVERRIDE.with(|slot| slot.set(None));
+    }
+}
 
 fn secret_assignment_pattern() -> &'static Regex {
     static PATTERN: OnceLock<Regex> = OnceLock::new();
@@ -93,6 +227,13 @@ fn is_placeholder_only(value: &str) -> bool {
     let value = value
         .trim()
         .trim_matches(|character| matches!(character, '\"' | '\''));
+    // [LOCAL PATCH] dream-privacy-config
+    // The redact-mode fragment marker is a placeholder by definition: it must
+    // survive every detector round-trip (including structured label joins) so
+    // `api_key=[REDACTED]` reads as redacted, not as a fresh secret.
+    if value == REDACTED_SECRET_FRAGMENT {
+        return true;
+    }
     let identifier = |candidate: &str| {
         !candidate.is_empty()
             && candidate
@@ -2126,11 +2267,230 @@ pub(crate) fn contains_secret_like_value(value: &str) -> bool {
     contains_non_hex_secret_like_value(value) || contains_opaque_hex_secret_token(value)
 }
 
-pub(crate) fn sanitize_extraction_source(value: &str) -> String {
-    if contains_secret_like_value(value) {
-        REDACTED_EXTRACTION_SOURCE.to_string()
+// [LOCAL PATCH] dream-privacy-config
+// Redact only the matched secret spans, keeping the surrounding text. Three
+// layers, each strictly narrower than the one before it:
+//   1. assignment-shaped detectors replace just the captured credential value
+//      (`api_key=sk-…` → `api_key=[REDACTED]`), honouring the same
+//      placeholder/state-word exemptions as the strict detectors;
+//   2. any remaining line that still trips a detector is replaced wholesale;
+//   3. if the assembled result is still unsafe (multi-line structured
+//      constructs such as YAML blocks), fail closed to the whole-field marker.
+// The returned value therefore never trips `contains_secret_like_value`.
+fn redact_pattern_value_spans(
+    text: &str,
+    pattern: &'static Regex,
+    group: &str,
+    should_redact: impl Fn(&regex::Captures<'_>) -> bool,
+) -> String {
+    let mut spans = Vec::new();
+    for captures in pattern.captures_iter(text) {
+        let target = if group.is_empty() {
+            captures.get(0)
+        } else {
+            captures.name(group)
+        };
+        if let Some(span) = target.filter(|_| should_redact(&captures)) {
+            spans.push((span.start(), span.end()));
+        }
+    }
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        if start < cursor {
+            continue; // overlapping captures: the earlier redaction already won
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(REDACTED_SECRET_FRAGMENT);
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+fn redact_secret_fragments(value: &str) -> String {
+    // [LOCAL PATCH] dream-privacy-config
+    let mut text = value.to_string();
+    let non_placeholder =
+        |captures: &regex::Captures<'_>| {
+            captures
+                .name("value")
+                .is_some_and(|candidate| !is_placeholder_only(candidate.as_str()))
+        };
+    let literal_value = |captures: &regex::Captures<'_>| {
+        captures.name("value").is_some_and(|candidate| {
+            credential_assignment_value_is_literal(candidate.as_str())
+        })
+    };
+
+    text = redact_pattern_value_spans(&text, secret_assignment_pattern(), "value", non_placeholder);
+    text = redact_pattern_value_spans(
+        &text,
+        generic_secret_assignment_pattern(),
+        "value",
+        non_placeholder,
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        present_tense_secret_assignment_pattern(),
+        "value",
+        literal_value,
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        past_tense_secret_assignment_pattern(),
+        "value",
+        literal_value,
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        pin_credential_assignment_pattern(),
+        "value",
+        non_placeholder,
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        short_credential_config_field_pattern(),
+        "value",
+        non_placeholder,
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        redis_password_directive_pattern(),
+        "value",
+        non_placeholder,
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        wallet_mnemonic_assignment_pattern(),
+        "value",
+        |captures| {
+            captures.name("value").is_some_and(|candidate| {
+                !is_placeholder_only(candidate.as_str())
+                    && candidate
+                        .as_str()
+                        .split_ascii_whitespace()
+                        .map(|word| {
+                            word.trim_matches(
+                                |character: char| !character.is_ascii_alphabetic(),
+                            )
+                        })
+                        .filter(|word| !word.is_empty())
+                        .all(|word| word.bytes().all(|byte| byte.is_ascii_alphabetic()))
+            })
+        },
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        mysql_identified_credential_pattern(),
+        "value",
+        |captures| {
+            captures.name("generated").is_none() && non_placeholder(&captures)
+        },
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        cli_credential_flag_pattern(),
+        "value",
+        non_placeholder,
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        markdown_table_credential_pattern(),
+        "value",
+        non_placeholder,
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        environment_credential_assignment_pattern(),
+        "value",
+        |captures| {
+            captures.name("name").is_some_and(|name| {
+                !name.as_str().eq_ignore_ascii_case("max_token")
+            }) && literal_value(&captures)
+        },
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        ambiguous_environment_credential_assignment_pattern(),
+        "value",
+        literal_value,
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        template_credential_assignment_pattern(),
+        "value",
+        |captures| {
+            captures.name("label").is_some_and(|label| {
+                structured_environment_name_is_credential(label.as_str())
+            }) && non_placeholder(&captures)
+        },
+    );
+    text = redact_pattern_value_spans(
+        &text,
+        authorization_secret_pattern(),
+        "value",
+        |captures| {
+            captures
+                .name("value")
+                .is_some_and(|candidate| !candidate.as_str().trim().is_empty())
+        },
+    );
+    text = redact_pattern_value_spans(&text, bare_authorization_scheme_pattern(), "token", |_| {
+        true
+    });
+    text = redact_pattern_value_spans(&text, credential_url_pattern(), "value", |_| true);
+    text = redact_pattern_value_spans(&text, known_secret_pattern(), "", |_| true);
+    text = redact_pattern_value_spans(&text, sql_password_clause_pattern(), "", |_| true);
+    text = redact_pattern_value_spans(&text, otp_provisioning_uri_pattern(), "", |_| true);
+
+    if !contains_secret_like_value(&text) {
+        return text;
+    }
+
+    // Line-level fallback for every remaining detector family (docker auth,
+    // kubernetes secrets, netrc, pgpass, HCL defaults, XML, opaque hex/high
+    // entropy tokens, …). Clean lines survive verbatim.
+    let mut out = String::with_capacity(text.len());
+    let mut redacted_any = false;
+    for chunk in text.split_inclusive('\n') {
+        let (body, ending) = match chunk.strip_suffix('\n') {
+            Some(rest) => match rest.strip_suffix('\r') {
+                Some(body) => (body, "\r\n"),
+                None => (rest, "\n"),
+            },
+            None => (chunk, ""),
+        };
+        if contains_secret_like_value(body) {
+            out.push_str(REDACTED_SECRET_FRAGMENT);
+            redacted_any = true;
+        } else {
+            out.push_str(body);
+        }
+        out.push_str(ending);
+    }
+    if redacted_any && !contains_secret_like_value(&out) {
+        out
     } else {
-        value.to_string()
+        REDACTED_EXTRACTION_SOURCE.to_string()
+    }
+}
+
+// [LOCAL PATCH] dream-privacy-config
+pub(crate) fn sanitize_extraction_source(value: &str) -> String {
+    match current_dream_privacy_mode() {
+        DreamPrivacyMode::Off => value.to_string(),
+        DreamPrivacyMode::Redact => redact_secret_fragments(value),
+        DreamPrivacyMode::Strict => {
+            if contains_secret_like_value(value) {
+                REDACTED_EXTRACTION_SOURCE.to_string()
+            } else {
+                value.to_string()
+            }
+        }
     }
 }
 
@@ -2334,7 +2694,7 @@ fn structured_sources_contain_secret(sources: &[&str], label_fields: &[(usize, &
 /// credential labels before testing every remaining field as the value. The
 /// hard label-fragment cap keeps this conservative check bounded without
 /// rejecting ordinary records merely because they contain many fields.
-pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
+fn extraction_sources_are_secret_safe_strict(sources: &[&str]) -> bool {
     // A technical hash label exempts a token only when both occur in the same
     // field. Candidate-wide exemptions let an unrelated tag such as `commit`
     // launder an opaque credential stored in another field.
@@ -2361,20 +2721,66 @@ pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
     !structured_sources_contain_secret(sources, &label_fields)
 }
 
+fn extraction_sources_contain_secret(sources: &[&str]) -> bool {
+    !extraction_sources_are_secret_safe_strict(sources)
+}
+
+// [LOCAL PATCH] dream-privacy-config
+/// Mode-aware stripping decision for extraction sources. Strict and redact use
+/// the full strict predicate (redact localizes damage earlier, so the predicate
+/// only decides *whether* extra care is needed); off disables stripping.
+pub(crate) fn extraction_sources_are_secret_safe(sources: &[&str]) -> bool {
+    if current_dream_privacy_mode() == DreamPrivacyMode::Off {
+        return true;
+    }
+    !extraction_sources_contain_secret(sources)
+}
+
 /// Sanitize a label/content pair together so a split credential such as
 /// `Password` + `hunter2` cannot bypass field-local checks.
+// [LOCAL PATCH] dream-privacy-config
 pub(crate) fn sanitize_extraction_source_pair(label: &str, content: &str) -> (String, String) {
-    if !extraction_sources_are_secret_safe(&[label, content]) {
-        (
-            REDACTED_EXTRACTION_SOURCE.to_string(),
-            REDACTED_EXTRACTION_SOURCE.to_string(),
-        )
-    } else {
-        (label.to_string(), content.to_string())
+    match current_dream_privacy_mode() {
+        DreamPrivacyMode::Off => (label.to_string(), content.to_string()),
+        DreamPrivacyMode::Redact => {
+            let redacted_label = redact_secret_fragments(label);
+            let redacted_content = redact_secret_fragments(content);
+            if !extraction_sources_contain_secret(&[&redacted_label, &redacted_content]) {
+                return (redacted_label, redacted_content);
+            }
+            // A split credential survived fragment redaction. Drop the value
+            // side but keep the (already redacted) label so the fact that a
+            // credential exists is still consolidatable.
+            let dropped_content = REDACTED_SECRET_FRAGMENT.to_string();
+            if !extraction_sources_contain_secret(&[&redacted_label, &dropped_content]) {
+                return (redacted_label, dropped_content);
+            }
+            (
+                REDACTED_EXTRACTION_SOURCE.to_string(),
+                REDACTED_EXTRACTION_SOURCE.to_string(),
+            )
+        }
+        DreamPrivacyMode::Strict => {
+            if extraction_sources_contain_secret(&[label, content]) {
+                (
+                    REDACTED_EXTRACTION_SOURCE.to_string(),
+                    REDACTED_EXTRACTION_SOURCE.to_string(),
+                )
+            } else {
+                (label.to_string(), content.to_string())
+            }
+        }
     }
 }
 
+// [LOCAL PATCH] dream-privacy-config
 pub(crate) fn durable_candidate_is_secret_safe(candidate: &DurableExtractionCandidate) -> bool {
+    // The durable gate is the last line of defense before secrets reach the
+    // persistent memory sinks. It stays on in strict and redact modes; only off
+    // mode may disable it, via its dedicated config field (R4).
+    if !durable_privacy_gate_enabled() {
+        return true;
+    }
     let mut sources = vec![
         candidate.title.as_str(),
         candidate.kind.as_str(),
@@ -2387,10 +2793,14 @@ pub(crate) fn durable_candidate_is_secret_safe(candidate: &DurableExtractionCand
     if let Some(confidence) = candidate.confidence.as_deref() {
         sources.push(confidence);
     }
-    extraction_sources_are_secret_safe(&sources)
+    !extraction_sources_contain_secret(&sources)
 }
 
+// [LOCAL PATCH] dream-privacy-config
 pub(crate) fn ledger_candidate_is_secret_safe(candidate: &LedgerExtractionCandidate) -> bool {
+    if !durable_privacy_gate_enabled() {
+        return true;
+    }
     let mut sources = vec![candidate.title.as_str(), candidate.kind.as_str()];
     if let Some(due_at) = candidate.due_at.as_deref() {
         sources.push(due_at);
@@ -2404,7 +2814,7 @@ pub(crate) fn ledger_candidate_is_secret_safe(candidate: &LedgerExtractionCandid
     if let Some(confidence) = candidate.confidence.as_deref() {
         sources.push(confidence);
     }
-    extraction_sources_are_secret_safe(&sources)
+    !extraction_sources_contain_secret(&sources)
 }
 
 #[cfg(test)]
@@ -3818,5 +4228,150 @@ mod tests {
                 "transition safe case was rejected: {case}"
             );
         }
+    }
+
+    // [LOCAL PATCH] dream-privacy-config tests
+    #[test]
+    fn dream_privacy_mode_parses_canonical_values_and_rejects_garbage() {
+        assert_eq!(DreamPrivacyMode::parse("strict"), Some(DreamPrivacyMode::Strict));
+        assert_eq!(DreamPrivacyMode::parse(" redact "), Some(DreamPrivacyMode::Redact));
+        assert_eq!(DreamPrivacyMode::parse("OFF"), Some(DreamPrivacyMode::Off));
+        assert_eq!(DreamPrivacyMode::parse("sometimes"), None);
+        assert_eq!(DreamPrivacyMode::parse(""), None);
+        assert_eq!(DreamPrivacyMode::default(), DreamPrivacyMode::Strict);
+        assert_eq!(DreamPrivacyMode::Off.as_str(), "off");
+    }
+
+    #[test]
+    fn strict_mode_matches_pre_patch_behavior() {
+        let _guard = override_dream_privacy_for_tests(DreamPrivacyMode::Strict, true);
+        assert_eq!(
+            sanitize_extraction_source("deploy note api_key=sk-test123"),
+            REDACTED_EXTRACTION_SOURCE
+        );
+        assert_eq!(
+            sanitize_extraction_source("just an ordinary note"),
+            "just an ordinary note"
+        );
+        let (label, content) = sanitize_extraction_source_pair("Password", "hunter2");
+        assert_eq!(label, REDACTED_EXTRACTION_SOURCE);
+        assert_eq!(content, REDACTED_EXTRACTION_SOURCE);
+    }
+
+    #[test]
+    fn redact_mode_masks_only_the_secret_fragments() {
+        let _guard = override_dream_privacy_for_tests(DreamPrivacyMode::Redact, true);
+        let redacted = sanitize_extraction_source(
+            "The deploy used api_key=sk-test123 and touched two services.",
+        );
+        assert!(
+            !redacted.contains("sk-test123"),
+            "secret value must not survive: {redacted}"
+        );
+        assert!(redacted.contains("api_key=[REDACTED]"), "got: {redacted}");
+        assert!(
+            redacted.contains("and touched two services."),
+            "safe remainder must survive: {redacted}"
+        );
+        assert!(!contains_secret_like_value(&redacted));
+
+        // Multi-line content: only the dirty line is masked.
+        let multi = sanitize_extraction_source(
+            "first safe line\npassword: hunter2\nlast safe line",
+        );
+        assert!(multi.contains("first safe line"), "got: {multi}");
+        assert!(multi.contains("last safe line"), "got: {multi}");
+        assert!(!multi.contains("hunter2"), "got: {multi}");
+        assert!(!contains_secret_like_value(&multi));
+
+        // A lone placeholder is not a secret in either mode and survives
+        // untouched (a placeholder followed by prose is a structured-literal
+        // hit for the strict detectors too, and is masked line-wise instead).
+        let placeholder = sanitize_extraction_source("api_key=${API_KEY}");
+        assert_eq!(placeholder, "api_key=${API_KEY}");
+
+        // Split credentials keep the label, drop the value side.
+        let (label, content) = sanitize_extraction_source_pair("Password", "hunter2");
+        assert_eq!(label, "Password");
+        assert_eq!(content, REDACTED_SECRET_FRAGMENT);
+    }
+
+    #[test]
+    fn redact_mode_fails_closed_on_unlocalizable_secrets() {
+        let _guard = override_dream_privacy_for_tests(DreamPrivacyMode::Redact, true);
+        // An opaque high-entropy token on its own line is replaced line-wise;
+        // a construct the fragment pass cannot localize still fails closed to
+        // the whole-field marker instead of leaking.
+        let line_localized = sanitize_extraction_source("sha: 4f3c2b1a9d8e7f6c5b4a39281706050402918273\nkept");
+        if line_localized == REDACTED_EXTRACTION_SOURCE {
+            // Whole-marker is always acceptable (strict superset of safety).
+        } else {
+            assert!(line_localized.contains("kept"), "got: {line_localized}");
+            assert!(!contains_secret_like_value(&line_localized));
+        }
+    }
+
+    #[test]
+    fn off_mode_passes_sources_through_but_gates_durable_candidates() {
+        let _guard = override_dream_privacy_for_tests(DreamPrivacyMode::Off, true);
+        let secret = "api_key=sk-test123";
+        assert_eq!(sanitize_extraction_source(secret), secret);
+        assert!(extraction_sources_are_secret_safe(&[secret]));
+        let (label, content) = sanitize_extraction_source_pair("Password", "hunter2");
+        assert_eq!((label.as_str(), content.as_str()), ("Password", "hunter2"));
+
+        // The durable gate is independently configurable in off mode (R4).
+        assert!(durable_privacy_gate_enabled());
+        let candidate = DurableExtractionCandidate {
+            title: "deploy credential".to_string(),
+            kind: "fact".to_string(),
+            content: "api_key=sk-test123".to_string(),
+            session_id: None,
+            scope: None,
+            tags: Vec::new(),
+            confidence: None,
+        };
+        assert!(!durable_candidate_is_secret_safe(&candidate));
+
+        let _off_nogate = override_dream_privacy_for_tests(DreamPrivacyMode::Off, false);
+        assert!(!durable_privacy_gate_enabled());
+        assert!(durable_candidate_is_secret_safe(&candidate));
+    }
+
+    #[test]
+    fn redact_mode_keeps_the_durable_gate_enabled() {
+        let _guard = override_dream_privacy_for_tests(DreamPrivacyMode::Redact, false);
+        assert!(durable_privacy_gate_enabled());
+        let candidate = DurableExtractionCandidate {
+            title: "deploy credential".to_string(),
+            kind: "fact".to_string(),
+            content: "api_key=sk-test123".to_string(),
+            session_id: None,
+            scope: None,
+            tags: Vec::new(),
+            confidence: None,
+        };
+        assert!(!durable_candidate_is_secret_safe(&candidate));
+    }
+
+    #[test]
+    fn sync_dream_privacy_from_config_falls_back_to_strict_on_invalid_values() {
+        // Pure resolver: mirrors exactly what the Dream-run sync writes.
+        assert_eq!(
+            resolve_dream_privacy_from_config("bogus", false),
+            (DreamPrivacyMode::Strict, false)
+        );
+        assert_eq!(
+            resolve_dream_privacy_from_config("off", false),
+            (DreamPrivacyMode::Off, false)
+        );
+        assert_eq!(
+            resolve_dream_privacy_from_config("redact", true),
+            (DreamPrivacyMode::Redact, true)
+        );
+        assert_eq!(
+            resolve_dream_privacy_from_config("STRICT", true),
+            (DreamPrivacyMode::Strict, true)
+        );
     }
 }

@@ -2331,6 +2331,18 @@ fn validate_tools_skills(value: &ToolsSkillsSection) -> Result<(), String> {
 }
 
 fn validate_memory(value: &MemorySection) -> Result<(), String> {
+    // [LOCAL PATCH] dream-privacy-config
+    // Reject unrecognized privacy modes at the settings write path so the
+    // serialized sidecar can never carry a value the engine would silently
+    // downgrade to strict.
+    if let Some(memory) = value.0.as_ref() {
+        if !crate::is_valid_dream_privacy_mode(&memory.dream_privacy_mode) {
+            return Err(format!(
+                "dream_privacy_mode must be one of \"strict\" | \"redact\" | \"off\" (got {:?})",
+                memory.dream_privacy_mode
+            ));
+        }
+    }
     validate_json_serializable(value)
 }
 

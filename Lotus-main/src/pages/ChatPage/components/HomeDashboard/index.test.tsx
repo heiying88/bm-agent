@@ -121,7 +121,7 @@ describe("HomeDashboard", () => {
       </AntdApp>,
     );
 
-    expect(screen.getByText("Welcome to Bodhi")).toBeInTheDocument();
+    expect(screen.getByText("Welcome to nana")).toBeInTheDocument();
     expect(screen.getAllByText("Start with a task").length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "Code review" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Write documentation" })).toBeInTheDocument();

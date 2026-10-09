@@ -1,8 +1,10 @@
 <div align="center">
 
-# Bamboo 🎋
+# nana 🎋
 
-<img src="./docs/assets/bamboo-agent-hero.svg" alt="Bamboo agent runtime overview" width="100%" />
+> 本项目原名 **Bamboo**，现已更名为 **nana**。为保持与既有部署、数据目录（`/data`）、环境变量（`BAMBOO_*`）与 crate 名称的兼容，代码层面的 `bamboo` 标识保持不变，仅产品展示名改为 nana。
+
+<img src="./docs/assets/bamboo-agent-hero.svg" alt="nana agent runtime overview" width="100%" />
 
 ### 本地优先的 AI Agent 运行时，使用 Rust 编写。
 
@@ -20,9 +22,9 @@
 
 ## 这是什么
 
-Bamboo 是运行在你自己机器上的 AI 助手"大脑"。它远不止聊天——它会记笔记、积累可检索的长期记忆、使用工具（读写文件、运行命令、搜索网络），并自动压缩超长对话，让助手永不"失忆"或陷入停顿。这一切都封装在一个紧凑、可自托管的程序里，数据默认留在本地。
+nana（原名 Bamboo）是运行在你自己机器上的 AI 助手"大脑"。它远不止聊天——它会记笔记、积累可检索的长期记忆、使用工具（读写文件、运行命令、搜索网络），并自动压缩超长对话，让助手永不"失忆"或陷入停顿。这一切都封装在一个紧凑、可自托管的程序里，数据默认留在本地。
 
-如果 Bodhi 是你看到的 AI 产品，**Bamboo 就是驱动它的引擎。**
+**nana 就是驱动你所见 AI 产品的引擎。**
 
 ---
 

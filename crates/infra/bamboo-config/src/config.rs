@@ -433,6 +433,21 @@ pub struct MemoryConfig {
     /// deletes. Set false to opt out.
     #[serde(default = "default_true_granularity_freshness_gardener_enabled")]
     pub granularity_freshness_gardener_enabled: bool,
+    /// [LOCAL PATCH] dream-privacy-config — Dream 提取源隐私策略：
+    /// `strict`（默认，现状）：会话源命中敏感值即整体剥离；
+    /// `redact`：仅将命中片段替换为 `[REDACTED]`，其余内容正常进入整理，
+    ///   持久化候选门禁保持启用；
+    /// `off`：不做提取源剥离（敏感内容可能出站到模型服务商，需自担风险，
+    ///   可配合 model-policy 的 keyword_masking 做出站兜底）。
+    /// 非法值在读取路径回退 strict 并打 WARN；写入路径由
+    /// `validate_memory` 拒绝。随 memory.json 热加载（每次 Dream 运行刷新）。
+    #[serde(default = "default_dream_privacy_mode")]
+    pub dream_privacy_mode: String,
+    /// [LOCAL PATCH] dream-privacy-config — `off` 模式下是否仍保留持久化
+    /// 候选密钥门禁（`durable_candidate_is_secret_safe`）。默认 true：安全
+    /// 兜底不回退；strict/redact 模式下门禁恒为启用，本字段仅对 off 生效。
+    #[serde(default = "default_true_dream_privacy_off_keep_durable_gate")]
+    pub dream_privacy_off_keep_durable_gate: bool,
 }
 
 impl Default for MemoryConfig {
@@ -464,12 +479,34 @@ impl Default for MemoryConfig {
             capacity_max_archivals_per_run: default_capacity_max_archivals_per_run(),
             granularity_freshness_gardener_enabled:
                 default_true_granularity_freshness_gardener_enabled(),
+            dream_privacy_mode: default_dream_privacy_mode(),
+            dream_privacy_off_keep_durable_gate:
+                default_true_dream_privacy_off_keep_durable_gate(),
         }
     }
 }
 
 fn default_summary_target_ratio() -> f64 {
     0.20
+}
+
+// [LOCAL PATCH] dream-privacy-config
+fn default_dream_privacy_mode() -> String {
+    "strict".to_string()
+}
+
+fn default_true_dream_privacy_off_keep_durable_gate() -> bool {
+    true
+}
+
+/// Whether `value` is a legal `dream_privacy_mode` (used by the settings
+/// write-path validation; the engine read-path additionally warns and falls
+/// back to strict when it sees an unrecognized value).
+pub fn is_valid_dream_privacy_mode(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "strict" | "redact" | "off"
+    )
 }
 
 fn default_summary_safe_window_percent() -> u8 {
@@ -7270,6 +7307,36 @@ mod tests {
     }
 
     #[test]
+    // [LOCAL PATCH] dream-privacy-config
+    #[test]
+    fn dream_privacy_mode_defaults_to_strict_and_validates_writes() {
+        let defaults = MemoryConfig::default();
+        assert_eq!(defaults.dream_privacy_mode, "strict");
+        assert!(defaults.dream_privacy_off_keep_durable_gate);
+
+        // Partial memory.json keeps the strict default (serde default fn).
+        let partial: MemoryConfig =
+            serde_json::from_str(r#"{"auto_dream_enabled": false}"#).unwrap();
+        assert_eq!(partial.dream_privacy_mode, "strict");
+        assert!(partial.dream_privacy_off_keep_durable_gate);
+
+        // Configured values round-trip.
+        let configured: MemoryConfig = serde_json::from_str(
+            r#"{"dream_privacy_mode": "redact", "dream_privacy_off_keep_durable_gate": false}"#,
+        )
+        .unwrap();
+        assert_eq!(configured.dream_privacy_mode, "redact");
+        assert!(!configured.dream_privacy_off_keep_durable_gate);
+
+        // The settings write path accepts canonical values only.
+        for valid in ["strict", "redact", "off", " REDACT "] {
+            assert!(crate::is_valid_dream_privacy_mode(valid));
+        }
+        for invalid in ["", "sometimes", "redacted", "0"] {
+            assert!(!crate::is_valid_dream_privacy_mode(invalid));
+        }
+    }
+
     fn salvage_preserves_legacy_inline_sidecars_from_backup_baseline() {
         let temp = TempHome::new();
         std::fs::write(
@@ -9054,6 +9121,8 @@ mod tests {
                 memory_active_capacity: 500,
                 capacity_max_archivals_per_run: 10,
                 granularity_freshness_gardener_enabled: false,
+                dream_privacy_mode: "strict".to_string(),
+                dream_privacy_off_keep_durable_gate: true,
             }
         });
         let config: Config = serde_json::from_value(legacy).unwrap();

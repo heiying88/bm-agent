@@ -97,11 +97,47 @@ describe("SystemSettingsConfigTab auto dream settings", () => {
       expect(mockValidateBambooConfigPatch).toHaveBeenCalledWith({
         memory: {
           auto_dream_enabled: false,
+          dream_privacy_mode: "strict",
+          dream_privacy_off_keep_durable_gate: true,
         },
       });
       expect(configSectionsService.putSection).toHaveBeenCalledWith("memory", 4, {
         background_model: "gpt-4.1-mini",
         auto_dream_enabled: false,
+        dream_privacy_mode: "strict",
+        dream_privacy_off_keep_durable_gate: true,
+      });
+    });
+  });
+
+  it("saves the configured dream privacy mode and off-mode gate", async () => {
+    render(
+      <AntdApp>
+        <SystemSettingsConfigTab msgApi={msgApi} locale="en-US" onLocaleChange={() => undefined} />
+      </AntdApp>,
+    );
+
+    const modeSelect = await screen.findByTestId("dream-privacy-mode");
+    // Off mode is not selected yet, so the gate switch stays hidden.
+    expect(screen.queryByTestId("dream-privacy-gate")).toBeNull();
+
+    // Open the antd Select and pick "off" (third option).
+    fireEvent.mouseDown(modeSelect.querySelector(".ant-select-selector") ?? modeSelect);
+    const offOption = await screen.findByText("Off (no stripping)");
+    fireEvent.click(offOption);
+
+    const gate = screen.getByTestId("dream-privacy-gate");
+    expect(gate.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(gate);
+    fireEvent.click(screen.getByTestId("save-memory-settings"));
+
+    await waitFor(() => {
+      expect(mockValidateBambooConfigPatch).toHaveBeenCalledWith({
+        memory: {
+          auto_dream_enabled: true,
+          dream_privacy_mode: "off",
+          dream_privacy_off_keep_durable_gate: false,
+        },
       });
     });
   });

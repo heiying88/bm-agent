@@ -40,7 +40,7 @@ export const zhCnTranslation = {
           completedToast: "后台命令已结束 — {{command}}（{{status}}，退出码 {{code}}）",
         },
         clarification: {
-          title: "Bodhi AI 需要您的回复",
+          title: "nana AI 需要您的回复",
           fallbackBody: "Agent 需要您回答一个问题",
         },
         conversationSummarized:
@@ -306,8 +306,8 @@ export const zhCnTranslation = {
     },
     setup: {
       welcome: {
-        heading: "欢迎使用 Bodhi",
-        description: "Bodhi 是您的 AI 驱动开发助手。配置一个 AI 提供商即可开始，或直接进入应用。",
+        heading: "欢迎使用 nana",
+        description: "nana是您的 AI 驱动开发助手。配置一个 AI 提供商即可开始，或直接进入应用。",
         providerHint:
           "要开始对话，您需要配置一个 AI 提供商（如 OpenAI、Anthropic）并提供 API 密钥。",
         proxyHint: "在公司代理后面？您可以稍后在系统设置 > 网络中配置代理。",
@@ -327,8 +327,8 @@ export const zhCnTranslation = {
     },
     onboarding: {
       welcome: {
-        title: "欢迎使用 Bodhi！",
-        description: "Bodhi 是您的 AI 驱动开发助手。让我们快速了解一下界面。",
+        title: "欢迎使用 nana！",
+        description: "nana是您的 AI 驱动开发助手。让我们快速了解一下界面。",
       },
       newSession: {
         title: "新建会话",
@@ -518,7 +518,7 @@ export const zhCnTranslation = {
         modalTitle: "设置工作区路径",
         invalidTitle: "无效的工作区路径",
         issuesDetected: "检测到工作区路径的潜在问题：",
-        confirmSaveInvalid: "仍要提交此路径吗？Bamboo 可能会拒绝它。",
+        confirmSaveInvalid: "仍要提交此路径吗？nana 可能会拒绝它。",
         errorEnterPath: "请输入工作区路径",
         errorSaveFailed: "保存工作区路径失败",
         switchRevisionConflict:
@@ -528,14 +528,14 @@ export const zhCnTranslation = {
         switchProjectArchived: "当前项目已归档，无法更改其会话工作区。",
         switchProjectUnavailable: "此会话所属项目不可用。请刷新项目后再选择工作区。",
         switchSessionRunning: "此会话正在运行或启动中。请先停止会话，再更改工作区。",
-        switchInvalidPath: "请选择 Bamboo 可用的现有文件夹作为工作区。",
+        switchInvalidPath: "请选择 nana 可用的现有文件夹作为工作区。",
         placeholder: "例如：/Users/alice/Workspace/MyProject",
         label: "工作区",
         browseFolder: "浏览文件夹",
         descriptionTitle: "工作区路径描述",
         descriptionP1: "设置工作区路径后，文件引用和工作区相关工具才能稳定地定位文件。",
         descriptionP2:
-          "Bamboo 会校验文件夹是否存在。对于项目会话，该文件夹还必须已绑定到当前项目。",
+          "nana 会校验文件夹是否存在。对于项目会话，该文件夹还必须已绑定到当前项目。",
         checkTitle: "工作区路径检查",
         checkDescription: "工作区路径校验失败。",
         recentTitle: "最近工作区",
@@ -607,7 +607,7 @@ export const zhCnTranslation = {
         },
         permissionMode: {
           ariaLabel: "权限模式：{{mode}}",
-          autoUnsupported: "Auto 需要更新版本的 Bamboo 后端。此会话仍可使用默认或免确认模式。",
+          autoUnsupported: "Auto 需要更新版本的 nana 后端。此会话仍可使用默认或免确认模式。",
           modes: {
             default: {
               label: "默认",
@@ -619,7 +619,7 @@ export const zhCnTranslation = {
             },
             auto: {
               label: "Auto",
-              description: "不等待 Bamboo 批准；此会话中的操作可能立即执行。",
+              description: "不等待 nana 批准；此会话中的操作可能立即执行。",
             },
           },
           status: {
@@ -629,7 +629,7 @@ export const zhCnTranslation = {
           },
           autoConfirm: {
             title: "启用危险的 Auto 模式？",
-            warning: "Bamboo 在工具调用前将不再请求批准，包括高风险操作。",
+            warning: "nana 在工具调用前将不再请求批准，包括高风险操作。",
             scope: "此设置仅作用于会话“{{session}}”，直到你再次更改该会话的权限模式。",
             boundaries: "计划/只读限制、显式硬拒绝、身份验证、操作系统权限和沙箱限制仍然有效。",
             enable: "为此会话启用 Auto",
@@ -687,21 +687,21 @@ export const zhCnTranslation = {
           viewBase: "查看基础版",
           copy: "复制",
           snapshotTitle: "提示快照",
-          bambooSource: "来源：Bamboo",
+          bambooSource: "来源：nana",
           contextModelHint:
             "Project 是长期组织与共享资源边界；Workspace 是当前执行目录，可在同一 Project 内切换。",
           projectPath: "项目路径",
           sessionWorkspace: "会话工作区",
           effectiveWorkspace: "有效工作区",
-          projectPathFallback: "会话未设置工作区，因此 Bamboo 使用项目路径作为有效工作区。",
+          projectPathFallback: "会话未设置工作区，因此 nana 使用项目路径作为有效工作区。",
           resourceRevision: "资源版本",
           notSet: "未设置",
           unavailable: "不可用",
           sections: {
             base: "基础提示",
             enhancement: "增强层",
-            project: "项目上下文 · Bamboo",
-            workspace: "工作区上下文 · Bamboo",
+            project: "项目上下文 · nana",
+            workspace: "工作区上下文 · nana",
             instruction: "指令层",
             env: "环境变量",
             skills: "技能",
@@ -773,7 +773,7 @@ export const zhCnTranslation = {
         selectModelBeforeRetry: "重试前请先选择模型。",
       },
       streaming: {
-        assistant: "Bodhi",
+        assistant: "nana",
         requestCancelled: "请求已取消",
         sendFailed: "发送消息失败",
         retryFailed: "重试请求失败",
@@ -1075,7 +1075,7 @@ export const zhCnTranslation = {
         providerNotConfigured: "请先配置供应商",
         unknownError: "未知错误",
         workspacePathEmpty: "工作区路径不能为空",
-        brandName: "Bodhi",
+        brandName: "nana",
         subTitleUser: "提示词",
         chatMessagesAria: "聊天消息",
         aiRespondingAria: "AI 正在回复",
@@ -1170,7 +1170,7 @@ export const zhCnTranslation = {
         onRunFailed: "运行失败",
         loadError: "加载通知偏好设置失败",
         saveError: "保存通知偏好设置失败",
-        desktopOnly: "桌面通知仅在 Bodhi 桌面应用中可用。",
+        desktopOnly: "桌面通知仅在nana桌面应用中可用。",
         osNote: "可能还需要系统通知权限，可在系统设置中管理。",
         channels: {
           title: "通知渠道",
@@ -1185,7 +1185,7 @@ export const zhCnTranslation = {
           testAttempted: "已尝试：{{channels}}",
           desktop: {
             title: "桌面通知",
-            auto: "自动（独立运行时开启，Bodhi 内嵌时关闭）",
+            auto: "自动（独立运行时开启，nana内嵌时关闭）",
             on: "开启",
             off: "关闭",
           },
@@ -1212,7 +1212,7 @@ export const zhCnTranslation = {
       connectTab: {
         title: "连接（IM 桥接）",
         description:
-          "从外部聊天平台驱动 Bamboo 会话。启用某个平台会启动一个持久桥接进程；关闭则移除它。",
+          "从外部聊天平台驱动 nana 会话。启用某个平台会启动一个持久桥接进程；关闭则移除它。",
         retry: "重试",
         save: "保存连接设置",
         saving: "保存中…",
@@ -1308,7 +1308,7 @@ export const zhCnTranslation = {
       },
       pluginsTab: {
         title: "插件",
-        description: "安装、更新和移除插件，为 Bamboo 扩展 MCP 服务器、提示词、技能和工作流。",
+        description: "安装、更新和移除插件，为 nana 扩展 MCP 服务器、提示词、技能和工作流。",
         retry: "重试",
         empty: "尚未安装任何插件",
         columns: {
@@ -1595,14 +1595,14 @@ export const zhCnTranslation = {
           "同时运行的 actor 进程上限，超出的派生请求排队等待。留空使用默认值（8）。",
         subagentExecutor: "执行引擎 (Executor)",
         subagentExecutorHint:
-          "驱动子代理 Actor 的引擎：内置 Bamboo agent loop、Claude Code CLI 或 Codex CLI。",
-        subagentExecutorBuiltIn: "内置（Bamboo agent loop）",
+          "驱动子代理 Actor 的引擎：内置 nana agent loop、Claude Code CLI 或 Codex CLI。",
+        subagentExecutorBuiltIn: "内置（nana agent loop）",
         subagentExecutorClaudeCode: "Claude Code CLI",
         subagentExecutorCodex: "Codex CLI",
         codex: {
           notice: "Codex CLI 执行器",
           noticeDescription:
-            "Bamboo 每次激活都会启动一个非交互式 `codex exec --json` 进程，并在派生前应用所选认证与沙箱边界。",
+            "nana 每次激活都会启动一个非交互式 `codex exec --json` 进程，并在派生前应用所选认证与沙箱边界。",
           binary: "Codex 可执行文件路径",
           binaryHint:
             "可覆盖可执行文件；留空则从 PATH 解析 `codex`。检测会运行与 worker 完全相同的版本和能力预检。",
@@ -1627,12 +1627,12 @@ export const zhCnTranslation = {
             },
           },
           authMode: "认证模式",
-          authModeHint: "请选择凭据与计费的归属。推荐使用最小权限的 Bamboo 模式。",
+          authModeHint: "请选择凭据与计费的归属。推荐使用最小权限的 nana 模式。",
           authModes: {
             bamboo: {
-              label: "Bamboo 父 Provider（推荐）",
+              label: "nana 父 Provider（推荐）",
               billing:
-                "使用仅本次运行有效的 token 访问 Bamboo /openai/v1；计费和指标仍归父 Provider。",
+                "使用仅本次运行有效的 token 访问 nana /openai/v1；计费和指标仍归父 Provider。",
             },
             inherit: {
               label: "继承用户 Codex 登录",
@@ -1648,7 +1648,7 @@ export const zhCnTranslation = {
             },
           },
           apiKeyEnvironment:
-            "OPENAI_API_KEY 会加入转发环境变量名称列表；Bamboo 不会在此配置中保存它的值。",
+            "OPENAI_API_KEY 会加入转发环境变量名称列表；nana 不会在此配置中保存它的值。",
           baseUrl: "自定义 Provider Base URL",
           baseUrlHint: "必须是绝对 HTTP(S) URL，且不能含凭据、查询参数或 fragment。",
           providerKeyRef: "Provider 凭据引用",
@@ -1671,7 +1671,7 @@ export const zhCnTranslation = {
           },
           approvalPolicy: "审批策略",
           approvalPolicyHint:
-            "Exec 支持 never/on-failure；App server 固定为 on-request，以便 Bamboo 转发父级决定。",
+            "Exec 支持 never/on-failure；App server 固定为 on-request，以便 nana 转发父级决定。",
           approvalPolicies: {
             mapped: "映射默认值（never）",
             never: "从不交互询问",
@@ -1717,16 +1717,27 @@ export const zhCnTranslation = {
         claudeCodeForwardEnvPlaceholder: "例如 ANTHROPIC_API_KEY，按 Enter 添加",
         memoryTitle: "Memory 与 Auto Dream",
         memoryDescription:
-          "管理 Bamboo 的记忆层：会话记忆用于当前工作连续性，长期记忆用于沉淀 durable knowledge，而 Auto Dream 负责在后台更新 Dream Notebook 并提取长期记忆候选项。",
+          "管理 nana 的记忆层：会话记忆用于当前工作连续性，长期记忆用于沉淀 durable knowledge，而 Auto Dream 负责在后台更新 Dream Notebook 并提取长期记忆候选项。",
         autoDreamEnabled: "启用 Auto Dream",
         autoDreamEnabledHint: "在后台自动维护 Dream Notebook，并提取长期记忆候选项。",
+        dreamPrivacyMode: "Dream 隐私策略",
+        dreamPrivacyModeHint:
+          "整理会话历史前的脱敏方式：严格=命中敏感内容整体剥离（默认）；打码=仅将敏感片段替换为 [REDACTED]，其余内容正常进入整理；关闭=不做剥离。热加载，修改后无需重启。",
+        dreamPrivacyModeStrict: "严格（整体剥离）",
+        dreamPrivacyModeRedact: "打码（仅敏感片段）",
+        dreamPrivacyModeOff: "关闭（不剥离）",
+        dreamPrivacyGate: "保留持久化密钥门禁",
+        dreamPrivacyGateHint:
+          "仅在“关闭”模式下生效：仍然拒绝把疑似密钥写入长期记忆（最后防线，建议保持开启）。",
+        dreamPrivacyWarning:
+          "注意：非严格模式下，会话中的敏感内容可能进入 Dream 笔记并出站发送给模型服务商；如在意出站泄露，请在“关键词脱敏”中配置兜底掩码。",
         memoryModelMovedTitle: "记忆模型已迁移到 Provider Settings",
         memoryModelMovedDescription:
           "记忆背景模型现在统一在 Provider Settings 的 Model Preferences 中配置，这里保留 Auto Dream 作为系统级开关。",
         backgroundModel: "后台记忆模型",
         backgroundModelPlaceholder: "留空则使用当前 Provider 的 fast model",
         backgroundModelHint:
-          "可选的专用 memory summarization / reflection 模型。若留空，Bamboo 会回退到当前 Provider 的 fast model。",
+          "可选的专用 memory summarization / reflection 模型。若留空，nana 会回退到当前 Provider 的 fast model。",
         toolsEmpty: "当前没有可用工具。",
         reloadTools: "刷新工具列表",
         skillLimits: {
@@ -1737,9 +1748,9 @@ export const zhCnTranslation = {
           publication: "发布包 (MB)",
           retained: "保留总量 (MB)",
         },
-        loadBambooConfigFailed: "加载 Bamboo 配置失败",
-        bambooConfigSaved: "Bamboo 配置已保存",
-        saveBambooConfigFailed: "保存 Bamboo 配置失败",
+        loadBambooConfigFailed: "加载 nana 配置失败",
+        bambooConfigSaved: "nana 配置已保存",
+        saveBambooConfigFailed: "保存 nana 配置失败",
       },
       networkCard: {
         title: "网络设置",
@@ -2009,7 +2020,7 @@ export const zhCnTranslation = {
         saveEnhancement: "保存增强",
         description: "该文本会先追加，然后再拼接已启用的系统增强，最后再发送请求。",
         copilotConclusionWithOptionsBeforeFinishDescription:
-          "为 Copilot 会话启用后，Bamboo 要求助手必须通过调用 conclusion_with_options 来结束回复。如果模型尝试以纯文本结束，Bamboo 会中止本次补全，并返回补全策略违规错误。",
+          "为 Copilot 会话启用后，nana 要求助手必须通过调用 conclusion_with_options 来结束回复。如果模型尝试以纯文本结束，nana 会中止本次补全，并返回补全策略违规错误。",
       },
       hooksTab: {
         title: "Hooks",
@@ -2073,7 +2084,7 @@ export const zhCnTranslation = {
       },
       permissionsTab: {
         title: "权限",
-        description: "查看 Bamboo 当前生效的版本化权限策略，管理强制确认模式，并撤销已记住的规则。",
+        description: "查看 nana 当前生效的版本化权限策略，管理强制确认模式，并撤销已记住的规则。",
         alwaysAsk: "始终确认",
         rememberedAllows: "已记住的允许",
         denies: "拒绝规则",
@@ -2108,7 +2119,7 @@ export const zhCnTranslation = {
         revoke: "撤销",
         revokeRule: "撤销权限规则 {{id}}",
         revokeTitle: "撤销这条权限规则？",
-        revokeDescription: "版本化删除成功后，Bamboo 将不再应用该匹配器。",
+        revokeDescription: "版本化删除成功后，nana 将不再应用该匹配器。",
         revokeSuccess: "权限规则已撤销",
         revokeFailed: "撤销权限规则失败",
         ruleSource: "来源",
@@ -2122,7 +2133,7 @@ export const zhCnTranslation = {
         lastMatchedAt: "最近命中",
         matchCount: "命中次数",
         temporaryInspectionUnavailable:
-          "Bamboo 当前未通过策略 API 暴露活跃的临时授权；Lotus 不会推测或伪造这些数据。",
+          "nana 当前未通过策略 API 暴露活跃的临时授权；Lotus 不会推测或伪造这些数据。",
         oneShotLifetime: "在下一次匹配请求中消费。",
         temporaryGrantDuration: "已配置的会话授权有效期：{{seconds}} 秒。",
       },
@@ -2364,7 +2375,7 @@ export const zhCnTranslation = {
       },
       workflowsTab: {
         title: "工作流库",
-        description: "通过统一的纯元数据目录浏览 Bamboo 指令型与编排型工作流。",
+        description: "通过统一的纯元数据目录浏览 nana 指令型与编排型工作流。",
         loading: "正在加载工作流目录",
         loadFailed: "加载工作流目录失败",
         refresh: "刷新",
@@ -2454,16 +2465,16 @@ export const zhCnTranslation = {
       providerTab: {
         title: "LLM 提供商配置",
         description: "配置你偏好的 LLM 提供商。点击“保存并应用配置”后会保存并生效。",
-        bambooApiGuideTitle: "Bamboo Provider 兼容 API 基础地址",
+        bambooApiGuideTitle: "nana Provider 兼容 API 基础地址",
         bambooApiGuideDescription:
-          "将 OpenAI、Anthropic 或 Gemini 客户端连接到当前 Bamboo 后端时，请使用以下基础地址：",
+          "将 OpenAI、Anthropic 或 Gemini 客户端连接到当前 nana 后端时，请使用以下基础地址：",
         bambooApiProviders: {
           openai: "OpenAI",
           anthropic: "Anthropic",
           gemini: "Gemini",
         },
         bambooApiGuideNote:
-          "/v1 仅供 Lotus 和 Bamboo 内部 API 使用；OpenAI 兼容客户端必须使用 /openai/v1。",
+          "/v1 仅供 Lotus 和 nana 内部 API 使用；OpenAI 兼容客户端必须使用 /openai/v1。",
         copyBambooApiUrl: "复制基础地址",
         copyBambooApiUrlFor: "复制 {{provider}} 基础地址",
         bambooApiUrlCopied: "基础地址已复制",
@@ -2566,7 +2577,7 @@ export const zhCnTranslation = {
         responsesOnlyModelsOptional: "仅 Responses 模型（可选）",
         responsesOnlyModelsPlaceholder: '例如 "gpt-5.3-codex", "gpt-5*"',
         responsesOnlyHelp1:
-          "部分模型仅支持 OpenAI Responses API（不支持 chat/completions）。可在此添加模型 ID 强制 Bamboo 使用",
+          "部分模型仅支持 OpenAI Responses API（不支持 chat/completions）。可在此添加模型 ID 强制 nana 使用",
         responsesOnlyHelp2: "支持精确匹配（如 gpt-5.3-codex）和后缀 * 的前缀匹配（如 gpt-5*）。",
         anthropicConfigTitle: "Anthropic 配置",
         anthropicConfigDescription: "输入 Anthropic API Key 以使用 Claude 模型。",
@@ -3307,7 +3318,7 @@ export const zhCnTranslation = {
         questionLabel: "问题",
         responseInInputHint: "使用下方的选项或输入框进行回复。",
         responseByOptionHint: "请使用输入框下方的选项进行回复。",
-        permissionReason: "Bamboo 要求确认：{{reason}}",
+        permissionReason: "nana 要求确认：{{reason}}",
         permissionRequester: "请求方",
         childExecutor: "Child 执行器",
         permissionTool: "工具",
@@ -3326,20 +3337,20 @@ export const zhCnTranslation = {
           configuredRule: "已配置规则",
           configuredAlwaysAsk: "该操作命中了强制确认规则 {{rule}}。",
           configuredAlwaysAskBypass: "已开启免确认，但该操作命中了强制确认规则 {{rule}}。",
-          hardDangerous: "Bamboo 将该操作判定为高危操作，需要明确确认。",
-          hardDangerousBypass: "已开启免确认，但 Bamboo 仍要求明确确认此高危操作。",
+          hardDangerous: "nana 将该操作判定为高危操作，需要明确确认。",
+          hardDangerousBypass: "已开启免确认，但 nana 仍要求明确确认此高危操作。",
           platformHardDeny: "平台安全策略要求明确检查该操作。",
           explicitDeny: "该操作命中了拒绝规则 {{rule}}。",
           modeDenied: "执行器当前生效的权限模式要求明确确认。",
           riskThreshold: "该操作超过了已配置的风险阈值。",
         },
-        matcherRequired: "Bamboo 必须提供已授权的匹配器，才能提交此作用域权限。",
-        policyRevisionRequired: "Bamboo 必须提供策略版本，才能记住此权限。",
-        workspaceRequired: "Bamboo 必须提供稳定的 workspace 标识，才能记住此权限。",
+        matcherRequired: "nana 必须提供已授权的匹配器，才能提交此作用域权限。",
+        policyRevisionRequired: "nana 必须提供策略版本，才能记住此权限。",
+        workspaceRequired: "nana 必须提供稳定的 workspace 标识，才能记住此权限。",
         globalConfirmationRequired: "全局权限需要明确二次确认。",
         policyRevisionChanged: "权限策略已变化，请检查刷新后的作用域并重试。",
         requestChanged: "这条权限请求已不再是当前请求，请检查下一条请求后再操作。",
-        decisionNotAllowed: "Bamboo 未授权此权限决定。",
+        decisionNotAllowed: "nana 未授权此权限决定。",
         permissionDecisions: {
           allow_once: "仅允许这一次",
           allow_session: "本会话内允许",
@@ -3494,7 +3505,7 @@ export const zhCnTranslation = {
       promptCopied: "已复制「{{name}}」提示词",
     },
     home: {
-      title: "欢迎使用 Bodhi",
+      title: "欢迎使用 nana",
       subtitle: "这里是你工作区的概览。",
       sections: {
         running: "正在运行",

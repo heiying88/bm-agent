@@ -41,7 +41,7 @@ export const enUsTranslation = {
           completedToast: "Background shell finished â {{command}} ({{status}}, exit {{code}})",
         },
         clarification: {
-          title: "Bodhi AI needs your response",
+          title: "nana AI needs your response",
           fallbackBody: "Agent needs you to answer a question",
         },
         conversationSummarized:
@@ -309,9 +309,9 @@ export const enUsTranslation = {
     },
     setup: {
       welcome: {
-        heading: "Welcome to Bodhi",
+        heading: "Welcome to nana",
         description:
-          "Bodhi is your AI-powered development assistant. Get started by configuring an AI provider, or jump right in.",
+          "nana is your AI-powered development assistant. Get started by configuring an AI provider, or jump right in.",
         providerHint:
           "To start chatting, you'll need to configure an AI provider (e.g. OpenAI, Anthropic) with an API key.",
         proxyHint:
@@ -332,9 +332,9 @@ export const enUsTranslation = {
     },
     onboarding: {
       welcome: {
-        title: "Welcome to Bodhi!",
+        title: "Welcome to nana!",
         description:
-          "Bodhi is your AI-powered development assistant. Let's take a quick look around.",
+          "nana is your AI-powered development assistant. Let's take a quick look around.",
       },
       newSession: {
         title: "New Session",
@@ -537,7 +537,7 @@ export const enUsTranslation = {
         modalTitle: "Set Workspace Path",
         invalidTitle: "Invalid Workspace Path",
         issuesDetected: "Potential issues detected with the workspace path:",
-        confirmSaveInvalid: "Submit this path anyway? Bamboo may reject it.",
+        confirmSaveInvalid: "Submit this path anyway? nana may reject it.",
         errorEnterPath: "Please enter a workspace path",
         errorSaveFailed: "Failed to save workspace path",
         switchRevisionConflict:
@@ -552,7 +552,7 @@ export const enUsTranslation = {
           "This session's Project is unavailable. Refresh Projects before choosing a workspace.",
         switchSessionRunning:
           "This session is running or starting. Stop it before changing the workspace.",
-        switchInvalidPath: "Choose an existing folder that Bamboo can use as a workspace.",
+        switchInvalidPath: "Choose an existing folder that nana can use as a workspace.",
         placeholder: "e.g. /Users/alice/Workspace/MyProject",
         label: "Workspace",
         browseFolder: "Browse folder",
@@ -560,7 +560,7 @@ export const enUsTranslation = {
         descriptionP1:
           "Set a workspace path so file references and workspace tools can resolve files reliably.",
         descriptionP2:
-          "Bamboo validates that the folder exists. For a Project session, the folder must already be bound to that Project.",
+          "nana validates that the folder exists. For a Project session, the folder must already be bound to that Project.",
         checkTitle: "Workspace Path Check",
         checkDescription: "Workspace path validation failed.",
         recentTitle: "Recent Workspaces",
@@ -636,7 +636,7 @@ export const enUsTranslation = {
         permissionMode: {
           ariaLabel: "Permission mode: {{mode}}",
           autoUnsupported:
-            "Auto requires a newer Bamboo backend. This session can still use Default or Bypass.",
+            "Auto requires a newer nana backend. This session can still use Default or Bypass.",
           modes: {
             default: {
               label: "Default",
@@ -650,7 +650,7 @@ export const enUsTranslation = {
             auto: {
               label: "Auto",
               description:
-                "Never pause for Bamboo approval; operations may execute immediately in this session.",
+                "Never pause for nana approval; operations may execute immediately in this session.",
             },
           },
           status: {
@@ -661,7 +661,7 @@ export const enUsTranslation = {
           autoConfirm: {
             title: "Enable dangerous Auto mode?",
             warning:
-              "Bamboo will not ask for approval before tool calls, including high-risk operations.",
+              "nana will not ask for approval before tool calls, including high-risk operations.",
             scope:
               "This applies only to session â{{session}}â and remains active until you change its permission mode.",
             boundaries:
@@ -722,22 +722,22 @@ export const enUsTranslation = {
           viewBase: "View Base",
           copy: "Copy",
           snapshotTitle: "Prompt Snapshot",
-          bambooSource: "Source: Bamboo",
+          bambooSource: "Source: nana",
           contextModelHint:
             "Project is the long-lived organization and shared-resource boundary; Workspace is the current execution directory and may change within the Project.",
           projectPath: "Project path",
           sessionWorkspace: "Session workspace",
           effectiveWorkspace: "Effective workspace",
           projectPathFallback:
-            "No session workspace is set, so Bamboo uses the Project path as the effective workspace.",
+            "No session workspace is set, so nana uses the Project path as the effective workspace.",
           resourceRevision: "Resource revision",
           notSet: "Not set",
           unavailable: "Unavailable",
           sections: {
             base: "Base",
             enhancement: "Enhancement",
-            project: "Project context Â· Bamboo",
-            workspace: "Workspace context Â· Bamboo",
+            project: "Project context Â· nana",
+            workspace: "Workspace context Â· nana",
             instruction: "Instruction",
             env: "Environment",
             skills: "Skills",
@@ -810,7 +810,7 @@ export const enUsTranslation = {
         selectModelBeforeRetry: "Please select a model before retrying.",
       },
       streaming: {
-        assistant: "Bodhi",
+        assistant: "nana",
         requestCancelled: "Request cancelled",
         sendFailed: "Failed to send message",
         retryFailed: "Failed to retry request",
@@ -1124,7 +1124,7 @@ export const enUsTranslation = {
         providerNotConfigured: "Please configure provider first",
         unknownError: "Unknown error",
         workspacePathEmpty: "Workspace path cannot be empty",
-        brandName: "Bodhi",
+        brandName: "nana",
         subTitleUser: "Prompt",
         chatMessagesAria: "Chat messages",
         aiRespondingAria: "AI is responding",
@@ -1221,7 +1221,7 @@ export const enUsTranslation = {
         onRunFailed: "A run fails",
         loadError: "Failed to load notification preferences",
         saveError: "Failed to save notification preferences",
-        desktopOnly: "Desktop notifications are only available in the Bodhi desktop app.",
+        desktopOnly: "Desktop notifications are only available in the nana desktop app.",
         osNote:
           "OS notification permissions may also be required. You can manage them in your system settings.",
         channels: {
@@ -1238,7 +1238,7 @@ export const enUsTranslation = {
           testAttempted: "Attempted: {{channels}}",
           desktop: {
             title: "Desktop",
-            auto: "Auto (on when standalone, off when embedded in Bodhi)",
+            auto: "Auto (on when standalone, off when embedded in nana)",
             on: "On",
             off: "Off",
           },
@@ -1265,7 +1265,7 @@ export const enUsTranslation = {
       connectTab: {
         title: "Connect (IM Bridge)",
         description:
-          "Drive Bamboo sessions from an external chat platform. Enabling a platform starts a persistent bridge; disabling removes it.",
+          "Drive nana sessions from an external chat platform. Enabling a platform starts a persistent bridge; disabling removes it.",
         retry: "Retry",
         save: "Save connect settings",
         saving: "Savingâ¦",
@@ -1365,7 +1365,7 @@ export const enUsTranslation = {
       pluginsTab: {
         title: "Plugins",
         description:
-          "Install, update, and remove plugins that extend Bamboo with MCP servers, prompts, skills, and workflows.",
+          "Install, update, and remove plugins that extend nana with MCP servers, prompts, skills, and workflows.",
         retry: "Retry",
         empty: "No plugins installed",
         columns: {
@@ -1661,14 +1661,14 @@ export const enUsTranslation = {
           "Upper bound on actor processes running at once; further spawns wait their turn. Empty = default (8).",
         subagentExecutor: "Executor",
         subagentExecutorHint:
-          "Which engine drives sub-agent actors: the built-in Bamboo agent loop, Claude Code CLI, or Codex CLI.",
-        subagentExecutorBuiltIn: "Built-in (Bamboo agent loop)",
+          "Which engine drives sub-agent actors: the built-in nana agent loop, Claude Code CLI, or Codex CLI.",
+        subagentExecutorBuiltIn: "Built-in (nana agent loop)",
         subagentExecutorClaudeCode: "Claude Code CLI",
         subagentExecutorCodex: "Codex CLI",
         codex: {
           notice: "Codex CLI executor",
           noticeDescription:
-            "Bamboo starts one non-interactive `codex exec --json` process per activation and applies the selected auth and sandbox boundary before every spawn.",
+            "nana starts one non-interactive `codex exec --json` process per activation and applies the selected auth and sandbox boundary before every spawn.",
           binary: "Codex binary path",
           binaryHint:
             "Override the executable or leave empty to resolve `codex` from PATH. Detect runs the same version and capability preflight used by workers.",
@@ -1697,12 +1697,12 @@ export const enUsTranslation = {
           },
           authMode: "Authentication mode",
           authModeHint:
-            "Choose who owns credentials and billing. Bamboo mode is the recommended least-privilege default.",
+            "Choose who owns credentials and billing. nana mode is the recommended least-privilege default.",
           authModes: {
             bamboo: {
-              label: "Bamboo parent provider (recommended)",
+              label: "nana parent provider (recommended)",
               billing:
-                "Uses a scoped per-run token against Bamboo's /openai/v1 endpoint; billing and metrics remain in the parent provider.",
+                "Uses a scoped per-run token against nana's /openai/v1 endpoint; billing and metrics remain in the parent provider.",
             },
             inherit: {
               label: "Inherit user Codex login",
@@ -1720,7 +1720,7 @@ export const enUsTranslation = {
             },
           },
           apiKeyEnvironment:
-            "OPENAI_API_KEY is added to the forwarded environment-name list. Bamboo never stores its value in this config.",
+            "OPENAI_API_KEY is added to the forwarded environment-name list. nana never stores its value in this config.",
           baseUrl: "Custom provider base URL",
           baseUrlHint: "Absolute HTTP(S) URL without credentials, query parameters, or a fragment.",
           providerKeyRef: "Provider credential reference",
@@ -1743,7 +1743,7 @@ export const enUsTranslation = {
           },
           approvalPolicy: "Approval policy",
           approvalPolicyHint:
-            "Exec supports never/on-failure. App server fixes this to on-request so Bamboo can relay the parent decision.",
+            "Exec supports never/on-failure. App server fixes this to on-request so nana can relay the parent decision.",
           approvalPolicies: {
             mapped: "Mapped default (never)",
             never: "Never ask interactively",
@@ -1790,17 +1790,28 @@ export const enUsTranslation = {
         claudeCodeForwardEnvPlaceholder: "e.g. ANTHROPIC_API_KEY, press Enter to add",
         memoryTitle: "Memory & Auto Dream",
         memoryDescription:
-          "Manage Bamboo's memory layers: session memory for current-work continuity, long-term memory for durable knowledge, and Auto Dream for background Dream Notebook updates and durable memory extraction.",
+          "Manage nana's memory layers: session memory for current-work continuity, long-term memory for durable knowledge, and Auto Dream for background Dream Notebook updates and durable memory extraction.",
         autoDreamEnabled: "Enable Auto Dream",
         autoDreamEnabledHint:
           "Automatically maintains the Dream Notebook and extracts long-term memory candidates in the background.",
+        dreamPrivacyMode: "Dream privacy policy",
+        dreamPrivacyModeHint:
+          "How session history is sanitized before consolidation: strict drops a source entirely when it contains a credential-like value (default); redact replaces only the matched fragments with [REDACTED]; off performs no stripping. Hot-reloaded without a restart.",
+        dreamPrivacyModeStrict: "Strict (drop whole source)",
+        dreamPrivacyModeRedact: "Redact (mask fragments only)",
+        dreamPrivacyModeOff: "Off (no stripping)",
+        dreamPrivacyGate: "Keep durable secret gate",
+        dreamPrivacyGateHint:
+          "Off mode only: still reject secret-like durable-memory candidates before persistence (last line of defense — recommended).",
+        dreamPrivacyWarning:
+          "Warning: outside strict mode, sensitive session content may enter the Dream notebook and be sent outbound to the model provider. Configure keyword masking as an outbound backstop if that matters to you.",
         memoryModelMovedTitle: "Memory model moved to Provider Settings",
         memoryModelMovedDescription:
           "Memory Background Model is now configured in Provider Settings under Model Preferences. Auto Dream remains here as a system-level switch.",
         backgroundModel: "Background Memory Model",
         backgroundModelPlaceholder: "Leave empty to use the provider fast model",
         backgroundModelHint:
-          "Optional dedicated model for memory summarization and reflection. If blank, Bamboo falls back to the current provider's fast model.",
+          "Optional dedicated model for memory summarization and reflection. If blank, nana falls back to the current provider's fast model.",
         toolsEmpty: "No tools are currently available.",
         reloadTools: "Reload Tools",
         skillLimits: {
@@ -1811,9 +1822,9 @@ export const enUsTranslation = {
           publication: "Per publication (MB)",
           retained: "Retained total (MB)",
         },
-        loadBambooConfigFailed: "Failed to load Bamboo config",
-        bambooConfigSaved: "Bamboo config saved",
-        saveBambooConfigFailed: "Failed to save Bamboo config",
+        loadBambooConfigFailed: "Failed to load nana config",
+        bambooConfigSaved: "nana config saved",
+        saveBambooConfigFailed: "Failed to save nana config",
       },
       networkCard: {
         title: "Network Settings",
@@ -2094,7 +2105,7 @@ export const enUsTranslation = {
         taskListRules: "Shared Task Rules",
         copilotConclusionWithOptionsBeforeFinish: "Copilot conclusion_with_options Before Finish",
         copilotConclusionWithOptionsBeforeFinishDescription:
-          "When enabled for Copilot sessions, Bamboo requires the assistant to finish by calling conclusion_with_options. If the model tries to end with plain text, Bamboo stops the completion and returns a completion policy violation.",
+          "When enabled for Copilot sessions, nana requires the assistant to finish by calling conclusion_with_options. If the model tries to end with plain text, nana stops the completion and returns a completion policy violation.",
         switchOn: "ON",
         switchOff: "OFF",
         enhancementPlaceholder: "Add global enhancement text to append to every system prompt.",
@@ -2165,7 +2176,7 @@ export const enUsTranslation = {
       permissionsTab: {
         title: "Permissions",
         description:
-          "Inspect the revisioned policy Bamboo currently enforces, manage always-ask patterns, and revoke remembered rules.",
+          "Inspect the revisioned policy nana currently enforces, manage always-ask patterns, and revoke remembered rules.",
         alwaysAsk: "Always ask",
         rememberedAllows: "Remembered allows",
         denies: "Denies",
@@ -2201,7 +2212,7 @@ export const enUsTranslation = {
         revokeRule: "Revoke permission rule {{id}}",
         revokeTitle: "Revoke this permission rule?",
         revokeDescription:
-          "Bamboo will stop applying this matcher after the revisioned delete succeeds.",
+          "nana will stop applying this matcher after the revisioned delete succeeds.",
         revokeSuccess: "Permission rule revoked",
         revokeFailed: "Failed to revoke permission rule",
         ruleSource: "Source",
@@ -2215,7 +2226,7 @@ export const enUsTranslation = {
         lastMatchedAt: "Last matched",
         matchCount: "Match count",
         temporaryInspectionUnavailable:
-          "Bamboo does not currently expose active temporary grants through the policy API. Lotus will not infer or fabricate them.",
+          "nana does not currently expose active temporary grants through the policy API. Lotus will not infer or fabricate them.",
         oneShotLifetime: "Consumed by the next matching request.",
         temporaryGrantDuration: "Configured session-grant lifetime: {{seconds}} seconds.",
       },
@@ -2462,7 +2473,7 @@ export const enUsTranslation = {
       workflowsTab: {
         title: "Workflow Library",
         description:
-          "Browse Bamboo instruction and orchestration Workflows from one metadata-only catalog.",
+          "Browse nana instruction and orchestration Workflows from one metadata-only catalog.",
         loading: "Loading workflow catalog",
         loadFailed: "Failed to load the workflow catalog",
         refresh: "Refresh",
@@ -2553,16 +2564,16 @@ export const enUsTranslation = {
         title: "LLM Provider Configuration",
         description:
           'Configure your preferred LLM provider. Configuration will be saved and applied when you click "Save and Apply Configuration".',
-        bambooApiGuideTitle: "Bamboo-compatible API base URLs",
+        bambooApiGuideTitle: "nana-compatible API base URLs",
         bambooApiGuideDescription:
-          "Use these base URLs when connecting OpenAI, Anthropic, or Gemini clients to this Bamboo backend:",
+          "Use these base URLs when connecting OpenAI, Anthropic, or Gemini clients to this nana backend:",
         bambooApiProviders: {
           openai: "OpenAI",
           anthropic: "Anthropic",
           gemini: "Gemini",
         },
         bambooApiGuideNote:
-          "The /v1 endpoint is for Lotus and Bamboo's internal API. OpenAI-compatible clients must use /openai/v1.",
+          "The /v1 endpoint is for Lotus and nana's internal API. OpenAI-compatible clients must use /openai/v1.",
         copyBambooApiUrl: "Copy base URL",
         copyBambooApiUrlFor: "Copy {{provider}} base URL",
         bambooApiUrlCopied: "Base URL copied",
@@ -2673,7 +2684,7 @@ export const enUsTranslation = {
         responsesOnlyModelsOptional: "Responses-Only Models (Optional)",
         responsesOnlyModelsPlaceholder: 'e.g. "gpt-5.3-codex", "gpt-5*"',
         responsesOnlyHelp1:
-          "Some models only support the OpenAI Responses API (not chat/completions). Add model ids here to force Bamboo to use upstream",
+          "Some models only support the OpenAI Responses API (not chat/completions). Add model ids here to force nana to use upstream",
         responsesOnlyHelp2:
           "Supports exact match (e.g. gpt-5.3-codex) and prefix match with a trailing * (e.g. gpt-5*).",
         anthropicConfigTitle: "Anthropic Configuration",
@@ -2758,7 +2769,7 @@ export const enUsTranslation = {
         bodhiApiKey: "Bodhi API Key",
         bodhiBaseUrl: "Base URL",
         targetProvider: "Target Provider",
-        bodhiBaseUrlExtra: "Your Bodhi Server endpoint address",
+        bodhiBaseUrlExtra: "Your Bodhi server endpoint address",
         targetProviderExtra: "Which upstream provider to route through Bodhi",
         apiKeyRequired: "API key is required",
         apiKeyKeepPlaceholder: "Configured â leave empty to keep",
@@ -2898,7 +2909,7 @@ export const enUsTranslation = {
         missingIdField: "Missing or invalid id field",
         missingTransportField: "Missing or invalid transport field",
         missingTransportInfo:
-          "Missing transport info. Expected either transport (Bodhi format) or command/url (mainstream MCP format).",
+          "Missing transport info. Expected either transport (nana format) or command/url (mainstream MCP format).",
         invalidJson: "Invalid JSON: {{message}}",
         unknownError: "Unknown error",
         editTitle: "Edit MCP Server",
@@ -3428,7 +3439,7 @@ export const enUsTranslation = {
         questionLabel: "Question",
         responseInInputHint: "Use the options or input box below to respond.",
         responseByOptionHint: "Please respond using the options below the input box.",
-        permissionReason: "Bamboo requires approval: {{reason}}",
+        permissionReason: "nana requires approval: {{reason}}",
         permissionRequester: "Requester",
         childExecutor: "Child executor",
         permissionTool: "Tool",
@@ -3448,25 +3459,25 @@ export const enUsTranslation = {
           configuredAlwaysAsk: "This operation matched the required approval rule {{rule}}.",
           configuredAlwaysAskBypass:
             "Bypass is on, but this operation matched the required approval rule {{rule}}.",
-          hardDangerous: "Bamboo classified this as hard-dangerous and requires explicit approval.",
+          hardDangerous: "nana classified this as hard-dangerous and requires explicit approval.",
           hardDangerousBypass:
-            "Bypass is on, but Bamboo keeps this hard-dangerous operation behind explicit approval.",
+            "Bypass is on, but nana keeps this hard-dangerous operation behind explicit approval.",
           platformHardDeny: "The platform safety policy requires explicit review.",
           explicitDeny: "This operation matched the deny rule {{rule}}.",
           modeDenied: "The executor's effective permission mode requires explicit review.",
           riskThreshold: "This operation exceeds the configured risk threshold.",
         },
-        matcherRequired: "Bamboo must provide an authorized matcher for this scoped permission.",
+        matcherRequired: "nana must provide an authorized matcher for this scoped permission.",
         policyRevisionRequired:
-          "Bamboo must provide a policy revision before this permission can be remembered.",
+          "nana must provide a policy revision before this permission can be remembered.",
         workspaceRequired:
-          "Bamboo must provide a stable workspace identity before this permission can be remembered.",
+          "nana must provide a stable workspace identity before this permission can be remembered.",
         globalConfirmationRequired: "Global permission requires explicit confirmation.",
         policyRevisionChanged:
           "The permission policy changed. Review the refreshed scope and try again.",
         requestChanged:
           "This permission request is no longer current. Review the next request before responding.",
-        decisionNotAllowed: "This permission decision is not authorized by Bamboo.",
+        decisionNotAllowed: "This permission decision is not authorized by nana.",
         permissionDecisions: {
           allow_once: "Allow once",
           allow_session: "Allow for this session",
@@ -3502,7 +3513,7 @@ export const enUsTranslation = {
         readOnlyHint:
           "Skill files remain read-only, but you can enable or disable them for prompt usage.",
         disabledHint:
-          "Disabled skills stay visible here, but Bamboo filters them from system prompt skill context and blocks load_skill at runtime.",
+          "Disabled skills stay visible here, but nana filters them from system prompt skill context and blocks load_skill at runtime.",
         disabledTag: "Disabled",
         switchEnabled: "On",
         switchDisabled: "Off",
@@ -3626,7 +3637,7 @@ export const enUsTranslation = {
       promptCopied: 'Copied "{{name}}" prompt',
     },
     home: {
-      title: "Welcome to Bodhi",
+      title: "Welcome to nana",
       subtitle: "Here's an overview of your workspace.",
       sections: {
         running: "Running Now",

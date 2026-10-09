@@ -36,6 +36,8 @@ interface ConfigFormState {
   https_proxy: string;
   memory: {
     auto_dream_enabled: boolean;
+    dream_privacy_mode: string;
+    dream_privacy_off_keep_durable_gate: boolean;
   };
   subagents: BambooSubagentsConfig;
 }
@@ -163,6 +165,8 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
     https_proxy: "",
     memory: {
       auto_dream_enabled: false,
+      dream_privacy_mode: "strict",
+      dream_privacy_off_keep_durable_gate: true,
     },
     subagents: {},
   });
@@ -207,6 +211,9 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
         https_proxy: core.data.https_proxy || "",
         memory: {
           auto_dream_enabled: memory.data?.auto_dream_enabled ?? false,
+          dream_privacy_mode: memory.data?.dream_privacy_mode ?? "strict",
+          dream_privacy_off_keep_durable_gate:
+            memory.data?.dream_privacy_off_keep_durable_gate ?? true,
         },
         subagents: normalizeSubagentsForm(subagents.data),
       };
@@ -271,11 +278,19 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
     if (!envelope || envelope.revision === baseRevisions.memory || dirtySections.memory) return;
     setConfig((current) => ({
       ...current,
-      memory: { auto_dream_enabled: envelope.data?.auto_dream_enabled ?? false },
+      memory: {
+        auto_dream_enabled: envelope.data?.auto_dream_enabled ?? false,
+        dream_privacy_mode: envelope.data?.dream_privacy_mode ?? "strict",
+        dream_privacy_off_keep_durable_gate:
+          envelope.data?.dream_privacy_off_keep_durable_gate ?? true,
+      },
     }));
     if (baseDraftsRef.current) {
       baseDraftsRef.current.memory = {
         auto_dream_enabled: envelope.data?.auto_dream_enabled ?? false,
+        dream_privacy_mode: envelope.data?.dream_privacy_mode ?? "strict",
+        dream_privacy_off_keep_durable_gate:
+          envelope.data?.dream_privacy_off_keep_durable_gate ?? true,
       };
     }
     setBaseRevisions((current) => ({ ...current, memory: envelope.revision }));
@@ -331,6 +346,28 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
       memory: {
         ...prev.memory,
         auto_dream_enabled: checked,
+      },
+    }));
+  };
+
+  const handleDreamPrivacyModeChange = (value: string) => {
+    setDirtySections((current) => ({ ...current, memory: true }));
+    setConfig((prev) => ({
+      ...prev,
+      memory: {
+        ...prev.memory,
+        dream_privacy_mode: value,
+      },
+    }));
+  };
+
+  const handleDreamPrivacyGateToggle = (checked: boolean) => {
+    setDirtySections((current) => ({ ...current, memory: true }));
+    setConfig((prev) => ({
+      ...prev,
+      memory: {
+        ...prev.memory,
+        dream_privacy_off_keep_durable_gate: checked,
       },
     }));
   };
@@ -444,7 +481,11 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
         };
       } else if (section === "memory") {
         patch = {
-          memory: { auto_dream_enabled: config.memory.auto_dream_enabled },
+          memory: {
+            auto_dream_enabled: config.memory.auto_dream_enabled,
+            dream_privacy_mode: config.memory.dream_privacy_mode,
+            dream_privacy_off_keep_durable_gate: config.memory.dream_privacy_off_keep_durable_gate,
+          },
         };
       } else {
         const isClaudeCode = config.subagents.executor === SUBAGENT_EXECUTOR_CLAUDE_CODE;
@@ -559,6 +600,8 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
           {
             ...(memorySnapshot.envelope?.data ?? {}),
             auto_dream_enabled: config.memory.auto_dream_enabled,
+            dream_privacy_mode: config.memory.dream_privacy_mode,
+            dream_privacy_off_keep_durable_gate: config.memory.dream_privacy_off_keep_durable_gate,
           },
           baseRevision,
         );
@@ -567,11 +610,17 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
           ...current,
           memory: {
             auto_dream_enabled: saved.data?.auto_dream_enabled ?? false,
+            dream_privacy_mode: saved.data?.dream_privacy_mode ?? "strict",
+            dream_privacy_off_keep_durable_gate:
+              saved.data?.dream_privacy_off_keep_durable_gate ?? true,
           },
         }));
         if (baseDraftsRef.current) {
           baseDraftsRef.current.memory = {
             auto_dream_enabled: saved.data?.auto_dream_enabled ?? false,
+            dream_privacy_mode: saved.data?.dream_privacy_mode ?? "strict",
+            dream_privacy_off_keep_durable_gate:
+              saved.data?.dream_privacy_off_keep_durable_gate ?? true,
           };
         }
         setBaseRevisions((current) => ({ ...current, memory: savedRevision }));
@@ -738,6 +787,9 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
     if (externalNames.has("memory") && memorySnapshot.envelope) {
       const latest = {
         auto_dream_enabled: memorySnapshot.envelope.data?.auto_dream_enabled ?? false,
+        dream_privacy_mode: memorySnapshot.envelope.data?.dream_privacy_mode ?? "strict",
+        dream_privacy_off_keep_durable_gate:
+          memorySnapshot.envelope.data?.dream_privacy_off_keep_durable_gate ?? true,
       };
       const rebased = reapplyConfigChanges(baseDrafts.memory, config.memory, latest);
       nextConfig = { ...nextConfig, memory: rebased };
@@ -943,6 +995,77 @@ export const SystemSettingsConfigTab: React.FC<SystemSettingsConfigTabProps> = (
                           onChange={handleAutoDreamToggle}
                         />
                       </div>
+
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: token.marginMD,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <div>
+                          <Text strong>{t("settings.configTab.dreamPrivacyMode")}</Text>
+                          <div>
+                            <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                              {t("settings.configTab.dreamPrivacyModeHint")}
+                            </Text>
+                          </div>
+                        </div>
+                        <Select
+                          data-testid="dream-privacy-mode"
+                          style={{ width: 220 }}
+                          value={config.memory.dream_privacy_mode}
+                          onChange={handleDreamPrivacyModeChange}
+                          options={[
+                            {
+                              label: t("settings.configTab.dreamPrivacyModeStrict"),
+                              value: "strict",
+                            },
+                            {
+                              label: t("settings.configTab.dreamPrivacyModeRedact"),
+                              value: "redact",
+                            },
+                            {
+                              label: t("settings.configTab.dreamPrivacyModeOff"),
+                              value: "off",
+                            },
+                          ]}
+                        />
+                      </div>
+
+                      {config.memory.dream_privacy_mode === "off" && (
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: token.marginMD,
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <div>
+                            <Text strong>{t("settings.configTab.dreamPrivacyGate")}</Text>
+                            <div>
+                              <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
+                                {t("settings.configTab.dreamPrivacyGateHint")}
+                              </Text>
+                            </div>
+                          </div>
+                          <Switch
+                            data-testid="dream-privacy-gate"
+                            checked={config.memory.dream_privacy_off_keep_durable_gate}
+                            onChange={handleDreamPrivacyGateToggle}
+                          />
+                        </div>
+                      )}
+
+                      {config.memory.dream_privacy_mode !== "strict" && (
+                        <Text type="warning" style={{ fontSize: token.fontSizeSM }}>
+                          {t("settings.configTab.dreamPrivacyWarning")}
+                        </Text>
+                      )}
 
                       <div style={{ display: "flex", justifyContent: "flex-end" }}>
                         <Button
