@@ -2314,16 +2314,15 @@ fn redact_pattern_value_spans(
 fn redact_secret_fragments(value: &str) -> String {
     // [LOCAL PATCH] dream-privacy-config
     let mut text = value.to_string();
-    let non_placeholder =
-        |captures: &regex::Captures<'_>| {
-            captures
-                .name("value")
-                .is_some_and(|candidate| !is_placeholder_only(candidate.as_str()))
-        };
+    let non_placeholder = |captures: &regex::Captures<'_>| {
+        captures
+            .name("value")
+            .is_some_and(|candidate| !is_placeholder_only(candidate.as_str()))
+    };
     let literal_value = |captures: &regex::Captures<'_>| {
-        captures.name("value").is_some_and(|candidate| {
-            credential_assignment_value_is_literal(candidate.as_str())
-        })
+        captures
+            .name("value")
+            .is_some_and(|candidate| credential_assignment_value_is_literal(candidate.as_str()))
     };
 
     text = redact_pattern_value_spans(&text, secret_assignment_pattern(), "value", non_placeholder);
@@ -2374,9 +2373,7 @@ fn redact_secret_fragments(value: &str) -> String {
                         .as_str()
                         .split_ascii_whitespace()
                         .map(|word| {
-                            word.trim_matches(
-                                |character: char| !character.is_ascii_alphabetic(),
-                            )
+                            word.trim_matches(|character: char| !character.is_ascii_alphabetic())
                         })
                         .filter(|word| !word.is_empty())
                         .all(|word| word.bytes().all(|byte| byte.is_ascii_alphabetic()))
@@ -2387,9 +2384,7 @@ fn redact_secret_fragments(value: &str) -> String {
         &text,
         mysql_identified_credential_pattern(),
         "value",
-        |captures| {
-            captures.name("generated").is_none() && non_placeholder(&captures)
-        },
+        |captures| captures.name("generated").is_none() && non_placeholder(&captures),
     );
     text = redact_pattern_value_spans(
         &text,
@@ -2408,9 +2403,10 @@ fn redact_secret_fragments(value: &str) -> String {
         environment_credential_assignment_pattern(),
         "value",
         |captures| {
-            captures.name("name").is_some_and(|name| {
-                !name.as_str().eq_ignore_ascii_case("max_token")
-            }) && literal_value(&captures)
+            captures
+                .name("name")
+                .is_some_and(|name| !name.as_str().eq_ignore_ascii_case("max_token"))
+                && literal_value(&captures)
         },
     );
     text = redact_pattern_value_spans(
@@ -2424,21 +2420,17 @@ fn redact_secret_fragments(value: &str) -> String {
         template_credential_assignment_pattern(),
         "value",
         |captures| {
-            captures.name("label").is_some_and(|label| {
-                structured_environment_name_is_credential(label.as_str())
-            }) && non_placeholder(&captures)
-        },
-    );
-    text = redact_pattern_value_spans(
-        &text,
-        authorization_secret_pattern(),
-        "value",
-        |captures| {
             captures
-                .name("value")
-                .is_some_and(|candidate| !candidate.as_str().trim().is_empty())
+                .name("label")
+                .is_some_and(|label| structured_environment_name_is_credential(label.as_str()))
+                && non_placeholder(&captures)
         },
     );
+    text = redact_pattern_value_spans(&text, authorization_secret_pattern(), "value", |captures| {
+        captures
+            .name("value")
+            .is_some_and(|candidate| !candidate.as_str().trim().is_empty())
+    });
     text = redact_pattern_value_spans(&text, bare_authorization_scheme_pattern(), "token", |_| {
         true
     });
@@ -4233,8 +4225,14 @@ mod tests {
     // [LOCAL PATCH] dream-privacy-config tests
     #[test]
     fn dream_privacy_mode_parses_canonical_values_and_rejects_garbage() {
-        assert_eq!(DreamPrivacyMode::parse("strict"), Some(DreamPrivacyMode::Strict));
-        assert_eq!(DreamPrivacyMode::parse(" redact "), Some(DreamPrivacyMode::Redact));
+        assert_eq!(
+            DreamPrivacyMode::parse("strict"),
+            Some(DreamPrivacyMode::Strict)
+        );
+        assert_eq!(
+            DreamPrivacyMode::parse(" redact "),
+            Some(DreamPrivacyMode::Redact)
+        );
         assert_eq!(DreamPrivacyMode::parse("OFF"), Some(DreamPrivacyMode::Off));
         assert_eq!(DreamPrivacyMode::parse("sometimes"), None);
         assert_eq!(DreamPrivacyMode::parse(""), None);
@@ -4276,9 +4274,8 @@ mod tests {
         assert!(!contains_secret_like_value(&redacted));
 
         // Multi-line content: only the dirty line is masked.
-        let multi = sanitize_extraction_source(
-            "first safe line\npassword: hunter2\nlast safe line",
-        );
+        let multi =
+            sanitize_extraction_source("first safe line\npassword: hunter2\nlast safe line");
         assert!(multi.contains("first safe line"), "got: {multi}");
         assert!(multi.contains("last safe line"), "got: {multi}");
         assert!(!multi.contains("hunter2"), "got: {multi}");
@@ -4302,7 +4299,8 @@ mod tests {
         // An opaque high-entropy token on its own line is replaced line-wise;
         // a construct the fragment pass cannot localize still fails closed to
         // the whole-field marker instead of leaking.
-        let line_localized = sanitize_extraction_source("sha: 4f3c2b1a9d8e7f6c5b4a39281706050402918273\nkept");
+        let line_localized =
+            sanitize_extraction_source("sha: 4f3c2b1a9d8e7f6c5b4a39281706050402918273\nkept");
         if line_localized == REDACTED_EXTRACTION_SOURCE {
             // Whole-marker is always acceptable (strict superset of safety).
         } else {

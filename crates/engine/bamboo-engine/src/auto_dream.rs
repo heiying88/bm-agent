@@ -4419,11 +4419,10 @@ mod tests {
     // facts survive, and the durable gate keeps rejecting secret candidates.
     #[tokio::test]
     async fn redact_privacy_mode_keeps_session_facts_and_masks_fragments() {
-        let _privacy =
-            crate::auto_dream_privacy::override_dream_privacy_for_tests(
-                crate::auto_dream_privacy::DreamPrivacyMode::Redact,
-                true,
-            );
+        let _privacy = crate::auto_dream_privacy::override_dream_privacy_for_tests(
+            crate::auto_dream_privacy::DreamPrivacyMode::Redact,
+            true,
+        );
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
@@ -4469,7 +4468,10 @@ mod tests {
         )
         .await;
         assert_eq!(contexts.len(), 1);
-        let source = contexts[0].summary.as_deref().expect("redact keeps a source");
+        let source = contexts[0]
+            .summary
+            .as_deref()
+            .expect("redact keeps a source");
         assert!(
             !source.contains("sk-test123"),
             "secret value must not reach the provider prompt: {source}"
@@ -4501,9 +4503,7 @@ mod tests {
             confidence: None,
         };
         assert!(crate::auto_dream_privacy::durable_privacy_gate_enabled());
-        assert!(!crate::auto_dream_privacy::durable_candidate_is_secret_safe(
-            &secret_candidate
-        ));
+        assert!(!crate::auto_dream_privacy::durable_candidate_is_secret_safe(&secret_candidate));
     }
 
     // [LOCAL PATCH] dream-privacy-config
@@ -4511,11 +4511,10 @@ mod tests {
     // separately-configurable durable gate remains enforceable.
     #[tokio::test]
     async fn off_privacy_mode_forwards_sources_and_gates_durable_candidates() {
-        let _privacy =
-            crate::auto_dream_privacy::override_dream_privacy_for_tests(
-                crate::auto_dream_privacy::DreamPrivacyMode::Off,
-                true,
-            );
+        let _privacy = crate::auto_dream_privacy::override_dream_privacy_for_tests(
+            crate::auto_dream_privacy::DreamPrivacyMode::Off,
+            true,
+        );
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
         bamboo_config::paths::init_bamboo_dir(temp_dir.path().to_path_buf());
@@ -4558,7 +4557,10 @@ mod tests {
         )
         .await;
         assert_eq!(contexts.len(), 1);
-        let source = contexts[0].summary.as_deref().expect("off keeps the raw source");
+        let source = contexts[0]
+            .summary
+            .as_deref()
+            .expect("off keeps the raw source");
         assert!(
             source.contains("api_key=sk-test123"),
             "off mode forwards sources verbatim: {source}"
@@ -4574,9 +4576,7 @@ mod tests {
             confidence: None,
         };
         assert!(crate::auto_dream_privacy::durable_privacy_gate_enabled());
-        assert!(!crate::auto_dream_privacy::durable_candidate_is_secret_safe(
-            &secret_candidate
-        ));
+        assert!(!crate::auto_dream_privacy::durable_candidate_is_secret_safe(&secret_candidate));
     }
 
     #[tokio::test]

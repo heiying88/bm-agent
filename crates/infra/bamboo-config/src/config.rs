@@ -480,8 +480,7 @@ impl Default for MemoryConfig {
             granularity_freshness_gardener_enabled:
                 default_true_granularity_freshness_gardener_enabled(),
             dream_privacy_mode: default_dream_privacy_mode(),
-            dream_privacy_off_keep_durable_gate:
-                default_true_dream_privacy_off_keep_durable_gate(),
+            dream_privacy_off_keep_durable_gate: default_true_dream_privacy_off_keep_durable_gate(),
         }
     }
 }
