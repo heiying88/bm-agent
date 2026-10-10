@@ -51,10 +51,63 @@ fn default_base_prompt_does_not_unconditionally_require_conclusion_with_options(
 }
 #[test]
 fn default_base_prompt_prefers_using_injected_context_before_reasking() {
-    assert!(DEFAULT_BASE_PROMPT.contains("treat it as available working context"));
-    assert!(DEFAULT_BASE_PROMPT.contains("Prefer a minimal verifiable attempt first"));
-    assert!(DEFAULT_BASE_PROMPT
-        .contains("only ask follow-up questions for information that is still genuinely missing"));
+    // v0.0.9 起基础提示词为中文;断言与其行为保证等价的中文表述。
+    assert!(DEFAULT_BASE_PROMPT.contains("直接当作可用的工作背景"));
+    assert!(DEFAULT_BASE_PROMPT.contains("先做最小可验证的尝试"));
+    assert!(DEFAULT_BASE_PROMPT.contains("只对确实仍然缺失的信息追问"));
+}
+
+/// 基础提示词必须自带渠道标记与能力自认知(中文):机器人得知道自己能发
+/// 文件/语音、能被切换模型/智能度/审批模式、认得入站媒体与引用标记——
+/// 否则这些约定只在微信会话首条消息的《渠道能力提示》里,模型在原生会话
+/// 或被问到自身能力时一无所知。
+#[test]
+fn default_base_prompt_documents_channel_markers_and_capabilities() {
+    for marker in [
+        "[SEND_FILE: 文件绝对路径]",
+        "[SEND_VOICE: 要念的文本]",
+        "[SET_MODEL: 模型名]",
+        "[SET_THINK: 档位]",
+        "[SET_PERMISSION: default/auto/bypass]",
+        "[图片]",
+        "[引用回复]",
+        "[引用内容]",
+        "[未支持的消息类型 N]",
+    ] {
+        assert!(
+            DEFAULT_BASE_PROMPT.contains(marker),
+            "base prompt must document the `{marker}` convention"
+        );
+    }
+    // 半角标点的硬性要求也要在提示词里(中文语境下模型极易写成全角)。
+    assert!(DEFAULT_BASE_PROMPT.contains("半角方括号、半角冒号加一个空格"));
+    // 审批三档的使用指引(含 bypass 风险闸)也必须在提示词里。
+    assert!(DEFAULT_BASE_PROMPT.contains("绝不主动建议 bypass"));
+    // 语音链路自认知:转写来源(微信 ASR/硅基流动)与自动降级语义。
+    assert!(DEFAULT_BASE_PROMPT.contains("[语音] 行是微信自带的转写"));
+    assert!(DEFAULT_BASE_PROMPT.contains("硅基流动 SenseVoice"));
+    assert!(DEFAULT_BASE_PROMPT.contains("硅基流动 CosyVoice"));
+    assert!(DEFAULT_BASE_PROMPT.contains("自动降级为文字"));
+    // 聊天渠道命令面与长会话压缩恢复点:用户问"你有什么命令"必须答得上来。
+    for command in [
+        "/new",
+        "/stop",
+        "/status",
+        "/models",
+        "/model",
+        "/think",
+        "/sessions",
+        "/switch",
+        "/del",
+    ] {
+        assert!(
+            DEFAULT_BASE_PROMPT.contains(command),
+            "base prompt must document the `{command}` channel command"
+        );
+    }
+    assert!(DEFAULT_BASE_PROMPT.contains("接下来都允许"));
+    assert!(DEFAULT_BASE_PROMPT.contains("仅支持私聊"));
+    assert!(DEFAULT_BASE_PROMPT.contains("[post-compaction-recovery]"));
 }
 
 #[tokio::test]

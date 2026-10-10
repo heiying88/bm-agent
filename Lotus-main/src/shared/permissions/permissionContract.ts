@@ -21,6 +21,9 @@ export interface PermissionDecision {
 
 export interface PermissionRequestContract {
   requestId?: string;
+  /** Server-issued generation of this parked operation; required by the typed
+   * decision endpoint (replay identity alongside requestId). */
+  requestGeneration?: string;
   sessionId?: string;
   workspacePath?: string;
   childSessionId?: string;
@@ -50,6 +53,8 @@ export interface PermissionRequestContract {
 
 export interface PermissionDecisionSubmission {
   request_id: string;
+  /** Server rejects the typed decision without it (missing field 400). */
+  request_generation?: string;
   decision: PermissionDecisionId;
   matcher_id?: string;
   expected_policy_revision?: number;
@@ -123,6 +128,7 @@ export const buildPermissionDecisionSubmission = (
 
   return {
     request_id: request.requestId,
+    ...(request.requestGeneration ? { request_generation: request.requestGeneration } : {}),
     decision,
     ...(MATCHER_DECISIONS.has(decision) ? { matcher_id: matcherId } : {}),
     ...(durable ? { expected_policy_revision: policyRevision } : {}),
@@ -190,6 +196,7 @@ export const normalizePermissionRequest = (value: unknown): PermissionRequestCon
 
   return {
     requestId: text(source.request_id, outer.request_id),
+    requestGeneration: text(source.request_generation, outer.request_generation),
     sessionId: text(source.session_id, outer.session_id),
     workspacePath: text(source.workspace_path),
     childSessionId: text(source.child_session_id, outer.child_session_id),

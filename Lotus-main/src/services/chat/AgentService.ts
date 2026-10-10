@@ -45,6 +45,7 @@ export type AgentEventType =
   | "child_approval_changed"
   | "session_title_updated"
   | "session_pinned_updated"
+  | "session_execution_profile_updated"
   | "session_created"
   | "session_deleted"
   | "session_cleared"
@@ -283,6 +284,11 @@ export interface AgentEvent {
   scope?: string;
   // SessionPinnedUpdated event
   pinned?: boolean;
+  // SessionExecutionProfileUpdated event (model / reasoning-effort switch)
+  model_ref?: { provider: string; model: string } | null;
+  model?: string;
+  reasoning_effort?: ReasoningEffort | null;
+  permission_mode?: string | null;
   // MessageAppended / SessionCreated events
   message_id?: string;
   role?: "user" | "assistant" | "tool" | "system";
@@ -1033,6 +1039,20 @@ export interface SessionPinnedUpdatedEvent {
   updated_at: string;
 }
 
+/** Model / reasoning effort / approval mode switched (web PATCH or
+ *  chat-channel command). Absent `model_ref` / `reasoning_effort` means
+ *  "config default"; absent `permission_mode` means "this write didn't
+ *  change the approval mode". */
+export interface SessionExecutionProfileUpdatedEvent {
+  type: "session_execution_profile_updated";
+  session_id: string;
+  model_ref?: { provider: string; model: string } | null;
+  model?: string;
+  reasoning_effort?: ReasoningEffort | null;
+  permission_mode?: SessionPermissionMode | null;
+  updated_at: string;
+}
+
 export interface AgentEventHandlers {
   onToken?: (content: string) => void;
   onReasoningToken?: (content: string) => void;
@@ -1110,6 +1130,7 @@ export interface AgentEventHandlers {
   onNotification?: (event: AgentEvent) => void;
   onSessionTitleUpdated?: (event: SessionTitleUpdatedEvent) => void;
   onSessionPinnedUpdated?: (event: SessionPinnedUpdatedEvent) => void;
+  onSessionExecutionProfileUpdated?: (event: SessionExecutionProfileUpdatedEvent) => void;
   onPlanModeEntered?: (event: AgentEvent) => void;
   onPlanModeExited?: (event: AgentEvent) => void;
   onPlanFileUpdated?: (event: AgentEvent) => void;
@@ -2479,6 +2500,24 @@ export class AgentClient {
             type: "session_pinned_updated",
             session_id: event.session_id,
             pinned: event.pinned,
+            updated_at: event.updated_at,
+          });
+        }
+        break;
+      case "session_execution_profile_updated":
+        if (event.session_id && typeof event.updated_at === "string") {
+          const permissionMode =
+            typeof event.permission_mode === "string" &&
+            isSessionPermissionMode(event.permission_mode)
+              ? event.permission_mode
+              : null;
+          handlers.onSessionExecutionProfileUpdated?.({
+            type: "session_execution_profile_updated",
+            session_id: event.session_id,
+            model_ref: event.model_ref ?? null,
+            model: typeof event.model === "string" ? event.model : "",
+            reasoning_effort: event.reasoning_effort ?? null,
+            permission_mode: permissionMode,
             updated_at: event.updated_at,
           });
         }

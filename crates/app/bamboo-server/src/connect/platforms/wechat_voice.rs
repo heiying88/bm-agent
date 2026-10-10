@@ -475,7 +475,15 @@ pub fn is_voice_suitable(text: &str) -> bool {
     if trimmed.lines().any(|line| line.matches('|').count() >= 2) {
         return false;
     }
-    if trimmed.contains("[SEND_FILE:") || trimmed.contains("[SEND_VOICE:") {
+    // 文件/语音标记行不念（含全角写法——正常出口已剥离，这里拦的是
+    // 残留/误用，别把控制标记读给用户听）。
+    if trimmed.contains("[SEND_FILE:")
+        || trimmed.contains("[SEND_VOICE:")
+        || trimmed.lines().any(|line| {
+            super::super::marker_line::strip_marker_line(line, "SEND_FILE").is_some()
+                || super::super::marker_line::strip_marker_line(line, "SEND_VOICE").is_some()
+        })
+    {
         return false;
     }
     if trimmed.contains("http://") || trimmed.contains("https://") {

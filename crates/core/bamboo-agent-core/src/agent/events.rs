@@ -571,6 +571,33 @@ pub enum AgentEvent {
         updated_at: chrono::DateTime<chrono::Utc>,
     },
 
+    /// Session execution profile (model / reasoning effort / approval mode)
+    /// changed — via web PATCH or a chat-channel switch command (`/model`,
+    /// `/think`, `[SET_MODEL:]`/`[SET_THINK:]`/`[SET_PERMISSION:]` markers).
+    ///
+    /// Replayable metadata event carrying the FULL new effective values, so
+    /// the latest event wins and any client (web page sitting on the session)
+    /// can update its model/think selectors live without a refetch. Absent
+    /// optional fields mean "config default" (or "unchanged class" for
+    /// `permission_mode` when this write didn't touch it).
+    SessionExecutionProfileUpdated {
+        session_id: String,
+        /// Effective per-session model override; `None` = config default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_ref: Option<bamboo_domain::ProviderModelRef>,
+        /// Display model name (the session's effective model string).
+        #[serde(default)]
+        model: String,
+        /// Effective reasoning effort; `None` = config default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
+        /// Effective session approval mode ("auto"/"default"/"bypass");
+        /// absent when this write didn't change it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    },
+
     /// A new session was created.
     ///
     /// Change-feed event: durable, journaled, carried on the account `/stream`
@@ -1010,6 +1037,7 @@ impl AgentEvent {
                     | AgentEvent::BashCompleted { .. }
                     | AgentEvent::SessionTitleUpdated { .. }
                     | AgentEvent::SessionPinnedUpdated { .. }
+                    | AgentEvent::SessionExecutionProfileUpdated { .. }
                     | AgentEvent::PlanModeEntered { .. }
                     | AgentEvent::PlanModeExited { .. }
                     | AgentEvent::BudgetExceeded { .. }

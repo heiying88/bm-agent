@@ -24,6 +24,7 @@
 
 pub mod approvals;
 pub mod bridge;
+pub mod marker_line;
 pub mod platform;
 pub mod platforms;
 pub mod render;

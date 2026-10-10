@@ -1474,6 +1474,7 @@ describe("useAgentEventSubscription", () => {
       tool_call_id: "call-perm-1",
       permission_request: {
         request_id: "call-perm-1",
+        request_generation: "gen-7",
         session_id: "session-1",
         reason_code: "configured_always_ask",
         effective_mode: "default",
@@ -1526,6 +1527,7 @@ describe("useAgentEventSubscription", () => {
           options: ["allow_once", "deny_once"],
           permissionRequest: expect.objectContaining({
             requestId: "call-perm-1",
+            requestGeneration: "gen-7",
             reasonCode: "configured_always_ask",
           }),
         }),

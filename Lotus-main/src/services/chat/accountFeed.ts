@@ -18,6 +18,7 @@ import { AgentClient, type ChangeEvent, type FeedSubscription } from "./AgentSer
 import { useAppStore, selectShouldObserve } from "@shared/store/appStore";
 import { useConfigSectionStore } from "@shared/store/configSectionStore";
 import { useSessionReadStateStore } from "@shared/store/sessionReadStateStore";
+import type { SessionPermissionMode } from "@shared/permissions/sessionPermissionMode";
 import { isApiV2WsEnabled } from "@shared/utils/debugFlags";
 import { workflowCatalogQuery } from "../../features/workflows";
 import {
@@ -303,6 +304,27 @@ const applyChange = (change: ChangeEvent): boolean => {
     case "session_pinned_updated":
       if (sessionId && typeof event.pinned === "boolean") {
         store.applyServerPinned(sessionId, event.pinned, event.updated_at ?? change.ts);
+      }
+      scheduleRefresh();
+      break;
+    case "session_execution_profile_updated":
+      // Model / reasoning-effort / approval-mode switch (web PATCH in another
+      // tab, or a chat-channel command like /think): live-update the cached
+      // chat config so an open input bar reflects it without a refetch.
+      if (sessionId) {
+        const chat = store.chats.find((entry) => entry.id === sessionId);
+        if (chat) {
+          store.updateSession(sessionId, {
+            config: {
+              ...(chat.config || {}),
+              model_ref: event.model_ref ?? undefined,
+              reasoningEffort: event.reasoning_effort ?? undefined,
+              ...(event.permission_mode
+                ? { permissionMode: event.permission_mode as SessionPermissionMode }
+                : {}),
+            },
+          });
+        }
       }
       scheduleRefresh();
       break;

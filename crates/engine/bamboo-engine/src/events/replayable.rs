@@ -14,7 +14,7 @@
 //! ## Invariant
 //!
 //! No code in the workspace may pair `runner.push_critical_event` with
-//! `sender.send` outside this helper, the runtime
+//! `sender.send` outside this module, the runtime
 //! `ReplayableSessionEventPublisher`, the generic engine event forwarder, or
 //! the server's `spawn_event_forwarder`
 //! (in `handlers::agent::execute::runtime::events`).
@@ -22,17 +22,26 @@
 //! first, cache second), which leaves a small window where a late subscriber
 //! receives the live event but the cache is still empty.
 //!
-//! ## When to use this helper
+//! ## When to use which helper
 //!
-//! Use this helper for **synchronous** writers that hold an
-//! [`AgentSessionContext`] directly — e.g. HTTP handlers (`patch_session`,
-//! `regenerate_title`) and background tasks (`title_gen`). The runtime
-//! forwarder (`spawn_event_forwarder`) handles the equivalent ordering for
-//! events that flow through the engine's mpsc channel.
+//! Use [`publish_replayable_session_event`] for **synchronous** writers that
+//! hold an [`AgentSessionContext`] directly — e.g. HTTP handlers
+//! (`patch_session`, `regenerate_title`) and background tasks (`title_gen`).
+//! Use [`publish_replayable_session_event_via_parts`] when the writer holds
+//! the raw registries instead (e.g. the connect bridge's `ConnectContext`) —
+//! the ordering lives here either way. The runtime forwarder
+//! (`spawn_event_forwarder`) handles the equivalent ordering for events that
+//! flow through the engine's mpsc channel.
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use bamboo_agent_core::AgentEvent;
+use tokio::sync::{broadcast, RwLock as TokioRwLock};
 
 use crate::app_context::AgentSessionContext;
+use crate::runtime::execution::event_forwarder::AccountFeedInbox;
+use crate::AgentRunner;
 
 /// Publishes a replayable session event with the correct cache-then-broadcast
 /// ordering. See module docs for the invariant.
@@ -71,5 +80,41 @@ pub async fn publish_replayable_session_event(
         // read lock, so an event can appear in either their snapshot or their
         // receiver, never both.
         let _ = sender.send(event);
+    }
+}
+
+/// Parts-based variant of [`publish_replayable_session_event`] for writers
+/// that hold the raw registries instead of an [`AgentSessionContext`] (the
+/// connect bridge publishes chat-channel switches this way). The
+/// cache-then-broadcast ordering is identical — this module remains the only
+/// place that pairs `runner.push_critical_event` with `sender.send`.
+///
+/// `sender` is the caller-resolved broadcast channel for `session_id`
+/// (get-or-create semantics live with the caller); pass `None` only when no
+/// channel can exist — the runner replay cache and account feed still get the
+/// event, only the live broadcast is skipped. `account_feed_inbox` mirrors the
+/// event onto the account-wide change feed.
+pub async fn publish_replayable_session_event_via_parts(
+    runners: &Arc<TokioRwLock<HashMap<String, AgentRunner>>>,
+    sender: Option<&broadcast::Sender<AgentEvent>>,
+    account_feed_inbox: Option<&AccountFeedInbox>,
+    session_id: &str,
+    event: AgentEvent,
+) {
+    {
+        let mut runners = runners.write().await;
+        if let Some(runner) = runners.get_mut(session_id) {
+            runner.push_critical_event(event.clone());
+        }
+
+        if let Some(inbox) = account_feed_inbox {
+            let _ = inbox
+                .send((Some(session_id.to_string()), event.clone()))
+                .await;
+        }
+
+        if let Some(sender) = sender {
+            let _ = sender.send(event);
+        }
     }
 }

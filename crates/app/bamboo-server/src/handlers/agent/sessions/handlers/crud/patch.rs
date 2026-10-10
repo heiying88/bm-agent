@@ -1,5 +1,7 @@
 use actix_web::{web, HttpRequest, HttpResponse, Result};
 
+use bamboo_agent_core::AgentEvent;
+
 use crate::app_state::AppState;
 use bamboo_engine::model_config_helper::normalize_gold_config_json;
 use bamboo_engine::session_app::metadata::{MetadataError, SessionMetadataService};
@@ -792,6 +794,29 @@ pub async fn patch_session(
             std::sync::Arc::new(bamboo_engine::SessionSnapshot::new(session.clone())),
         );
         drop(guard);
+
+        // Replayable metadata event: model / reasoning-effort / approval-mode
+        // changes are pushed live to any client sitting on this session (and
+        // journaled on the account feed) — mirrors title/pinned semantics so
+        // chat-channel switches (`/model`, `/think`, `[SET_PERMISSION:]`) and
+        // web PATCHes are indistinguishable to the frontend.
+        if model_changed || reasoning_changed || permission_transition.is_some() {
+            bamboo_engine::events::replayable::publish_replayable_session_event(
+                state.get_ref(),
+                &session_id,
+                AgentEvent::SessionExecutionProfileUpdated {
+                    session_id: session_id.clone(),
+                    model_ref: session.model_ref.clone(),
+                    model: session.model.clone(),
+                    reasoning_effort: session.reasoning_effort,
+                    permission_mode: permission_transition
+                        .as_ref()
+                        .map(|(_, effective, _)| effective.as_str().to_string()),
+                    updated_at: session.updated_at,
+                },
+            )
+            .await;
+        }
 
         // Only worth a line when something actually changed; a no-op config
         // patch (the common case for repeated/echoed UI writes) stays quiet.

@@ -64,6 +64,7 @@ describe("normalizePermissionRequest", () => {
     const request = normalizePermissionRequest({
       permission_request: {
         request_id: "r1",
+        request_generation: "gen-9",
         workspace_path: "/workspace",
         policy_revision: 7,
         allowed_decisions: ["allow_once", "allow_session", "allow_workspace"],
@@ -73,15 +74,18 @@ describe("normalizePermissionRequest", () => {
         ],
       },
     })!;
+    expect(request.requestGeneration).toBe("gen-9");
     expect(preferredPermissionMatcherId(request)).toBe("opaque-exact");
     expect(buildPermissionDecisionSubmission(request, "allow_workspace")).toEqual({
       request_id: "r1",
+      request_generation: "gen-9",
       decision: "allow_workspace",
       matcher_id: "opaque-exact",
       expected_policy_revision: 7,
     });
     expect(buildPermissionDecisionSubmission(request, "allow_session")).toEqual({
       request_id: "r1",
+      request_generation: "gen-9",
       decision: "allow_session",
       matcher_id: "opaque-exact",
     });

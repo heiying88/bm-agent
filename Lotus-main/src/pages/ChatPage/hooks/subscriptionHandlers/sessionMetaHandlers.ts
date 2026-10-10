@@ -17,6 +17,29 @@ export function createSessionMetaHandlers(run: RunContext): Partial<AgentEventHa
       applyReplayableSessionEvent(event, useAppStore.getState());
     },
 
+    // 模型/智能度/审批模式切换（网页 PATCH 或微信 /model、/think、SET 标记）
+    // 实时推送：直接改当前会话的 config，输入框选择器即刻生效，无需刷新。
+    onSessionExecutionProfileUpdated: (event) => {
+      const targetSessionId = event.session_id || sessionId;
+      const currentSession = useAppStore
+        .getState()
+        .chats.find((chat) => chat.id === targetSessionId);
+      if (!currentSession) {
+        void refreshChatsNow();
+        return;
+      }
+      updateSession(targetSessionId, {
+        config: {
+          ...(currentSession.config || {}),
+          model_ref: event.model_ref ?? undefined,
+          reasoningEffort: event.reasoning_effort ?? undefined,
+          ...(event.permission_mode
+            ? { permissionMode: event.permission_mode }
+            : {}),
+        },
+      });
+    },
+
     onPlanModeEntered: (event) => {
       const targetSessionId = event.session_id || sessionId;
       const planMode = planModeStateFromEvent(event);

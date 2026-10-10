@@ -30,6 +30,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
+use super::super::marker_line;
 use super::super::platform::{
     Capabilities, Inbound, InboundMessage, MessageRef, OutboundMessage, Platform, PlatformError,
     PlatformResult, ReplyCtx,
@@ -104,12 +105,10 @@ const UPLOAD_MEDIA_VOICE: i64 = 4;
 /// 入站观测值（微信自己的语音条带的 encode_type 即本线格式下 SILK 的
 /// 真实值，自动校准）> 本兜底常量。
 const VOICE_ENCODE_TYPE_SILK: i64 = 6;
-/// 出站附件标记：回复文本中单独一行的 `[SEND_FILE: <绝对路径>]` 由本适配器
-/// 解析并投递，标记行不展示给用户（bridge 在会话首条消息注入约定说明）。
-const SEND_FILE_MARKER: &str = "[SEND_FILE: ";
-/// 出站语音标记：单独一行的 `[SEND_VOICE: <要念的文本>]` 由本适配器解析并
-/// 合成语音条投递（用户明确要求朗读时模型才使用；标记行不展示）。
-const SEND_VOICE_MARKER: &str = "[SEND_VOICE: ";
+// 出站附件标记 `[SEND_FILE: <绝对路径>]` 与出站语音标记
+// `[SEND_VOICE: <要念的文本>]`：单独一行的标记由本适配器解析并投递，
+// 标记行不展示给用户（bridge 在会话首条消息注入约定说明；行级解析的
+// 宽容规则见 `crate::connect::marker_line`）。
 
 /// 全仓库共享一个 `reqwest::Client`（对齐 telegram 适配器的 `http_client` 惯例，
 /// 复用 workspace 锁定的 native-tls 栈，绝不另建第二个连接池）。
@@ -238,47 +237,19 @@ fn random_hex_16() -> String {
 }
 
 /// 从回复文本中提取 `[SEND_FILE: <绝对路径>]` 标记行：返回剥掉标记后的
-/// 展示文本与待投递文件路径列表（保持出现顺序）。标记行必须是整行。
+/// 展示文本与待投递文件路径列表（保持出现顺序）。标记行必须是整行；
+/// 解析走 [`crate::connect::marker_line`] 的宽容规则（全角括号/全角冒号/
+/// 缺空格均认——中文提示词下模型常输出全角标点，严格匹配会让附件投递
+/// 整类静默失效）。
 fn extract_send_file_markers(text: &str) -> (String, Vec<PathBuf>) {
-    let mut files = Vec::new();
-    let mut kept: Vec<&str> = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(SEND_FILE_MARKER) {
-            if let Some(path) = rest.strip_suffix(']') {
-                let path = path.trim();
-                if !path.is_empty() {
-                    files.push(PathBuf::from(path));
-                    continue;
-                }
-            }
-        }
-        kept.push(line);
-    }
-    let visible = kept.join("\n").trim().to_string();
-    (visible, files)
+    let (visible, paths) = marker_line::extract_marker_lines(text, "SEND_FILE");
+    (visible, paths.into_iter().map(PathBuf::from).collect())
 }
 
 /// 剥离 `[SEND_VOICE: <要念的文本>]` 标记行，返回（可见文本，语音文本
 /// 列表）。与 [`extract_send_file_markers`] 同一款解析，标记行不展示。
 fn extract_send_voice_markers(text: &str) -> (String, Vec<String>) {
-    let mut voices = Vec::new();
-    let mut kept: Vec<&str> = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix(SEND_VOICE_MARKER) {
-            if let Some(voice_text) = rest.strip_suffix(']') {
-                let voice_text = voice_text.trim();
-                if !voice_text.is_empty() {
-                    voices.push(voice_text.to_string());
-                    continue;
-                }
-            }
-        }
-        kept.push(line);
-    }
-    let visible = kept.join("\n").trim().to_string();
-    (visible, voices)
+    marker_line::extract_marker_lines(text, "SEND_VOICE")
 }
 
 /// 魔数嗅探图片扩展名（对齐 cc-connect 的 detectImageMime）。
@@ -401,6 +372,9 @@ struct IlinkMessage {
     create_time_ms: Option<i64>,
     #[serde(default)]
     item_list: Vec<IlinkItem>,
+    /// 信封级未识别字段原样保留（引用元数据等）——非空时留证。
+    #[serde(flatten)]
+    extra: serde_json::Value,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -418,12 +392,22 @@ struct IlinkItem {
     file_item: Option<IlinkFileItem>,
     #[serde(default)]
     video_item: Option<IlinkVideoItem>,
+    /// 未识别字段原样保留（flatten 收集）。公开协议文档只枚举了 type
+    /// 1–5；新消息类型（引用、表情、链接卡片……）上线时，这个字段让
+    /// WARN 日志能看到完整线格式，占位行也不会再静默吞掉整条消息。
+    #[serde(flatten)]
+    extra: serde_json::Value,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct IlinkTextItem {
     #[serde(default)]
     text: Option<String>,
+    /// 未识别字段原样保留：引用文字消息时，被引内容/引用关系很可能
+    /// 藏在 text_item 的未知字段里（实测引用文字只送达用户手打文本）。
+    /// 非空时 poll_once 以 WARN 留证原始线格式。
+    #[serde(flatten)]
+    extra: serde_json::Value,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1055,10 +1039,17 @@ impl WechatPlatform {
                 ))
             })?;
 
-        let parsed: GetUpdatesResponse = response.json().await.map_err(|error| {
+        let body_text = response.text().await.map_err(|error| {
             PlatformError::other(format!(
-                "getupdates response parse failed: {}",
+                "getupdates body read failed: {}",
                 self.sanitize_error(error)
+            ))
+        })?;
+        // 解析错误不含 URL,直接透传(原始 body 已在手,便于排查未公开格式)。
+        let parsed: GetUpdatesResponse = serde_json::from_str(&body_text).map_err(|error| {
+            PlatformError::other(format!(
+                "getupdates response parse failed: {error}; body head: {}",
+                body_text.chars().take(500).collect::<String>()
             ))
         })?;
 
@@ -1072,10 +1063,34 @@ impl WechatPlatform {
         }
 
         let mut events = Vec::with_capacity(parsed.msgs.len());
+        // 无解释丢弃计数：非 1 的 message_type、解析不出内容的用户消息、
+        // 缺 from_user_id/context_token 的消息——引用消息等未公开格式正是
+        // 落进这些路径才"机器人看不见"。循环尾统一带原始载荷留证。
+        let mut unexplained_drops = 0usize;
         for (index, msg) in parsed.msgs.iter().enumerate() {
             if msg.message_type != MSG_TYPE_INBOUND {
+                // 出站回显（type 2）是预期噪声，不计。
+                if msg.message_type != MSG_TYPE_OUTBOUND {
+                    unexplained_drops += 1;
+                }
                 continue;
             }
+            // 未映射字段留证：消息送达但携带我们不认识的字段（信封级、
+            // 条目级、text_item 级）。引用文字消息的实测表现是"只送达
+            // 用户手打文本"——被引内容若还在载荷里，只能藏在这些字段中。
+            // 捕获到即 WARN 原始 JSON，供一等公民引用支持定位线格式。
+            let unmapped = collect_unmapped_fields(msg);
+            if unmapped.as_object().is_some_and(|map| !map.is_empty()) {
+                tracing::warn!(
+                    raw = %serde_json::to_string(&unmapped).unwrap_or_default(),
+                    "connect: wechat inbound carried unmapped fields (possible quote/reference \
+                     metadata); raw fields above"
+                );
+            }
+            // 引用指针（实测：ref_msg.message_item 只含 msg_id/时间戳，无
+            // 原文）——放进 reply_ctx，bridge 在会话历史里按时间戳找回被引
+            // 原文（iLink 无按 id 取消息的 API，同会话历史是唯一来源）。
+            let quote_ref = extract_quote_ref(msg);
             // 内容行：文本 + 语音转写在映射时同步生成；图片/文件/视频需要
             // 异步下载，先落盘再把路径追加为文本行（Agent 可用工具打开）。
             let (mut lines, media_items) = extract_content_lines(msg);
@@ -1108,6 +1123,8 @@ impl WechatPlatform {
             }
             // 媒体即使下载失败也保留占位行——纯媒体消息不能因为 CDN
             // 抖动就整条消失。
+            let mut media_names: Vec<String> = Vec::new();
+            let mut media_failure = false;
             for media in &media_items {
                 match self.fetch_and_save_media(media, index).await {
                     Ok(path) => {
@@ -1115,9 +1132,17 @@ impl WechatPlatform {
                         let file_name = media.file_name().map(str::to_string);
                         match &file_name {
                             Some(name) => {
-                                lines.push(format!("{label} {}（{name}）", path.display()))
+                                lines.push(format!("{label} {}（{name}）", path.display()));
+                                media_names.push(name.clone());
                             }
-                            None => lines.push(format!("{label} {}", path.display())),
+                            None => {
+                                lines.push(format!("{label} {}", path.display()));
+                                media_names.push(
+                                    path.file_name()
+                                        .map(|name| name.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| path.display().to_string()),
+                                );
+                            }
                         }
                         // 音频文件转写（file_asr 开启时）：已解密的原始文件
                         // 直接上传识别，成功追加 [音频转写] 行；音乐/无语音/
@@ -1129,12 +1154,46 @@ impl WechatPlatform {
                     Err(error) => {
                         tracing::warn!("connect: wechat inbound media failed: {error}");
                         lines.push(format!("{}（下载或解密失败，未能保存）", media.label()));
+                        media_failure = true;
                     }
                 }
             }
-            if let Some(message) = Self::build_inbound_message(msg, index, lines, had_voice) {
+            // 纯媒体入站（无任何用户文字/语音转写行，且媒体全部落盘成功）：
+            // reply_ctx 打标 + 附文件名，bridge 据此确定性回一句"要我怎么
+            // 处理"而不是直接起模型分析（裸文件意图无从猜测，白烧 token）。
+            // 任一媒体下载失败则不打标——占位行需要模型向用户解释失败。
+            // [引用回复] 提示行不算用户文字：引用图片/文件发送同样要走
+            // 先问用途（否则引用媒体反而绕过了省 token 的短路）。
+            let media_only = !media_items.is_empty()
+                && !media_failure
+                && lines.iter().all(|line| {
+                    line.starts_with("[图片]")
+                        || line.starts_with("[文件]")
+                        || line.starts_with("[视频]")
+                        || line.starts_with("[引用回复]")
+                });
+            if let Some(message) = Self::build_inbound_message(
+                msg,
+                index,
+                lines,
+                had_voice,
+                media_only,
+                media_names,
+                quote_ref,
+            ) {
                 events.push(Inbound::Message(message));
+            } else {
+                unexplained_drops += 1;
             }
+        }
+        if unexplained_drops > 0 {
+            tracing::warn!(
+                count = unexplained_drops,
+                raw = %body_text.chars().take(2_000).collect::<String>(),
+                "connect: wechat inbound message(s) dropped without a session event \
+                 (unknown message_type / empty or unparsable items / missing token); \
+                 raw getupdates payload above"
+            );
         }
         Ok(events)
     }
@@ -1150,6 +1209,9 @@ impl WechatPlatform {
         batch_index: usize,
         lines: Vec<String>,
         had_voice: bool,
+        media_only: bool,
+        media_names: Vec<String>,
+        quote_ref: Option<serde_json::Value>,
     ) -> Option<InboundMessage> {
         let from = msg
             .from_user_id
@@ -1187,6 +1249,13 @@ impl WechatPlatform {
                 "context_token": context_token,
                 // 出站 mirror 语音决策用：本条入站消息是否含语音条。
                 "had_voice": had_voice,
+                // 纯媒体入站（裸文件，无文字/转写）：bridge 先问用途，
+                // 不直接起模型分析（见 poll_once 的打标规则）。
+                "media_only": media_only,
+                "media_names": media_names,
+                // 引用回复指针：bridge 按时间戳在会话历史里找回被引原文，
+                // 附为 [引用内容] 行。
+                "quote_ref": quote_ref,
             })),
         })
     }
@@ -2141,9 +2210,76 @@ impl InboundMedia {
     }
 }
 
+/// 汇总一条入站消息里所有"协议未映射"的字段（信封级 flatten、条目级
+/// flatten、text_item 级 flatten），空对象表示没有。只用于留证 WARN——
+/// 引用文字等未公开语义的字段从这里现形。
+fn collect_unmapped_fields(msg: &IlinkMessage) -> serde_json::Value {
+    let envelope_extra = msg.extra.as_object().filter(|map| !map.is_empty());
+    let items: Vec<serde_json::Value> = msg
+        .item_list
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "item": item.extra,
+                "text_item": item.text_item.as_ref().map(|text| &text.extra),
+            })
+        })
+        .filter(|value| {
+            value
+                .get("item")
+                .and_then(|v| v.as_object())
+                .is_some_and(|map| !map.is_empty())
+                || value
+                    .get("text_item")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|map| !map.is_empty())
+        })
+        .collect();
+    if envelope_extra.is_none() && items.is_empty() {
+        return serde_json::json!({});
+    }
+    serde_json::json!({
+        "message": envelope_extra.map(|_| &msg.extra),
+        "items": items,
+    })
+}
+
+/// 提取引用回复指针（实测线格式：条目级 `ref_msg.message_item` 只含被引
+/// 消息的 msg_id 与 create_time_ms，无原文）。bridge 据此在会话历史里按
+/// 时间戳找回原文。
+fn extract_quote_ref(msg: &IlinkMessage) -> Option<serde_json::Value> {
+    msg.item_list.iter().find_map(|item| {
+        let inner = item.extra.get("ref_msg")?.get("message_item")?;
+        let create_time_ms = inner.get("create_time_ms").and_then(|value| value.as_i64());
+        let ref_msg_id = inner.get("msg_id").and_then(|value| value.as_str());
+        (create_time_ms.is_some() || ref_msg_id.is_some()).then(|| {
+            serde_json::json!({
+                "msg_id": ref_msg_id,
+                "create_time_ms": create_time_ms,
+            })
+        })
+    })
+}
+
 fn extract_content_lines(msg: &IlinkMessage) -> (Vec<String>, Vec<InboundMedia>) {
     let mut lines = Vec::new();
     let mut media = Vec::new();
+
+    // 引用回复（实测线格式）：条目级 `ref_msg.message_item` 只携带被引
+    // 消息的 msg_id/时间戳指针，无原文；被引媒体则作为普通媒体条目随本
+    // 消息照常送达。先给模型一行可见提示——知道发生了引用、没有原文时
+    // 请用户复述，而不是毫无感知。
+    if msg
+        .item_list
+        .iter()
+        .any(|item| item.extra.get("ref_msg").is_some())
+    {
+        lines.push(
+            "[引用回复] 用户引用了此前的一条消息；若本条未附带被引内容（媒体路径或文本），\
+             说明渠道未下发原文，需要时请让用户复述。"
+                .to_string(),
+        );
+    }
 
     for item in &msg.item_list {
         match item.kind {
@@ -2155,7 +2291,10 @@ fn extract_content_lines(msg: &IlinkMessage) -> (Vec<String>, Vec<InboundMedia>)
                     .map(str::trim)
                     .filter(|text| !text.is_empty())
                 {
-                    lines.push(text.to_string());
+                    // 微信"引用回复"在部分线格式里以 appmsg(type=57) XML
+                    // 整体落在 text 里——渲染成可读引用行，别把原始 XML
+                    // 灌给模型。
+                    lines.push(render_inbound_text(text));
                 }
             }
             Some(ITEM_TYPE_VOICE) => {
@@ -2194,11 +2333,76 @@ fn extract_content_lines(msg: &IlinkMessage) -> (Vec<String>, Vec<InboundMedia>)
                     }));
                 }
             }
-            _ => {}
+            // 未识别的消息类型（公开协议只枚举了 1–5；引用、表情、链接
+            // 卡片等都可能走这里）：绝不静默丢弃——占位行让模型知道用户
+            // 发了一条读不了内容的消息（能据此告知用户而不是装没看见），
+            // WARN 带原始线格式，为协议跟进留证。
+            other => {
+                let raw = item.extra.to_string();
+                tracing::warn!(
+                    kind = ?other,
+                    raw = %raw.chars().take(2_000).collect::<String>(),
+                    "connect: wechat unsupported inbound item type (raw payload above)"
+                );
+                match other {
+                    Some(kind) => lines.push(format!("[未支持的消息类型 {kind}，内容暂无法读取]")),
+                    None => lines
+                        .push("[未支持的消息类型（缺失 type 字段），内容暂无法读取]".to_string()),
+                }
+            }
         }
     }
 
     (lines, media)
+}
+
+/// 渲染入站文本：微信引用回复（appmsg type=57）整体以 XML 落在 text 里
+/// 时，提取 `<title>`（用户输入）与 `<refermsg>`（被引者与被引内容），
+/// 渲染为 `[引用 <名字>: <被引摘要>] <用户输入>`；普通文本原样返回。
+fn render_inbound_text(text: &str) -> String {
+    if !text.contains("<refermsg") {
+        return text.to_string();
+    }
+    let title = extract_xml_tag(text, "title").unwrap_or_default();
+    let quoted = extract_xml_tag(text, "content").unwrap_or_default();
+    let display_name = extract_xml_tag(text, "displayname").unwrap_or_default();
+    if title.is_empty() && quoted.is_empty() {
+        // 解析不出任何东西时退回原文——宁可给模型原始 XML 也不丢消息。
+        return text.to_string();
+    }
+    let quoted_summary: String = quoted.chars().take(200).collect();
+    match (display_name.is_empty(), title.is_empty()) {
+        (false, false) => format!("[引用 {display_name}: {quoted_summary}]\n{title}"),
+        (false, true) => format!("[引用 {display_name}: {quoted_summary}]"),
+        (true, _) => format!("[引用: {quoted_summary}]\n{title}"),
+    }
+}
+
+/// 极简 XML 标签取值：`<tag>值</tag>`，兼容 `<tag><![CDATA[值]]></tag>`，
+/// 解码常见实体。够用即可——refermsg 是微信十年不变的稳定小格式，
+/// 不值得引入完整 XML 解析器。
+fn extract_xml_tag(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}");
+    let start = xml.find(&open)?;
+    let value_start = xml[start..].find('>')? + start + 1;
+    let close = format!("</{tag}>");
+    let value_end = xml[value_start..].find(&close)? + value_start;
+    let mut value = &xml[value_start..value_end];
+    if let Some(stripped) = value
+        .strip_prefix("<![CDATA[")
+        .and_then(|inner| inner.strip_suffix("]]>"))
+    {
+        value = stripped;
+    }
+    let decoded = value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#x0A;", "\n")
+        .replace("&amp;", "&");
+    let trimmed = decoded.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// 合成确定性 message_id（见 [`WechatPlatform::to_inbound_message`] 的说明）。
@@ -2924,6 +3128,153 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // 入站引用回复 / 未支持消息类型
+    // ------------------------------------------------------------------
+
+    /// 引用消息在公开协议里没有枚举（item type 只定义了 1–5）。两种线格式
+    /// 假设各有回归：以未知 type 到达时绝不静默丢弃（占位行 + 消息照常
+    /// 转发，模型能告知用户"读不了"）；以 appmsg XML 落在 text 时渲染成
+    /// 可读引用行。这条用未知 type 99 + refer_item 模拟前者。
+    /// 引用文字消息的实测表现：只送达用户手打文本，被引内容若还在载荷
+    /// 里只能藏在未映射字段（text_item/条目/信封级）。回归：这些字段必须
+    /// 被 flatten 捕获并汇入留证 WARN；普通文本消息不触发。
+    #[test]
+    fn unmapped_inbound_fields_are_captured_for_diagnosis() {
+        let msg: IlinkMessage = serde_json::from_str(
+            r#"{
+                "from_user_id": "wxid_u", "message_type": 1, "context_token": "CTX",
+                "item_list": [ { "type": 1, "text_item": { "text": "123", "refer_text": "被引的原文" } } ]
+            }"#,
+        )
+        .unwrap();
+        let raw = serde_json::to_string(&collect_unmapped_fields(&msg)).unwrap();
+        assert!(
+            raw.contains("refer_text"),
+            "must capture unmapped fields: {raw}"
+        );
+
+        let plain: IlinkMessage = serde_json::from_str(
+            r#"{
+                "from_user_id": "wxid_u", "message_type": 1, "context_token": "CTX",
+                "item_list": [ { "type": 1, "text_item": { "text": "普通消息" } } ]
+            }"#,
+        )
+        .unwrap();
+        assert!(collect_unmapped_fields(&plain)
+            .as_object()
+            .expect("always an object")
+            .is_empty());
+    }
+
+    /// 引用回复（实测线格式：条目级 ref_msg 只含被引 msg_id 指针，无原文）
+    /// 必须给模型一行可见提示；被引媒体则以普通媒体条目照常附带。
+    #[test]
+    fn quote_reply_renders_visible_note_with_typed_text() {
+        let msg: IlinkMessage = serde_json::from_str(
+            r#"{
+                "from_user_id": "wxid_u", "message_type": 1, "context_token": "CTX",
+                "item_list": [ {
+                    "type": 1,
+                    "text_item": { "text": "123" },
+                    "ref_msg": { "message_item": { "msg_id": "7514705227179257352", "type": 0, "create_time_ms": 1791645343000 } }
+                } ]
+            }"#,
+        )
+        .unwrap();
+        let (lines, media) = extract_content_lines(&msg);
+        assert!(media.is_empty());
+        assert_eq!(lines.len(), 2, "note + typed text, got: {lines:?}");
+        assert!(lines[0].starts_with("[引用回复]"), "got: {}", lines[0]);
+        assert_eq!(lines[1], "123");
+        // 引用指针同时进入 reply_ctx（msg_id + create_time_ms），供 bridge
+        // 在会话历史里做时间戳最近邻匹配找回原文。
+        let quote_ref = extract_quote_ref(&msg).expect("quote ref present");
+        assert_eq!(
+            quote_ref.get("msg_id").and_then(|v| v.as_str()),
+            Some("7514705227179257352")
+        );
+        assert!(quote_ref
+            .get("create_time_ms")
+            .and_then(|v| v.as_i64())
+            .is_some());
+
+        // 普通文本消息没有提示行。
+        let plain: IlinkMessage = serde_json::from_str(
+            r#"{
+                "from_user_id": "wxid_u", "message_type": 1, "context_token": "CTX",
+                "item_list": [ { "type": 1, "text_item": { "text": "普通消息" } } ]
+            }"#,
+        )
+        .unwrap();
+        let (lines, _) = extract_content_lines(&plain);
+        assert_eq!(lines, vec!["普通消息".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn poll_once_keeps_unsupported_item_types_visible() {
+        let server = wiremock::MockServer::start().await;
+        mount_getupdates(
+            &server,
+            serde_json::json!({
+                "ret": 0,
+                "msgs": [
+                    {
+                        "from_user_id": "wxid_user@im.wechat",
+                        "message_type": 1,
+                        "context_token": "CTX-REF",
+                        "item_list": [
+                            { "type": 99, "refer_item": { "text": "被引的原文", "display_name": "张三" } }
+                        ]
+                    }
+                ],
+                "get_updates_buf": "CURSOR-REF"
+            }),
+        )
+        .await;
+
+        let platform = platform_with_stub(server.uri());
+        let events = platform.poll_once().await.expect("poll_once succeeds");
+
+        assert_eq!(events.len(), 1, "unsupported item must not be dropped");
+        match &events[0] {
+            Inbound::Message(message) => {
+                assert!(
+                    message.text.contains("[未支持的消息类型 99"),
+                    "got: {}",
+                    message.text
+                );
+            }
+            Inbound::Callback(_) => panic!("expected a message event"),
+        }
+    }
+
+    #[test]
+    fn refermsg_xml_text_renders_as_quote_line() {
+        let xml = "<appmsg appid=\"wxid_x\" sdkver=\"0\"><title>你说得对</title><type>57</type>\
+                   <refermsg><type>1</type><svrid>123</svrid><displayname>张三</displayname>\
+                   <content><![CDATA[会议改成明天下午三点]]></content></refermsg></appmsg>";
+        assert_eq!(
+            render_inbound_text(xml),
+            "[引用 张三: 会议改成明天下午三点]\n你说得对"
+        );
+
+        // 普通文本与不含 refermsg 的内容原样透传。
+        assert_eq!(render_inbound_text("普通消息"), "普通消息");
+        assert_eq!(
+            render_inbound_text("<appmsg><title>链接</title></appmsg>"),
+            "<appmsg><title>链接</title></appmsg>"
+        );
+    }
+
+    /// 解析不出 title/content 的残缺 refermsg 退回原文——宁可给模型原始
+    /// XML 也不丢消息。
+    #[test]
+    fn malformed_refermsg_falls_back_verbatim() {
+        let xml = "<refermsg><garbage/></refermsg>";
+        assert_eq!(render_inbound_text(xml), xml);
+    }
+
+    // ------------------------------------------------------------------
     // 入站媒体：语音转写 / 图片 CDN 下载解密
     // ------------------------------------------------------------------
 
@@ -3070,6 +3421,40 @@ mod tests {
                                 }
                             }
                         ]
+                    },
+                    {
+                        "from_user_id": "wxid_user@im.wechat",
+                        "message_type": 1,
+                        "context_token": "CTX-IMG-TEXT",
+                        "item_list": [
+                            { "type": 1, "text_item": { "text": "这张图里报错是什么意思" } },
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {
+                                        "encrypt_query_param": "enc-param/with+special=&chars",
+                                        "aes_key": base64::engine::general_purpose::STANDARD.encode(key)
+                                    }
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "from_user_id": "wxid_user@im.wechat",
+                        "message_type": 1,
+                        "context_token": "CTX-IMG-QUOTE",
+                        "item_list": [
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {
+                                        "encrypt_query_param": "enc-param/with+special=&chars",
+                                        "aes_key": base64::engine::general_purpose::STANDARD.encode(key)
+                                    }
+                                },
+                                "ref_msg": { "message_item": { "msg_id": "7514705227179257352", "type": 0, "create_time_ms": 1791645343000i64 } }
+                            }
+                        ]
                     }
                 ],
                 "get_updates_buf": "CURSOR-IMG"
@@ -3089,7 +3474,7 @@ mod tests {
         .with_cdn_base(cdn.uri());
 
         let events = platform.poll_once().await.expect("poll_once succeeds");
-        assert_eq!(events.len(), 1, "a pure-image message must map");
+        assert_eq!(events.len(), 3, "all messages must map");
         match &events[0] {
             Inbound::Message(message) => {
                 assert!(
@@ -3100,8 +3485,25 @@ mod tests {
                 let path = message.text.trim_start_matches("[图片] ").trim();
                 let saved = std::fs::read(path).expect("image file exists on disk");
                 assert_eq!(saved, plain, "decrypted bytes must match the plaintext");
+                // 纯图片（无文字）：reply_ctx 打标 media_only——bridge 先问
+                // 用途，不直接起模型分析。文件名回填为落盘路径的 basename。
+                assert_eq!(
+                    message
+                        .reply_ctx
+                        .0
+                        .get("media_only")
+                        .and_then(|value| value.as_bool()),
+                    Some(true)
+                );
+                let names = message
+                    .reply_ctx
+                    .0
+                    .get("media_names")
+                    .and_then(|value| value.as_array())
+                    .expect("media_names present");
+                assert_eq!(names.len(), 1);
                 // CDN 请求确实带上了编码后的查询参数。
-                let requests = wait_for_requests(&cdn, 1).await;
+                let requests = wait_for_requests(&cdn, 3).await;
                 assert!(requests[0]
                     .url
                     .query()
@@ -3110,6 +3512,49 @@ mod tests {
             }
             Inbound::Callback(_) => panic!("expected a message event"),
         }
+        match &events[1] {
+            Inbound::Message(message) => {
+                // 带文字的媒体消息：意图已在文字里，不打标，照常起模型。
+                assert_eq!(
+                    message
+                        .reply_ctx
+                        .0
+                        .get("media_only")
+                        .and_then(|value| value.as_bool()),
+                    Some(false)
+                );
+                assert!(message.text.contains("这张图里报错是什么意思"));
+            }
+            Inbound::Callback(_) => panic!("expected a message event"),
+        }
+        match &events[2] {
+            Inbound::Message(message) => {
+                // 引用+裸媒体（无文字）：[引用回复] 提示行不算用户文字，
+                // media_only 必须仍然为真——引用媒体不能绕过"先问用途"。
+                assert!(
+                    message.text.contains("[引用回复]"),
+                    "quote note expected, got: {}",
+                    message.text
+                );
+                assert!(
+                    message.text.contains("[图片] "),
+                    "quoted media path expected, got: {}",
+                    message.text
+                );
+                assert_eq!(
+                    message
+                        .reply_ctx
+                        .0
+                        .get("media_only")
+                        .and_then(|value| value.as_bool()),
+                    Some(true),
+                    "quoted bare media must still ask intent first"
+                );
+            }
+            Inbound::Callback(_) => panic!("expected a message event"),
+        }
+        // 三个媒体下载（纯图、文字+图、引用+图）都打到同一个 CDN 桩。
+        let _ = wait_for_requests(&cdn, 3).await;
 
         let _ = std::fs::remove_dir_all(state_dir);
     }
@@ -3141,6 +3586,25 @@ mod tests {
         let (visible, files) = extract_send_file_markers("[SEND_FILE: 没闭合");
         assert!(files.is_empty());
         assert!(visible.contains("[SEND_FILE:"));
+    }
+
+    /// 全中文提示词下模型常把标记写成全角标点（［］【】：、全角空格）或
+    /// 漏掉冒号后的空格——严格半角前缀匹配会让附件投递整类静默失效
+    /// （标记行被当普通文本发给用户）。回归：宽容解析必须把这些写法
+    /// 全部识别为标记行，且路径内容原样保留。
+    #[test]
+    fn fullwidth_marker_variants_still_deliver_files() {
+        let text = "这是报告：\n［SEND_FILE：C:\\reports\\季报.docx］\n【SEND_FILE：/tmp/a.png】\n[SEND_FILE:/tmp/b.png]\n请查收。";
+        let (visible, files) = extract_send_file_markers(text);
+        assert_eq!(visible, "这是报告：\n请查收。");
+        assert_eq!(
+            files,
+            vec![
+                PathBuf::from("C:\\reports\\季报.docx"),
+                PathBuf::from("/tmp/a.png"),
+                PathBuf::from("/tmp/b.png"),
+            ]
+        );
     }
 
     /// 完整出站投递链路：getuploadurl → CDN POST（响应头带
@@ -3338,6 +3802,22 @@ mod tests {
         let (visible, voices) = extract_send_voice_markers("[SEND_VOICE: 没闭合");
         assert!(voices.is_empty());
         assert!(visible.contains("[SEND_VOICE:"));
+    }
+
+    /// 同 [`Self::fullwidth_marker_variants_still_deliver_files`]：语音标记的
+    /// 全角写法必须照常识别；标记内容内部的全角标点原样保留，绝不改写。
+    #[test]
+    fn fullwidth_voice_marker_variants_still_deliver() {
+        let text = "说明：\n［SEND_VOICE：明天下午三点开会］\n[SEND_VOICE: 提醒：三点开会（带笔记本）]\n以上。";
+        let (visible, voices) = extract_send_voice_markers(text);
+        assert_eq!(visible, "说明：\n以上。");
+        assert_eq!(
+            voices,
+            vec![
+                "明天下午三点开会".to_string(),
+                "提醒：三点开会（带笔记本）".to_string(),
+            ]
+        );
     }
 
     /// 未配置语音时标记文本并入正文——模型误用标记也不丢内容、不报错。

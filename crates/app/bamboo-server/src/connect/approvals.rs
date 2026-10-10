@@ -384,12 +384,24 @@ pub fn wants_session_scope(text: &str) -> bool {
 /// mapping. An OPEN ask (`allow_custom`) always
 /// matches: any non-empty text IS the answer, verbatim (matching
 /// `validate_pending_response`'s server-side rule).
+/// 全角数字（１２３…，中文输入法）归一为半角。审批回复"１"与
+/// `/switch １` 都靠它对齐半角输入，否则 `parse::<usize>` 直接失败。
+pub(crate) fn normalize_fullwidth_digits(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '０'..='９' => char::from(b'0' + (c as u32 - '０' as u32) as u8),
+            other => other,
+        })
+        .collect()
+}
+
 pub fn match_text_answer(ask: &ParkedAsk, text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if let Ok(index) = trimmed.parse::<usize>() {
+    // 编号审批回复：全角数字"１"同样按 1 基序号解析。
+    if let Ok(index) = normalize_fullwidth_digits(trimmed).parse::<usize>() {
         if index >= 1 && index <= ask.options.len() {
             return Some(ask.options[index - 1].clone());
         }
@@ -2014,6 +2026,16 @@ mod tests {
         );
         assert_eq!(match_text_answer(&pending, "2"), Some("Deny".to_string()));
         assert_eq!(match_text_answer(&pending, "3"), None);
+    }
+
+    /// 中文输入法的全角数字回复（"１"）同样按 1 基序号命中选项——
+    /// `parse::<usize>` 只认半角，不归一就整条落空。
+    #[test]
+    fn match_text_answer_numeric_index_accepts_fullwidth_digits() {
+        let pending = ask(vec!["允许", "拒绝"], false);
+        assert_eq!(match_text_answer(&pending, "１"), Some("允许".to_string()));
+        assert_eq!(match_text_answer(&pending, "２"), Some("拒绝".to_string()));
+        assert_eq!(match_text_answer(&pending, "１０"), None);
     }
 
     #[test]
